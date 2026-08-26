@@ -338,6 +338,10 @@ sqlite3 ~/.justspeak/history.db \
 # Average / worst-case total latency
 sqlite3 ~/.justspeak/history.db \
   "SELECT ROUND(AVG(total_ms),1), MAX(total_ms) FROM transcriptions WHERE outcome='success';"
+
+# Which apps you dictate into (frontmost app at key-down)
+sqlite3 ~/.justspeak/history.db \
+  "SELECT app_name, COUNT(*), SUM(word_count) FROM transcriptions WHERE outcome='success' GROUP BY 1 ORDER BY 2 DESC;"
 ```
 
 ---

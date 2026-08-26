@@ -21,6 +21,7 @@ final class JustSpeakApp {
     // so a focus change mid-turn downgrades to clipboard-only instead of pasting into the wrong app.
     private var turnFrontmostPID: pid_t?
     private var turnFrontmostName: String?
+    private var turnFrontmostBundleId: String?
 
     // Serial queue that owns all turn lifecycle state below. Both the WS commit completion and
     // the REST fallback timer used to race directly against a captured `var didFallback` bool
@@ -222,6 +223,7 @@ final class JustSpeakApp {
         let front = NSWorkspace.shared.frontmostApplication
         turnFrontmostPID = front?.processIdentifier
         turnFrontmostName = front?.localizedName
+        turnFrontmostBundleId = front?.bundleIdentifier
 
         micIdleWorkItem?.cancel()
         micIdleWorkItem = nil
@@ -338,7 +340,9 @@ final class JustSpeakApp {
                 languageCodes: config.languageCodes.joined(separator: ","),
                 smartMode: config.smartTranscription,
                 vadMode: config.vadMode,
-                error: nil
+                error: nil,
+                appBundleId: turnFrontmostBundleId,
+                appName: turnFrontmostName
             ))
             return
         }
@@ -554,7 +558,9 @@ final class JustSpeakApp {
                 languageCodes: config.languageCodes.joined(separator: ","),
                 smartMode: config.smartTranscription,
                 vadMode: config.vadMode,
-                error: error.localizedDescription
+                error: error.localizedDescription,
+                appBundleId: turnFrontmostBundleId,
+                appName: turnFrontmostName
             ))
             processingLock.lock()
             isProcessing = false
@@ -611,7 +617,9 @@ final class JustSpeakApp {
                 languageCodes: config.languageCodes.joined(separator: ","),
                 smartMode: config.smartTranscription,
                 vadMode: config.vadMode,
-                error: nil
+                error: nil,
+                appBundleId: turnFrontmostBundleId,
+                appName: turnFrontmostName
             ))
             processingLock.lock()
             isProcessing = false
@@ -742,7 +750,9 @@ final class JustSpeakApp {
             languageCodes: config.languageCodes.joined(separator: ","),
             smartMode: config.smartTranscription,
             vadMode: config.vadMode,
-            error: nil
+            error: nil,
+            appBundleId: turnFrontmostBundleId,
+            appName: turnFrontmostName
         ))
 
         print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")

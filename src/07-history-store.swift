@@ -32,6 +32,9 @@ final class TranscriptionHistoryStore {
         var smartMode: Bool
         var vadMode: String
         var error: String?
+        // App that was frontmost at key-down - where the dictation was aimed.
+        var appBundleId: String?
+        var appName: String?
     }
 
     private let queue = DispatchQueue(label: "com.justspeak.history", qos: .utility)
@@ -107,7 +110,9 @@ final class TranscriptionHistoryStore {
           language_codes TEXT,
           smart_mode INTEGER,
           vad_mode TEXT,
-          error TEXT
+          error TEXT,
+          app_bundle_id TEXT,
+          app_name TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_transcriptions_ts ON transcriptions(ts_epoch);
         CREATE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id);
@@ -117,6 +122,16 @@ final class TranscriptionHistoryStore {
             Logger.warn("HISTORY", "Failed to create history schema: \(String(cString: sqlite3_errmsg(opened)))")
             sqlite3_close(opened)
             return
+        }
+
+        // Columns added after the table first shipped. CREATE TABLE IF NOT EXISTS won't touch
+        // an existing DB, so each new column is a best-effort ALTER whose "duplicate column"
+        // failure on an already-migrated DB is expected and deliberately ignored.
+        for migration in [
+            "ALTER TABLE transcriptions ADD COLUMN app_bundle_id TEXT",
+            "ALTER TABLE transcriptions ADD COLUMN app_name TEXT"
+        ] {
+            sqlite3_exec(opened, migration, nil, nil, nil)
         }
 
         db = opened
@@ -166,8 +181,8 @@ final class TranscriptionHistoryStore {
               transport, model, is_live_route, fallback_reason, audio_seconds,
               first_token_ms, roundtrip_ms, capture_finalize_ms, inject_ms, total_ms,
               injected, input_tokens, output_tokens, tokens_metered, cost_usd,
-              language_codes, smart_mode, vad_mode, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              language_codes, smart_mode, vad_mode, error, app_bundle_id, app_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
 
             var stmt: OpaquePointer?
@@ -205,6 +220,8 @@ final class TranscriptionHistoryStore {
             self.bindBool(stmt, 24, r.smartMode)
             self.bindText(stmt, 25, r.vadMode)
             self.bindText(stmt, 26, r.error)
+            self.bindText(stmt, 27, r.appBundleId)
+            self.bindText(stmt, 28, r.appName)
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 self.failed = true
