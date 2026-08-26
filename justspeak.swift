@@ -908,6 +908,12 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         lock.lock()
         defer { lock.unlock() }
         
+        // 0. Server error handling
+        if let errorObj = json["error"] as? [String: Any] {
+            let message = (errorObj["message"] as? String) ?? "Unknown server error"
+            Logger.error("WS", "Server error: \(message)")
+        }
+        
         // 1. Handshake confirmation
         if json["setupComplete"] != nil {
             self.isConnected = true
@@ -929,21 +935,21 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             var updatedText: String? = nil
             var isUserSpeech = false
             
-            // PRIORITY 1: Progressive Interim Transcription (e.g. gemini-3.5-transcribe-live)
-            if let interim = serverContent["interimInputTranscription"] as? [String: Any],
-               let text = interim["text"] as? String, !text.isEmpty {
+            // PRIORITY 1: Finalized inputTranscription (e.g. gemini-3.5-transcribe-live)
+            if let inputTrans = serverContent["inputTranscription"] as? [String: Any],
+               let text = inputTrans["text"] as? String, !text.isEmpty {
                 updatedText = text
                 isUserSpeech = true
             }
-            // PRIORITY 2: Finalized inputAudioTranscription
+            // PRIORITY 2: Progressive Interim Transcription
+            else if let interim = serverContent["interimInputTranscription"] as? [String: Any],
+                    let text = interim["text"] as? String, !text.isEmpty {
+                updatedText = text
+                isUserSpeech = true
+            }
+            // PRIORITY 3: Alternative inputAudioTranscription
             else if let inputAudio = serverContent["inputAudioTranscription"] as? [String: Any],
                     let text = inputAudio["text"] as? String, !text.isEmpty {
-                updatedText = text
-                isUserSpeech = true
-            }
-            // PRIORITY 3: Alternative inputTranscription
-            else if let inputTranscription = serverContent["inputTranscription"] as? [String: Any],
-                    let text = inputTranscription["text"] as? String, !text.isEmpty {
                 updatedText = text
                 isUserSpeech = true
             }
@@ -981,7 +987,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 onLiveTextUpdate?(textCopy)
             }
             
-            // Conversational model explicit turn completion
+            // Explicit turn completion / generation completion
             let isTurnComplete = (serverContent["turnComplete"] as? Bool) ?? (serverContent["turnComplete"] != nil)
             let isGenComplete = (serverContent["generationComplete"] as? Bool) ?? (serverContent["generationComplete"] != nil)
             
@@ -1042,11 +1048,9 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         let base64Audio = pcmChunk.base64EncodedString()
         let payload: [String: Any] = [
             "realtimeInput": [
-                "mediaChunks": [
-                    [
-                        "mimeType": "audio/pcm;rate=16000",
-                        "data": base64Audio
-                    ]
+                "audio": [
+                    "mimeType": "audio/pcm;rate=16000",
+                    "data": base64Audio
                 ]
             ]
         ]
@@ -1072,7 +1076,18 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.hasFiredTurnCompletion = false
         lock.unlock()
         
-        // 1. Dispatch manual activityEnd signal for conversational models
+        // 1. Dispatch audioStreamEnd signal to flush audio encoder pipeline
+        let endAudioPayload: [String: Any] = [
+            "realtimeInput": [
+                "audioStreamEnd": true
+            ]
+        ]
+        if let endAudioJson = try? JSONSerialization.data(withJSONObject: endAudioPayload),
+           let endAudioStr = String(data: endAudioJson, encoding: .utf8) {
+            webSocketTask?.send(.string(endAudioStr)) { _ in }
+        }
+        
+        // 2. Dispatch manual activityEnd signal for conversational models
         if !model.contains("transcribe") {
             let endPayload: [String: Any] = [
                 "realtimeInput": [
@@ -1085,7 +1100,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
         }
         
-        // 2. Dispatch turnComplete signal to finalize transcript
+        // 3. Dispatch turnComplete signal to finalize transcript
         let commitPayload: [String: Any] = [
             "clientContent": [
                 "turnComplete": true
@@ -1104,15 +1119,15 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
         }
         
-        // 3. For dedicated STT Transcribe models: Launch active token settlement monitor
+        // 4. For dedicated STT Transcribe models: Launch active token settlement monitor
         if model.contains("transcribe") {
             settleWorkItem?.cancel()
             let settleItem = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
-                let minPostCommitWait: Double = 0.45
-                let quietWindow: Double = 0.32
-                let initialWaitWithoutTokens: Double = 1.20
-                let maxWait: Double = 2.50
+                let minPostCommitWait: Double = 0.35
+                let quietWindow: Double = 0.25
+                let initialWaitWithoutTokens: Double = 0.90
+                let maxWait: Double = 2.20
                 
                 while true {
                     Thread.sleep(forTimeInterval: 0.02)
@@ -1148,7 +1163,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                             return
                         }
                     } else if !text.isEmpty && elapsedCommit >= initialWaitWithoutTokens {
-                        // Settle check 2: We have pre-commit text, but no new tokens arrived within 1.20s
+                        // Settle check 2: We have pre-commit text, but no new tokens arrived
                         self.hasFiredTurnCompletion = true
                         self.isCommitting = false
                         let totalLatencyMs = elapsedCommit * 1000.0
