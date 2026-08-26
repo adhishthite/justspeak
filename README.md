@@ -151,7 +151,9 @@ All settings can be configured in `.env` or set as environment variables:
 | `SHOW_HUD` | `true` | Native floating Dynamic Island capsule + Apple Notch Bezel Aura |
 | `ENABLE_LIVE_WEBSOCKET` | `true` | Stream audio chunks via Live WebSockets (`true`) or REST only (`false`) |
 | `REST_FALLBACK_TIMEOUT` | `4.0` | Maximum seconds to wait for WebSocket response before falling back to REST |
-| `POST_ROLL_MS` | `250` | Grace period (ms) after key release to catch the tail of the final word before finalizing (0-500) |
+| `POST_ROLL_MS` | `250` | Adaptive trailing capture: continuous-quiet window (ms) after key release before the turn commits; audio keeps streaming while speech energy persists (0-500) |
+| `POST_ROLL_MAX_MS` | `1500` | Hard cap (ms) on the adaptive trailing capture above; set equal to `POST_ROLL_MS` (or `0`) to disable adaptation (0-5000) |
+| `TRAIL_SILENCE_DB` | `-40.0` | RMS dBFS below which the mic is considered quiet for the adaptive trailing capture above (-80.0 to -10.0) |
 | `VAD_MODE` | `manual` | `manual` (push-to-talk hold defines speech bounds, server VAD off), `tuned` (pause-tolerant server VAD), `auto` (stock server VAD) |
 | `VAD_SILENCE_MS` | `1500` | Tuned mode only: pause length (ms) before server VAD ends speech (200-5000) |
 | `MIC_IDLE_TIMEOUT` | `300` | Seconds without a dictation before the mic is released (status-bar indicator off); next key-down re-arms it. `0` = always on |

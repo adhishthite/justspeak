@@ -120,6 +120,14 @@ struct Config {
     // 250ms default: people release the key while the last word is still leaving their mouth;
     // audio keeps streaming during the grace period, so the only cost is commit latency.
     var postRollMs: Int = 250
+    // Adaptive trailing capture: after key release, audio keeps streaming while speech energy
+    // is still present; the turn commits once the mic has been quiet for postRollMs
+    // continuously, hard-capped at postRollMaxMs. Set equal to postRollMs (or 0) to disable
+    // adaptation and get the old fixed post-roll.
+    var postRollMaxMs: Int = 1500
+    // RMS dBFS below which the mic is considered quiet (speech typically -30 to -15, room
+    // noise -50 to -60 on this meter).
+    var trailSilenceDb: Double = -40.0
     var vadMode: String = "manual" // "manual" (PTT key defines speech bounds), "tuned", or "auto"
     var vadSilenceMs: Int = 1500
     // Release the mic (status-bar indicator off) after this many seconds without a dictation;
@@ -257,6 +265,8 @@ struct Config {
                         case "REST_FALLBACK_TIMEOUT": if let t = Double(value) { config.restFallbackTimeout = t }
                         case "PRE_ROLL_MS": if let ms = Int(value) { config.preRollMs = min(1000, max(0, ms)) }
                         case "POST_ROLL_MS": if let ms = Int(value) { config.postRollMs = min(500, max(0, ms)) }
+                        case "POST_ROLL_MAX_MS": if let ms = Int(value) { config.postRollMaxMs = min(5000, max(0, ms)) }
+                        case "TRAIL_SILENCE_DB": if let db = Double(value) { config.trailSilenceDb = min(-10.0, max(-80.0, db)) }
                         case "VAD_MODE": if ["manual", "tuned", "auto"].contains(value.lowercased()) { config.vadMode = value.lowercased() }
                         case "VAD_SILENCE_MS": if let ms = Int(value) { config.vadSilenceMs = min(5000, max(200, ms)) }
                         case "MIC_IDLE_TIMEOUT": if let sec = Int(value) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
@@ -292,6 +302,8 @@ struct Config {
         if let timeout = env["REST_FALLBACK_TIMEOUT"], let t = Double(timeout) { config.restFallbackTimeout = t }
         if let preRoll = env["PRE_ROLL_MS"], let ms = Int(preRoll) { config.preRollMs = min(1000, max(0, ms)) }
         if let postRoll = env["POST_ROLL_MS"], let ms = Int(postRoll) { config.postRollMs = min(500, max(0, ms)) }
+        if let postRollMax = env["POST_ROLL_MAX_MS"], let ms = Int(postRollMax) { config.postRollMaxMs = min(5000, max(0, ms)) }
+        if let trailDb = env["TRAIL_SILENCE_DB"], let db = Double(trailDb) { config.trailSilenceDb = min(-10.0, max(-80.0, db)) }
         if let vad = env["VAD_MODE"], ["manual", "tuned", "auto"].contains(vad.lowercased()) { config.vadMode = vad.lowercased() }
         if let vadSilence = env["VAD_SILENCE_MS"], let ms = Int(vadSilence) { config.vadSilenceMs = min(5000, max(200, ms)) }
         if let micIdle = env["MIC_IDLE_TIMEOUT"], let sec = Int(micIdle) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
@@ -902,7 +914,12 @@ final class AudioCaptureEngine {
     private var chunkCount: Int = 0
     private var recordingStartTime: CFAbsoluteTime = 0
     private var lastMeterUpdateTime: CFAbsoluteTime = 0
-    
+    // Latest RMS level while recording, polled by stopRecording's adaptive trailing-capture
+    // wait; updated on every buffer (not just the 10Hz meter throttle) so the poll sees a
+    // fresh reading.
+    private var lastLevelDb: Double = -120.0
+    private var lastLevelTime: CFAbsoluteTime = 0
+
     // Pre-roll rolling ring buffer (default 400ms = 6400 samples @ 16kHz = 12800 bytes)
     private var preRollRingBuffer = Data()
     private let maxPreRollBytes: Int
@@ -1066,18 +1083,26 @@ final class AudioCaptureEngine {
             }
             lock.unlock()
 
-            // RMS math, meter rendering, and callbacks all run off the lock. int16Pointer is
-            // still valid here - it points into outputBuffer, a local var alive for this call.
-            if shouldUpdateMeter {
-                var sumSquare: Double = 0.0
-                let sampleCount = Int(outputBuffer.frameLength)
-                for i in 0..<sampleCount {
-                    let sample = Double(int16Pointer[i])
-                    sumSquare += sample * sample
-                }
-                let rms = sqrt(sumSquare / Double(max(sampleCount, 1)))
-                let db = 20.0 * log10(max(rms, 1.0) / 32768.0)
+            // RMS math runs for every buffer while recording (not just the meter's 10Hz
+            // throttle) so stopRecording's adaptive trailing-capture poll always sees a fresh
+            // level. int16Pointer is still valid here - it points into outputBuffer, a local
+            // var alive for this call. Meter rendering and the onAudioLevel callback stay
+            // gated by shouldUpdateMeter as before.
+            var sumSquare: Double = 0.0
+            let sampleCount = Int(outputBuffer.frameLength)
+            for i in 0..<sampleCount {
+                let sample = Double(int16Pointer[i])
+                sumSquare += sample * sample
+            }
+            let rms = sqrt(sumSquare / Double(max(sampleCount, 1)))
+            let db = 20.0 * log10(max(rms, 1.0) / 32768.0)
 
+            lock.lock()
+            lastLevelDb = db
+            lastLevelTime = CFAbsoluteTimeGetCurrent()
+            lock.unlock()
+
+            if shouldUpdateMeter {
                 let meterBars = renderVolumeMeter(db: db)
                 Logger.meter("\(ANSI.bold)\(ANSI.yellow)🎙️  RECORDING\(ANSI.reset) [\(meterBars)] \(String(format: "%5.1f", db)) dB | \(String(format: "%.2fs", elapsed)) | \(String(format: "%.1f", kbStreamed)) KB streamed (#\(chunkCountSnapshot))")
                 onAudioLevel?(db)
@@ -1127,14 +1152,51 @@ final class AudioCaptureEngine {
         }
     }
     
-    func stopRecording(gracePeriodMs: Int = 150) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int) {
-        // True hold duration is measured at entry, BEFORE the post-roll sleep - otherwise the
+    func stopRecording(gracePeriodMs: Int, maxTrailMs: Int, silenceThresholdDb: Double) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int) {
+        // True hold duration is measured at entry, BEFORE the post-roll wait - otherwise the
         // grace period pads every tap past the caller's micro-click duration threshold.
         let stopRequestTime = CFAbsoluteTimeGetCurrent()
 
-        // 1. Brief post-roll grace period (150ms) to allow final acoustic phonemes from mic hardware buffer to arrive
-        if gracePeriodMs > 0 {
+        // 1. Trailing capture: keep streaming while speech energy persists. gracePeriodMs is the
+        // required continuous-quiet window; maxTrailMs the hard cap. maxTrailMs <= gracePeriodMs
+        // degenerates to the old fixed post-roll. A stale level reading (engine stall) counts as
+        // quiet so a wedged tap can never hold the turn to the cap.
+        if gracePeriodMs <= 0 {
+            // Adaptation and fixed post-roll both disabled - no wait.
+        } else if maxTrailMs <= gracePeriodMs {
             usleep(useconds_t(gracePeriodMs * 1000))
+        } else {
+            let graceSec = Double(gracePeriodMs) / 1000.0
+            let maxTrailSec = Double(maxTrailMs) / 1000.0
+            var quietStart: CFAbsoluteTime? = nil
+            while true {
+                usleep(25_000)
+                let now = CFAbsoluteTimeGetCurrent()
+                lock.lock()
+                let levelDb = lastLevelDb
+                let levelTime = lastLevelTime
+                lock.unlock()
+
+                let speaking = (now - levelTime) <= 0.30 && levelDb >= silenceThresholdDb
+                if speaking {
+                    quietStart = nil
+                } else if quietStart == nil {
+                    quietStart = now
+                }
+
+                let elapsedSinceEntry = now - stopRequestTime
+                if let qs = quietStart, (now - qs) >= graceSec, elapsedSinceEntry >= graceSec {
+                    break
+                }
+                if elapsedSinceEntry >= maxTrailSec {
+                    break
+                }
+            }
+
+            let totalWaitMs = (CFAbsoluteTimeGetCurrent() - stopRequestTime) * 1000.0
+            if totalWaitMs > Double(gracePeriodMs) + 1.0 {
+                Logger.debug("AUDIO", "Trailing speech captured: +\(Int(totalWaitMs - Double(gracePeriodMs)))ms past post-roll")
+            }
         }
 
         // 2. Synchronously drain all in-flight audio processing tasks on the serial queue
@@ -3592,7 +3654,7 @@ final class JustSpeakApp {
     /// lifecycle, and is the only place that mutates currentTurnId / turnSettled / pendingFallbackTimer.
     private func runTurnPipeline(keyUpTime: CFAbsoluteTime) {
         let pipelineStartTime = CFAbsoluteTimeGetCurrent()
-        let (pcmData, duration, chunks, capturedBytes) = audioCapture.stopRecording(gracePeriodMs: config.postRollMs)
+        let (pcmData, duration, chunks, capturedBytes) = audioCapture.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
 
         // Discard accidental micro-clicks (< 150ms or < 2KB of real captured audio, ignoring
         // the fixed pre-roll/silence-flush padding that stopRecording always appends)
@@ -4083,7 +4145,7 @@ struct Diagnostics {
             Thread.sleep(forTimeInterval: 1.0)
         }
         
-        let (pcmData, duration, chunks, _) = engine.stopRecording()
+        let (pcmData, duration, chunks, _) = engine.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
         SoundManager.playCommitSound()
         engine.stopEngine()
         
