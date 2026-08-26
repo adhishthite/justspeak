@@ -1,0 +1,30 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+
+# User Custom Vocabulary (local overrides)
+vocabulary.txt
+.vocabulary.txt
+
+# macOS Metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Xcode & Swift Build Artifacts
+.build/
+*.build/
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+*.swp
+*.swo
+*~
+
+# Scratch & Logs
+*.log
+scratch/
+tmp/

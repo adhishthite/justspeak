@@ -1,0 +1,41 @@
+# JustSpeak Custom Vocabulary
+# ============================
+# Add custom words, domain terms, technical acronyms, or teammate names (one per line).
+# Lines starting with '#' are comments and ignored. Empty lines are ignored.
+#
+# Usage:
+#   1. Copy this file to 'vocabulary.txt' (auto-loaded by JustSpeak):
+#      cp vocabulary.example.txt vocabulary.txt
+#   2. Or set CUSTOM_VOCABULARY="word1, word2, word3" in your .env
+#   3. Or set CUSTOM_VOCABULARY_FILE="path/to/my_vocab.txt" in your .env
+
+# Names & Proper Nouns
+Adhish
+Kunal
+JustSpeak
+
+# AI & Agentic Architectures
+LangGraph
+LangChain
+FastAPI
+Vertex AI
+BigQuery
+TensorFlow
+PyTorch
+RAG
+LLM
+MCP
+
+# Engineering & Cloud Infrastructure
+Kubernetes
+Docker
+Next.js
+TypeScript
+Biome
+PostgreSQL
+Redis
+RabbitMQ
+gRPC
+WebSockets
+Linear PCM
+CoreAudio

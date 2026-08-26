@@ -1,0 +1,2878 @@
+#!/usr/bin/swift
+//
+//  justspeak.swift
+//  JustSpeak - Ultra-Low-Latency Push-to-Talk macOS Voice Dictation
+//
+//  Zero native compiled dependencies. Pure Apple Swift.
+//  Uses AVFoundation, CoreGraphics CGEvent, and Gemini Live WebSockets / REST.
+//
+
+import Foundation
+import AVFoundation
+import AppKit
+import CoreGraphics
+import ApplicationServices
+import Darwin
+
+// Unbuffer standard output so terminal output flushes immediately in compiled binary
+setbuf(stdout, nil)
+setbuf(stderr, nil)
+
+// MARK: - ANSI Color Styling & High-Performance Logging
+
+enum ANSI {
+    static let reset = "\u{001B}[0m"
+    static let bold = "\u{001B}[1m"
+    static let dim = "\u{001B}[2m"
+    static let red = "\u{001B}[31m"
+    static let green = "\u{001B}[32m"
+    static let yellow = "\u{001B}[33m"
+    static let blue = "\u{001B}[34m"
+    static let magenta = "\u{001B}[35m"
+    static let cyan = "\u{001B}[36m"
+    static let white = "\u{001B}[37m"
+    static let gray = "\u{001B}[90m"
+    static let clearLine = "\u{001B}[2K\r"
+}
+
+struct Logger {
+    static var isVerbose: Bool = true
+    
+    // POSIX microsecond timestamp formatter (zero heap allocations)
+    static func timestamp() -> String {
+        var tv = timeval()
+        gettimeofday(&tv, nil)
+        var tm_val = tm()
+        localtime_r(&tv.tv_sec, &tm_val)
+        var buf = [CChar](repeating: 0, count: 32)
+        strftime(&buf, buf.count, "%H:%M:%S", &tm_val)
+        let ms = Int(tv.tv_usec) / 1000
+        return String(cString: buf) + String(format: ".%03d", ms)
+    }
+    
+    static func info(_ tag: String, _ message: String) {
+        print("\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(ANSI.bold)\(ANSI.cyan)[\(tag)]\(ANSI.reset) \(message)")
+        fflush(stdout)
+    }
+    
+    static func success(_ tag: String, _ message: String) {
+        print("\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(ANSI.bold)\(ANSI.green)[\(tag)]\(ANSI.reset) \(message)")
+        fflush(stdout)
+    }
+    
+    static func warn(_ tag: String, _ message: String) {
+        print("\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(ANSI.bold)\(ANSI.yellow)[\(tag)]\(ANSI.reset) \(message)")
+        fflush(stdout)
+    }
+    
+    static func error(_ tag: String, _ message: String) {
+        print("\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(ANSI.bold)\(ANSI.red)[\(tag)]\(ANSI.reset) \(message)")
+        fflush(stdout)
+    }
+    
+    static func debug(_ tag: String, _ message: String) {
+        guard isVerbose else { return }
+        print("\(ANSI.gray)[\(timestamp())] [\(tag)] \(message)\(ANSI.reset)")
+        fflush(stdout)
+    }
+    
+    static func meter(_ message: String) {
+        print("\(ANSI.clearLine)\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(message)", terminator: "")
+        fflush(stdout)
+    }
+    
+    static func endMeter() {
+        print("")
+        fflush(stdout)
+    }
+}
+
+// MARK: - Configuration Manager
+
+struct Config {
+    var geminiApiKey: String = ""
+    var geminiModel: String = "gemini-3.5-flash-lite"
+    var geminiLiveModel: String = "gemini-3.5-transcribe-live"
+    var smartTranscription: Bool = true
+    var languageCodes: [String] = ["en", "mr"]
+    var customVocabulary: [String] = []
+    var customVocabularyFile: String = ""
+    var hotkey: String = "right_option"
+    var hotkeyMode: String = "push_to_talk" // "push_to_talk" or "toggle"
+    var soundFeedback: Bool = true
+    var showHUD: Bool = true
+    var enableLiveWebSocket: Bool = true
+    var restFallbackTimeout: Double = 4.0
+    var restoreClipboard: Bool = true
+    var logLevel: String = "verbose"
+    
+    static func parseVocabulary(from text: String) -> [String] {
+        var items: [String] = []
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+            if let data = trimmed.data(using: .utf8),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [String] {
+                return arr.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            }
+        }
+        
+        let lines = text.components(separatedBy: .newlines)
+        for line in lines {
+            let cleanLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if cleanLine.isEmpty || cleanLine.hasPrefix("#") { continue }
+            
+            if cleanLine.contains(",") {
+                let parts = cleanLine.components(separatedBy: ",")
+                for part in parts {
+                    let cleaned = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleaned.isEmpty && !cleaned.hasPrefix("#") {
+                        items.append(cleaned)
+                    }
+                }
+            } else {
+                items.append(cleanLine)
+            }
+        }
+        return items
+    }
+    
+    static func loadVocabularyFile(path: String) -> [String] {
+        let expanded = NSString(string: path).expandingTildeInPath
+        if let content = try? String(contentsOfFile: expanded, encoding: .utf8) {
+            return parseVocabulary(from: content)
+        }
+        return []
+    }
+    
+    static func load() -> Config {
+        var config = Config()
+        var inlineVocabRaw = ""
+        var vocabFile = ""
+        var rawLanguages: String? = nil
+        
+        let currentDir = FileManager.default.currentDirectoryPath
+        let execDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
+        let envPaths = [
+            "\(currentDir)/.env",
+            "\(execDir)/.env"
+        ]
+        
+        for envPath in envPaths {
+            if let content = try? String(contentsOfFile: envPath, encoding: .utf8) {
+                let lines = content.components(separatedBy: .newlines)
+                for line in lines {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+                    
+                    let parts = trimmed.split(separator: "=", maxSplits: 1).map(String.init)
+                    if parts.count == 2 {
+                        let key = parts[0].trimmingCharacters(in: .whitespaces)
+                        var value = parts[1].trimmingCharacters(in: .whitespaces)
+                        if (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
+                            value = String(value.dropFirst().dropLast())
+                        }
+                        
+                        switch key {
+                        case "GEMINI_API_KEY": config.geminiApiKey = value
+                        case "GEMINI_MODEL": config.geminiModel = value
+                        case "GEMINI_LIVE_MODEL": config.geminiLiveModel = value
+                        case "SMART_TRANSCRIPTION": config.smartTranscription = (value.lowercased() == "true" || value == "1")
+                        case "LANGUAGE_CODES": rawLanguages = value
+                        case "CUSTOM_VOCABULARY": inlineVocabRaw = value
+                        case "CUSTOM_VOCABULARY_FILE": vocabFile = value
+                        case "HOTKEY": config.hotkey = value.lowercased()
+                        case "HOTKEY_MODE": config.hotkeyMode = value.lowercased()
+                        case "SOUND_FEEDBACK": config.soundFeedback = (value.lowercased() == "true" || value == "1")
+                        case "SHOW_HUD": config.showHUD = (value.lowercased() == "true" || value == "1")
+                        case "ENABLE_LIVE_WEBSOCKET": config.enableLiveWebSocket = (value.lowercased() == "true" || value == "1")
+                        case "RESTORE_CLIPBOARD": config.restoreClipboard = (value.lowercased() == "true" || value == "1")
+                        case "REST_FALLBACK_TIMEOUT": if let t = Double(value) { config.restFallbackTimeout = t }
+                        case "LOG_LEVEL": config.logLevel = value.lowercased()
+                        default: break
+                        }
+                    }
+                }
+                break
+            }
+        }
+        
+        let env = ProcessInfo.processInfo.environment
+        if let key = env["GEMINI_API_KEY"], !key.isEmpty { config.geminiApiKey = key }
+        if let model = env["GEMINI_MODEL"], !model.isEmpty { config.geminiModel = model }
+        if let liveModel = env["GEMINI_LIVE_MODEL"], !liveModel.isEmpty { config.geminiLiveModel = liveModel }
+        if let smart = env["SMART_TRANSCRIPTION"], !smart.isEmpty { config.smartTranscription = (smart.lowercased() == "true" || smart == "1") }
+        if let langs = env["LANGUAGE_CODES"], !langs.isEmpty { rawLanguages = langs }
+        if let vocab = env["CUSTOM_VOCABULARY"], !vocab.isEmpty { inlineVocabRaw = vocab }
+        if let vf = env["CUSTOM_VOCABULARY_FILE"], !vf.isEmpty { vocabFile = vf }
+        if let hk = env["HOTKEY"], !hk.isEmpty { config.hotkey = hk.lowercased() }
+        if let mode = env["HOTKEY_MODE"], !mode.isEmpty { config.hotkeyMode = mode.lowercased() }
+        if let sound = env["SOUND_FEEDBACK"] { config.soundFeedback = (sound.lowercased() == "true" || sound == "1") }
+        if let hud = env["SHOW_HUD"] { config.showHUD = (hud.lowercased() == "true" || hud == "1") }
+        if let ws = env["ENABLE_LIVE_WEBSOCKET"] { config.enableLiveWebSocket = (ws.lowercased() == "true" || ws == "1") }
+        if let r = env["RESTORE_CLIPBOARD"] { config.restoreClipboard = (r.lowercased() == "true" || r == "1") }
+        if let timeout = env["REST_FALLBACK_TIMEOUT"], let t = Double(timeout) { config.restFallbackTimeout = t }
+        if let log = env["LOG_LEVEL"] { config.logLevel = log.lowercased() }
+        
+        if let raw = rawLanguages {
+            let parsedLangs = raw.components(separatedBy: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+            if parsedLangs.contains("auto") || parsedLangs.contains("all") {
+                config.languageCodes = []
+            } else if !parsedLangs.isEmpty {
+                config.languageCodes = parsedLangs
+            }
+        }
+        
+        config.customVocabularyFile = vocabFile
+        
+        var combinedVocab: [String] = []
+        if !inlineVocabRaw.isEmpty {
+            combinedVocab.append(contentsOf: parseVocabulary(from: inlineVocabRaw))
+        }
+        
+        // Check specified vocabulary file or default candidate locations
+        var candidateFiles: [String] = []
+        if !vocabFile.isEmpty {
+            candidateFiles.append(vocabFile)
+            if !vocabFile.hasPrefix("/") {
+                candidateFiles.append("\(currentDir)/\(vocabFile)")
+                candidateFiles.append("\(execDir)/\(vocabFile)")
+            }
+        } else {
+            candidateFiles.append("\(currentDir)/vocabulary.txt")
+            candidateFiles.append("\(currentDir)/.vocabulary.txt")
+            candidateFiles.append("\(execDir)/vocabulary.txt")
+            candidateFiles.append("\(execDir)/.vocabulary.txt")
+        }
+        
+        for candidate in candidateFiles {
+            let items = loadVocabularyFile(path: candidate)
+            if !items.isEmpty {
+                combinedVocab.append(contentsOf: items)
+                if config.customVocabularyFile.isEmpty {
+                    config.customVocabularyFile = candidate
+                }
+                break
+            }
+        }
+        
+        // Deduplicate while preserving order
+        var seen = Set<String>()
+        var deduped: [String] = []
+        for word in combinedVocab {
+            let normalized = word.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalized.isEmpty && !seen.contains(normalized.lowercased()) {
+                seen.insert(normalized.lowercased())
+                deduped.append(normalized)
+            }
+        }
+        config.customVocabulary = deduped
+        
+        Logger.isVerbose = (config.logLevel == "verbose")
+        return config
+    }
+}
+
+// MARK: - Binary Helpers (WAV Header Generator)
+
+extension FixedWidthInteger {
+    var littleEndianBytes: [UInt8] {
+        withUnsafeBytes(of: self.littleEndian) { Array($0) }
+    }
+}
+
+func createWavData(from pcm16Data: Data, sampleRate: Int = 16000, channels: Int = 1) -> Data {
+    var wav = Data()
+    let dataSize = pcm16Data.count
+    let chunkSize = UInt32(36 + dataSize)
+    
+    // RIFF Chunk Descriptor
+    wav.append("RIFF".data(using: .ascii)!)
+    wav.append(contentsOf: chunkSize.littleEndianBytes)
+    wav.append("WAVE".data(using: .ascii)!)
+    
+    // fmt Sub-chunk
+    wav.append("fmt ".data(using: .ascii)!)
+    wav.append(contentsOf: UInt32(16).littleEndianBytes) // Subchunk1Size (16 for PCM)
+    wav.append(contentsOf: UInt16(1).littleEndianBytes)  // AudioFormat (1 = PCM Linear)
+    wav.append(contentsOf: UInt16(channels).littleEndianBytes)
+    wav.append(contentsOf: UInt32(sampleRate).littleEndianBytes)
+    wav.append(contentsOf: UInt32(sampleRate * channels * 2).littleEndianBytes) // ByteRate
+    wav.append(contentsOf: UInt16(channels * 2).littleEndianBytes)              // BlockAlign
+    wav.append(contentsOf: UInt16(16).littleEndianBytes)                         // BitsPerSample
+    
+    // data Sub-chunk
+    wav.append("data".data(using: .ascii)!)
+    wav.append(contentsOf: UInt32(dataSize).littleEndianBytes)
+    wav.append(pcm16Data)
+    
+    return wav
+}
+
+// MARK: - Audio Feedback Sound Manager (Apple System Earcons)
+
+final class SoundManager {
+    private static let startSoundPaths = [
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/begin_record.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_begin.caf"
+    ]
+    
+    private static let commitSoundPaths = [
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_confirm.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/end_record.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/acknowledgment_sent.caf"
+    ]
+    
+    private static let errorSoundPaths = [
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_cancel.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/mic_unmute_fail.caf"
+    ]
+    
+    private static var startSound: NSSound? = {
+        for path in startSoundPaths {
+            if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
+                sound.volume = 0.55
+                return sound
+            }
+        }
+        let fallback = NSSound(named: "Blow")
+        fallback?.volume = 0.45
+        return fallback
+    }()
+    
+    private static var commitSound: NSSound? = {
+        for path in commitSoundPaths {
+            if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
+                sound.volume = 0.65
+                return sound
+            }
+        }
+        let fallback = NSSound(named: "Hero")
+        fallback?.volume = 0.45
+        return fallback
+    }()
+    
+    private static var errorSound: NSSound? = {
+        for path in errorSoundPaths {
+            if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
+                sound.volume = 0.55
+                return sound
+            }
+        }
+        let fallback = NSSound(named: "Funk")
+        fallback?.volume = 0.45
+        return fallback
+    }()
+    
+    static func playStartSound() {
+        DispatchQueue.global(qos: .userInteractive).async {
+            startSound?.stop()
+            startSound?.play()
+        }
+    }
+    
+    static func playCommitSound() {
+        DispatchQueue.global(qos: .userInteractive).async {
+            commitSound?.stop()
+            commitSound?.play()
+        }
+    }
+    
+    static func playErrorSound() {
+        DispatchQueue.global(qos: .userInteractive).async {
+            errorSound?.stop()
+            errorSound?.play()
+        }
+    }
+}
+
+// MARK: - Text Injection & Clipboard Engine
+
+struct TextInjector {
+    private static func snapshotClipboard() -> [NSPasteboardItem] {
+        let pb = NSPasteboard.general
+        guard let items = pb.pasteboardItems else { return [] }
+        var copiedItems: [NSPasteboardItem] = []
+        for item in items {
+            let newItem = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    newItem.setData(data, forType: type)
+                }
+            }
+            copiedItems.append(newItem)
+        }
+        return copiedItems
+    }
+    
+    private static func restoreClipboard(_ savedItems: [NSPasteboardItem]) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if !savedItems.isEmpty {
+            pb.writeObjects(savedItems)
+        }
+    }
+    
+    static func inject(text: String, restorePreviousClipboard: Bool = true, completionSound: Bool = true) -> (success: Bool, latencyMs: Double) {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            Logger.warn("INJECT", "Refusing to inject empty string.")
+            return (false, 0)
+        }
+        
+        // 1. Snapshot previous clipboard to preserve user data
+        let previousClipboard = restorePreviousClipboard ? snapshotClipboard() : []
+        
+        // 2. Put text onto pasteboard for active app injection
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        let pbSuccess = pasteboard.setString(trimmed, forType: .string)
+        guard pbSuccess else {
+            Logger.error("INJECT", "Failed to write text to NSPasteboard.")
+            return (false, 0)
+        }
+        
+        // 3. Synthesize Cmd+V via CGEvent (posted exclusively to cghidEventTap)
+        let source = CGEventSource(stateID: .hidSystemState)
+        let vKeyCode: CGKeyCode = 0x09 // Virtual keycode for 'v'
+        
+        var eventSuccess = false
+        if let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true),
+           let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false) {
+            
+            keyDown.flags = .maskCommand
+            keyUp.flags = .maskCommand
+            
+            keyDown.post(tap: .cghidEventTap)
+            usleep(25_000) // 25ms key press hold
+            keyUp.post(tap: .cghidEventTap)
+            
+            eventSuccess = true
+        }
+        
+        // 4. Fallback to AppleScript only if CGEvent dispatch failed
+        if !eventSuccess {
+            Logger.warn("INJECT", "CGEvent posting failed; executing AppleScript System Events fallback...")
+            let appleScript = NSAppleScript(source: "tell application \"System Events\" to keystroke \"v\" using command down")
+            var errorInfo: NSDictionary?
+            appleScript?.executeAndReturnError(&errorInfo)
+            if let error = errorInfo {
+                Logger.error("INJECT", "AppleScript fallback error: \(error)")
+            } else {
+                eventSuccess = true
+            }
+        }
+        
+        // 5. Asynchronously restore user's previous clipboard after 350ms (giving Electron apps like Slack/VSCode time to consume)
+        if restorePreviousClipboard && !previousClipboard.isEmpty {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
+                restoreClipboard(previousClipboard)
+            }
+        }
+        
+        if completionSound {
+            SoundManager.playCommitSound()
+        }
+        
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+        return (eventSuccess, elapsed)
+    }
+}
+
+// MARK: - Audio Capture Engine with Pre-roll Ring Buffer & Offloaded Threading
+
+final class AudioCaptureEngine {
+    private let audioEngine = AVAudioEngine()
+    private var audioConverter: AVAudioConverter?
+    private let targetFormat: AVAudioFormat
+    
+    // Dedicated background audio processing queue (keeps CoreAudio render thread non-blocking)
+    private let audioProcessingQueue = DispatchQueue(label: "com.justspeak.audioProcessing", qos: .userInteractive)
+    
+    private let lock = NSLock()
+    private(set) var isRecording: Bool = false
+    private var recordedPCMData = Data()
+    private var chunkCount: Int = 0
+    private var recordingStartTime: CFAbsoluteTime = 0
+    private var lastMeterUpdateTime: CFAbsoluteTime = 0
+    
+    // Pre-roll rolling ring buffer (~250ms = 4000 samples @ 16kHz = 8000 bytes)
+    private var preRollRingBuffer = Data()
+    private let maxPreRollBytes = 8000
+    
+    // Streaming chunk accumulator (~150ms chunks = 4800 bytes)
+    private var pendingChunkBuffer = Data()
+    private let streamingChunkTargetBytes = 4800
+    
+    var onAudioChunk: ((Data) -> Void)?
+    var onAudioLevel: ((Double) -> Void)?
+    
+    init() {
+        // Standard 16kHz 16-bit Mono Linear PCM for speech AI models
+        self.targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 16000.0,
+            channels: 1,
+            interleaved: true
+        )!
+    }
+    
+    func setup() -> Bool {
+        let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        
+        Logger.info("MIC", "Hardware format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch, \(inputFormat.formatDescription)")
+        Logger.info("MIC", "Target format: 16000 Hz, 1 ch, 16-bit Linear PCM")
+        
+        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+            Logger.error("MIC", "Failed to construct AVAudioConverter from \(inputFormat) to \(targetFormat)")
+            return false
+        }
+        self.audioConverter = converter
+        
+        // Tap callback: ONLY copies incoming buffer and pushes to serial audio queue (0 blocking operations on render thread)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] (buffer, when) in
+            guard let self = self else { return }
+            let bufferCopy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity)!
+            bufferCopy.frameLength = buffer.frameLength
+            for i in 0..<Int(buffer.format.channelCount) {
+                if let src = buffer.floatChannelData?[i], let dst = bufferCopy.floatChannelData?[i] {
+                    memcpy(dst, src, Int(buffer.frameLength) * MemoryLayout<Float>.size)
+                }
+            }
+            
+            self.audioProcessingQueue.async {
+                self.processIncomingBufferOnQueue(bufferCopy)
+            }
+        }
+        
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            Logger.success("MIC", "Audio engine pre-warmed & running in background (zero keydown wake-up latency).")
+            return true
+        } catch {
+            Logger.error("MIC", "Could not start AVAudioEngine: \(error.localizedDescription)")
+            return false
+        }
+    }
+    
+    private func processIncomingBufferOnQueue(_ inputBuffer: AVAudioPCMBuffer) {
+        guard let converter = audioConverter else { return }
+        
+        let ratio = 16000.0 / inputBuffer.format.sampleRate
+        let outCapacity = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio + 64)
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return }
+        
+        var error: NSError?
+        var consumed = false
+        
+        let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+            if !consumed {
+                consumed = true
+                outStatus.pointee = .haveData
+                return inputBuffer
+            } else {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+        }
+        
+        if status == .haveData, outputBuffer.frameLength > 0, let int16Pointer = outputBuffer.int16ChannelData?[0] {
+            let byteCount = Int(outputBuffer.frameLength) * 2
+            let chunkData = Data(bytes: int16Pointer, count: byteCount)
+            
+            lock.lock()
+            let currentlyRecording = isRecording
+            
+            if !currentlyRecording {
+                // Maintain 250ms pre-roll circular buffer while idle
+                preRollRingBuffer.append(chunkData)
+                if preRollRingBuffer.count > maxPreRollBytes {
+                    preRollRingBuffer.removeFirst(preRollRingBuffer.count - maxPreRollBytes)
+                }
+                lock.unlock()
+                return
+            }
+            
+            recordedPCMData.append(chunkData)
+            pendingChunkBuffer.append(chunkData)
+            chunkCount += 1
+            
+            // Calculate RMS and render meter at 10Hz throttle (avoids terminal flooding)
+            let now = CFAbsoluteTimeGetCurrent()
+            if (now - lastMeterUpdateTime) > 0.10 {
+                lastMeterUpdateTime = now
+                var sumSquare: Double = 0.0
+                let sampleCount = Int(outputBuffer.frameLength)
+                for i in 0..<sampleCount {
+                    let sample = Double(int16Pointer[i])
+                    sumSquare += sample * sample
+                }
+                let rms = sqrt(sumSquare / Double(max(sampleCount, 1)))
+                let db = 20.0 * log10(max(rms, 1.0) / 32768.0)
+                
+                let elapsed = now - recordingStartTime
+                let meterBars = renderVolumeMeter(db: db)
+                let kbStreamed = Double(recordedPCMData.count) / 1024.0
+                Logger.meter("\(ANSI.bold)\(ANSI.yellow)🎙️  RECORDING\(ANSI.reset) [\(meterBars)] \(String(format: "%5.1f", db)) dB | \(String(format: "%.2fs", elapsed)) | \(String(format: "%.1f", kbStreamed)) KB streamed (#\(chunkCount))")
+                onAudioLevel?(db)
+            }
+            
+            // Coalesce audio into ~150ms frames before dispatching to WebSocket
+            if pendingChunkBuffer.count >= streamingChunkTargetBytes {
+                let toStream = pendingChunkBuffer
+                pendingChunkBuffer.removeAll(keepingCapacity: true)
+                lock.unlock()
+                onAudioChunk?(toStream)
+            } else {
+                lock.unlock()
+            }
+        }
+    }
+    
+    private func renderVolumeMeter(db: Double) -> String {
+        let normalized = max(0.0, min(1.0, (db + 50.0) / 50.0))
+        let totalBlocks = 12
+        let filledBlocks = Int(round(normalized * Double(totalBlocks)))
+        let emptyBlocks = totalBlocks - filledBlocks
+        
+        let filledStr = String(repeating: "█", count: filledBlocks)
+        let emptyStr = String(repeating: "░", count: emptyBlocks)
+        return "\(ANSI.green)\(filledStr)\(ANSI.gray)\(emptyStr)\(ANSI.reset)"
+    }
+    
+    func startRecording() {
+        lock.lock()
+        recordedPCMData.removeAll(keepingCapacity: true)
+        pendingChunkBuffer.removeAll(keepingCapacity: true)
+        
+        // Prepend rolling pre-roll buffer to prevent clipped first syllable
+        if !preRollRingBuffer.isEmpty {
+            recordedPCMData.append(preRollRingBuffer)
+            pendingChunkBuffer.append(preRollRingBuffer)
+            preRollRingBuffer.removeAll(keepingCapacity: true)
+        }
+        
+        chunkCount = 0
+        recordingStartTime = CFAbsoluteTimeGetCurrent()
+        lastMeterUpdateTime = 0
+        isRecording = true
+        lock.unlock()
+    }
+    
+    func stopRecording(gracePeriodMs: Int = 150) -> (pcmData: Data, duration: Double, chunkCount: Int) {
+        // 1. Brief post-roll grace period (150ms) to allow final acoustic phonemes from mic hardware buffer to arrive
+        if gracePeriodMs > 0 {
+            usleep(useconds_t(gracePeriodMs * 1000))
+        }
+        
+        // 2. Synchronously drain all in-flight audio processing tasks on the serial queue
+        audioProcessingQueue.sync { }
+        
+        lock.lock()
+        isRecording = false
+        
+        // 3. Flush any trailing pending chunk
+        if !pendingChunkBuffer.isEmpty {
+            let trailing = pendingChunkBuffer
+            pendingChunkBuffer.removeAll(keepingCapacity: true)
+            onAudioChunk?(trailing)
+        }
+        
+        // 4. Append 700ms acoustic lookahead silence flush (22,400 bytes @ 16kHz 16-bit mono)
+        // This satisfies the bidirectional acoustic lookahead window required by speech encoders to finalize trailing words
+        let silenceFlushBytes = 22400
+        let silenceData = Data(count: silenceFlushBytes)
+        recordedPCMData.append(silenceData)
+        onAudioChunk?(silenceData)
+        
+        let data = recordedPCMData
+        let duration = CFAbsoluteTimeGetCurrent() - recordingStartTime
+        let chunks = chunkCount
+        lock.unlock()
+        
+        Logger.endMeter()
+        return (data, duration, chunks)
+    }
+    
+    func stopEngine() {
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+    }
+}
+
+// MARK: - Gemini Live WebSocket Client (TEXT Modality + Manual Activity Detection + Auto-Reconnect)
+
+final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
+    private let apiKey: String
+    private let model: String
+    private var webSocketTask: URLSessionWebSocketTask?
+    private var urlSession: URLSession!
+    
+    private let lock = NSLock()
+    private(set) var isConnected: Bool = false
+    private(set) var isReady: Bool = false
+    
+    private var currentTurnText: String = ""
+    private var firstTokenLatencyMs: Double = 0
+    private var turnCommitTime: CFAbsoluteTime = 0
+    private var lastTokenReceivedTime: CFAbsoluteTime = 0
+    private var lastPostCommitTokenTime: CFAbsoluteTime? = nil
+    private var isCommitting: Bool = false
+    private var hasFiredTurnCompletion: Bool = false
+    private var turnCompletion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?
+    var onLiveTextUpdate: ((String) -> Void)?
+    private let smartTranscription: Bool
+    private let languageCodes: [String]
+    private let customVocabulary: [String]
+    
+    private var settleWorkItem: DispatchWorkItem?
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var reconnectAttempts: Int = 0
+    
+    init(
+        apiKey: String,
+        model: String = "gemini-3.5-transcribe-live",
+        smartTranscription: Bool = true,
+        languageCodes: [String] = ["en", "mr"],
+        customVocabulary: [String] = []
+    ) {
+        self.apiKey = apiKey
+        self.model = model
+        self.smartTranscription = smartTranscription
+        self.languageCodes = languageCodes
+        self.customVocabulary = customVocabulary
+        super.init()
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = true
+        config.timeoutIntervalForRequest = 10.0
+        self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+    
+    func connect() {
+        guard !apiKey.isEmpty else { return }
+        
+        reconnectWorkItem?.cancel()
+        
+        let wsUrlString = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=\(apiKey)"
+        guard let url = URL(string: wsUrlString) else {
+            Logger.error("WS", "Invalid WebSocket URL.")
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10.0
+        
+        let task = urlSession.webSocketTask(with: request)
+        self.webSocketTask = task
+        task.resume()
+        
+        Logger.info("WS", "Connecting to Gemini Live WebSockets (\(model))...")
+        sendSetupMessage()
+        listenForMessages()
+    }
+    
+    private func sendSetupMessage() {
+        let setupPayload: [String: Any]
+        if model.contains("transcribe") {
+            // Dedicated STT Live Streaming Model with Smart Transcription, Language Detection & Custom Vocabulary
+            var audioConfig: [String: Any] = [:]
+            if smartTranscription {
+                audioConfig["mode"] = "SMART"
+            }
+            if !languageCodes.isEmpty {
+                audioConfig["languageCodes"] = languageCodes
+            }
+            if !customVocabulary.isEmpty {
+                audioConfig["customVocabulary"] = customVocabulary
+            }
+            
+            var genConfig: [String: Any] = [
+                "responseModalities": ["TEXT"]
+            ]
+            if !audioConfig.isEmpty {
+                genConfig["audioTranscriptionConfig"] = audioConfig
+            }
+            
+            setupPayload = [
+                "setup": [
+                    "model": "models/\(model)",
+                    "generationConfig": genConfig
+                ]
+            ]
+        } else {
+            // Multimodal Conversational Audio Model with manual activity detection
+            var instruction = """
+            You are an ultra-fast, high-precision voice dictation engine.
+            Transcribe the user's spoken words verbatim and polish into clean written prose.
+            Rules:
+            1. Output ONLY the exact transcribed words with proper grammar, punctuation, and capitalization.
+            2. Remove speech disfluencies (um, uh, like, you know, stuttering, repeated words).
+            3. Never converse, reply to questions, add commentary, or say things like "I understand", "Sure", or "Here is...".
+            4. Never wrap text in quotation marks or code fences unless explicitly dictating code.
+            5. If the audio is silent or unintelligible, output nothing.
+            """
+            if !languageCodes.isEmpty {
+                instruction += "\nTarget language(s): \(languageCodes.joined(separator: ", "))"
+            }
+            if !customVocabulary.isEmpty {
+                instruction += "\n\nCustom vocabulary and technical terms to recognize accurately: \(customVocabulary.joined(separator: ", "))"
+            }
+            
+            setupPayload = [
+                "setup": [
+                    "model": "models/\(model)",
+                    "generationConfig": [
+                        "responseModalities": ["AUDIO"],
+                        "thinkingConfig": [
+                            "thinkingLevel": "minimal"
+                        ]
+                    ],
+                    "realtimeInputConfig": [
+                        "automaticActivityDetection": [
+                            "disabled": true
+                        ]
+                    ],
+                    "inputAudioTranscription": [:],
+                    "outputAudioTranscription": [:],
+                    "systemInstruction": [
+                        "parts": [
+                            [
+                                "text": instruction
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        }
+        
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: setupPayload),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            Logger.error("WS", "Failed to serialize setup message.")
+            return
+        }
+        
+        webSocketTask?.send(.string(jsonString)) { [weak self] error in
+            if let error = error {
+                Logger.error("WS", "Setup message send failed: \(error.localizedDescription)")
+                self?.isConnected = false
+            } else {
+                Logger.debug("WS", "Setup handshake dispatched to server.")
+            }
+        }
+    }
+    
+    private func listenForMessages() {
+        webSocketTask?.receive { [weak self] result in
+            guard let self = self else { return }
+            
+            switch result {
+            case .success(let message):
+                self.handleIncomingMessage(message)
+                self.listenForMessages() // Continue listening
+                
+            case .failure(let error):
+                self.lock.lock()
+                self.isConnected = false
+                self.isReady = false
+                let pendingCompletion = self.hasFiredTurnCompletion ? nil : self.turnCompletion
+                self.turnCompletion = nil
+                self.lock.unlock()
+                
+                Logger.warn("WS", "WebSocket disconnected: \(error.localizedDescription)")
+                pendingCompletion?(.failure(error))
+                self.scheduleReconnect()
+            }
+        }
+    }
+    
+    private func handleIncomingMessage(_ message: URLSessionWebSocketTask.Message) {
+        var rawData: Data?
+        switch message {
+        case .string(let str):
+            rawData = str.data(using: .utf8)
+        case .data(let data):
+            rawData = data
+        @unknown default:
+            break
+        }
+        
+        guard let data = rawData,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        
+        lock.lock()
+        defer { lock.unlock() }
+        
+        // 1. Handshake confirmation
+        if json["setupComplete"] != nil {
+            self.isConnected = true
+            self.isReady = true
+            self.reconnectAttempts = 0
+            Logger.success("WS", "Gemini Live session established & ready for streaming.")
+            return
+        }
+        
+        // 2. Server goAway notification (Server scheduled disconnect)
+        if json["goAway"] != nil {
+            Logger.warn("WS", "Server sent goAway signal. Preemptively scheduling reconnect...")
+            self.scheduleReconnect()
+            return
+        }
+        
+        // 3. Server content (transcription streaming)
+        if let serverContent = json["serverContent"] as? [String: Any] {
+            var updatedText: String? = nil
+            var isUserSpeech = false
+            
+            // PRIORITY 1: Progressive Interim Transcription (e.g. gemini-3.5-transcribe-live)
+            if let interim = serverContent["interimInputTranscription"] as? [String: Any],
+               let text = interim["text"] as? String, !text.isEmpty {
+                updatedText = text
+                isUserSpeech = true
+            }
+            // PRIORITY 2: Finalized inputAudioTranscription
+            else if let inputAudio = serverContent["inputAudioTranscription"] as? [String: Any],
+                    let text = inputAudio["text"] as? String, !text.isEmpty {
+                updatedText = text
+                isUserSpeech = true
+            }
+            // PRIORITY 3: Alternative inputTranscription
+            else if let inputTranscription = serverContent["inputTranscription"] as? [String: Any],
+                    let text = inputTranscription["text"] as? String, !text.isEmpty {
+                updatedText = text
+                isUserSpeech = true
+            }
+            // PRIORITY 4: Multimodal text delta from modelTurn
+            else if let modelTurn = serverContent["modelTurn"] as? [String: Any],
+                    let parts = modelTurn["parts"] as? [[String: Any]] {
+                var delta = ""
+                for part in parts {
+                    if let text = part["text"] as? String {
+                        delta += text
+                    }
+                }
+                if !delta.isEmpty {
+                    updatedText = currentTurnText + delta
+                }
+            } else if let outputTranscription = serverContent["outputTranscription"] as? [String: Any],
+                      let text = outputTranscription["text"] as? String, !text.isEmpty {
+                updatedText = currentTurnText + text
+            }
+            
+            if let newText = updatedText {
+                let now = CFAbsoluteTimeGetCurrent()
+                self.lastTokenReceivedTime = now
+                if self.isCommitting {
+                    self.lastPostCommitTokenTime = now
+                }
+                if currentTurnText.isEmpty && firstTokenLatencyMs == 0 && turnCommitTime > 0 {
+                    firstTokenLatencyMs = (now - turnCommitTime) * 1000.0
+                }
+                currentTurnText = newText
+                let textCopy = currentTurnText
+                let elapsedMs = turnCommitTime > 0 ? (now - turnCommitTime) * 1000.0 : 0
+                let label = isUserSpeech ? "⚡ DICTATING" : "⚡ STREAMING"
+                Logger.meter("\(ANSI.bold)\(ANSI.cyan)\(label)\(ANSI.reset) [\(String(format: "%.0f", elapsedMs))ms]: \(ANSI.bold)\(currentTurnText.replacingOccurrences(of: "\n", with: " "))\(ANSI.reset)")
+                onLiveTextUpdate?(textCopy)
+            }
+            
+            // Conversational model explicit turn completion
+            let isTurnComplete = (serverContent["turnComplete"] as? Bool) ?? (serverContent["turnComplete"] != nil)
+            let isGenComplete = (serverContent["generationComplete"] as? Bool) ?? (serverContent["generationComplete"] != nil)
+            
+            if (isTurnComplete || isGenComplete) && !currentTurnText.isEmpty && !hasFiredTurnCompletion {
+                hasFiredTurnCompletion = true
+                isCommitting = false
+                settleWorkItem?.cancel()
+                settleWorkItem = nil
+                
+                Logger.endMeter()
+                let totalLatencyMs = (CFAbsoluteTimeGetCurrent() - turnCommitTime) * 1000.0
+                let text = currentTurnText
+                currentTurnText = ""
+                let firstToken = firstTokenLatencyMs
+                firstTokenLatencyMs = 0
+                
+                let completion = self.turnCompletion
+                self.turnCompletion = nil
+                
+                DispatchQueue.global().async {
+                    completion?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
+                }
+            }
+        }
+    }
+    
+    func startNewTurn() {
+        lock.lock()
+        self.settleWorkItem?.cancel()
+        self.settleWorkItem = nil
+        self.isCommitting = false
+        self.currentTurnText = ""
+        self.firstTokenLatencyMs = 0
+        self.hasFiredTurnCompletion = false
+        self.turnCommitTime = 0
+        self.lastTokenReceivedTime = 0
+        self.lastPostCommitTokenTime = nil
+        self.turnCompletion = nil
+        lock.unlock()
+        
+        // Dispatch manual activityStart signal for conversational models
+        if !model.contains("transcribe") {
+            let startPayload: [String: Any] = [
+                "realtimeInput": [
+                    "activityStart": [:]
+                ]
+            ]
+            if let startJson = try? JSONSerialization.data(withJSONObject: startPayload),
+               let startStr = String(data: startJson, encoding: .utf8) {
+                webSocketTask?.send(.string(startStr)) { _ in }
+            }
+        }
+    }
+    
+    func sendAudioChunk(_ pcmChunk: Data) {
+        guard isReady else { return }
+        
+        let base64Audio = pcmChunk.base64EncodedString()
+        let payload: [String: Any] = [
+            "realtimeInput": [
+                "mediaChunks": [
+                    [
+                        "mimeType": "audio/pcm;rate=16000",
+                        "data": base64Audio
+                    ]
+                ]
+            ]
+        ]
+        
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            return
+        }
+        
+        webSocketTask?.send(.string(jsonString)) { error in
+            if let error = error {
+                Logger.debug("WS", "Chunk send error: \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    func commitTurn(completion: @escaping (Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void) {
+        lock.lock()
+        self.turnCommitTime = CFAbsoluteTimeGetCurrent()
+        self.isCommitting = true
+        self.lastPostCommitTokenTime = nil
+        self.turnCompletion = completion
+        self.hasFiredTurnCompletion = false
+        lock.unlock()
+        
+        // 1. Dispatch manual activityEnd signal for conversational models
+        if !model.contains("transcribe") {
+            let endPayload: [String: Any] = [
+                "realtimeInput": [
+                    "activityEnd": [:]
+                ]
+            ]
+            if let endJson = try? JSONSerialization.data(withJSONObject: endPayload),
+               let endStr = String(data: endJson, encoding: .utf8) {
+                webSocketTask?.send(.string(endStr)) { _ in }
+            }
+        }
+        
+        // 2. Dispatch turnComplete signal to finalize transcript
+        let commitPayload: [String: Any] = [
+            "clientContent": [
+                "turnComplete": true
+            ]
+        ]
+        
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: commitPayload),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            completion(.failure(NSError(domain: "JustSpeak", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize commit payload."])))
+            return
+        }
+        
+        webSocketTask?.send(.string(jsonString)) { error in
+            if let error = error {
+                Logger.debug("WS", "Commit turn send error: \(error.localizedDescription)")
+            }
+        }
+        
+        // 3. For dedicated STT Transcribe models: Launch active token settlement monitor
+        if model.contains("transcribe") {
+            settleWorkItem?.cancel()
+            let settleItem = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                let minPostCommitWait: Double = 0.45
+                let quietWindow: Double = 0.32
+                let initialWaitWithoutTokens: Double = 1.20
+                let maxWait: Double = 2.50
+                
+                while true {
+                    Thread.sleep(forTimeInterval: 0.02)
+                    self.lock.lock()
+                    guard self.isCommitting, !self.hasFiredTurnCompletion else {
+                        self.lock.unlock()
+                        return
+                    }
+                    
+                    let now = CFAbsoluteTimeGetCurrent()
+                    let elapsedCommit = now - self.turnCommitTime
+                    let text = self.currentTurnText
+                    let postCommitTokenTime = self.lastPostCommitTokenTime
+                    
+                    // Settle check 1: If post-commit tokens arrived, settle once quiet window passes
+                    if let postTime = postCommitTokenTime {
+                        let quietSincePostToken = now - postTime
+                        if elapsedCommit >= minPostCommitWait && !text.isEmpty && quietSincePostToken >= quietWindow {
+                            self.hasFiredTurnCompletion = true
+                            self.isCommitting = false
+                            let totalLatencyMs = elapsedCommit * 1000.0
+                            self.currentTurnText = ""
+                            let firstToken = self.firstTokenLatencyMs
+                            self.firstTokenLatencyMs = 0
+                            let cb = self.turnCompletion
+                            self.turnCompletion = nil
+                            self.lock.unlock()
+                            
+                            Logger.endMeter()
+                            DispatchQueue.global().async {
+                                cb?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
+                            }
+                            return
+                        }
+                    } else if !text.isEmpty && elapsedCommit >= initialWaitWithoutTokens {
+                        // Settle check 2: We have pre-commit text, but no new tokens arrived within 1.20s
+                        self.hasFiredTurnCompletion = true
+                        self.isCommitting = false
+                        let totalLatencyMs = elapsedCommit * 1000.0
+                        self.currentTurnText = ""
+                        let firstToken = self.firstTokenLatencyMs
+                        self.firstTokenLatencyMs = 0
+                        let cb = self.turnCompletion
+                        self.turnCompletion = nil
+                        self.lock.unlock()
+                        
+                        Logger.endMeter()
+                        DispatchQueue.global().async {
+                            cb?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
+                        }
+                        return
+                    }
+                    
+                    // Max timeout ceiling
+                    if elapsedCommit >= maxWait {
+                        self.hasFiredTurnCompletion = true
+                        self.isCommitting = false
+                        let totalLatencyMs = elapsedCommit * 1000.0
+                        let capturedText = self.currentTurnText
+                        self.currentTurnText = ""
+                        let firstToken = self.firstTokenLatencyMs
+                        self.firstTokenLatencyMs = 0
+                        let cb = self.turnCompletion
+                        self.turnCompletion = nil
+                        self.lock.unlock()
+                        
+                        Logger.endMeter()
+                        DispatchQueue.global().async {
+                            if !capturedText.isEmpty {
+                                cb?(.success((text: capturedText, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
+                            } else {
+                                cb?(.failure(NSError(domain: "JustSpeak", code: -2, userInfo: [NSLocalizedDescriptionKey: "No speech recognized before timeout."])))
+                            }
+                        }
+                        return
+                    }
+                    self.lock.unlock()
+                }
+            }
+            self.settleWorkItem = settleItem
+            DispatchQueue.global().async(execute: settleItem)
+        }
+    }
+    
+    var hasReceivedTokens: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !currentTurnText.isEmpty || firstTokenLatencyMs > 0
+    }
+    
+    private func scheduleReconnect() {
+        lock.lock()
+        guard reconnectWorkItem == nil else {
+            lock.unlock()
+            return
+        }
+        reconnectAttempts += 1
+        let delay = min(10.0, pow(2.0, Double(min(reconnectAttempts, 4))))
+        Logger.info("WS", "Scheduling WebSocket reconnection in \(String(format: "%.1f", delay))s (Attempt #\(reconnectAttempts))...")
+        
+        let item = DispatchWorkItem { [weak self] in
+            self?.lock.lock()
+            self?.reconnectWorkItem = nil
+            self?.lock.unlock()
+            self?.connect()
+        }
+        self.reconnectWorkItem = item
+        lock.unlock()
+        
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: item)
+    }
+    
+    func disconnect() {
+        reconnectWorkItem?.cancel()
+        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+        isConnected = false
+        isReady = false
+    }
+}
+
+// MARK: - Gemini REST Fallback Client (Single-Turn Audio)
+
+struct GeminiRestClient {
+    static func transcribe(
+        pcmData: Data,
+        apiKey: String,
+        model: String,
+        languageCodes: [String] = [],
+        customVocabulary: [String] = [],
+        completion: @escaping (Result<(text: String, latencyMs: Double), Error>) -> Void
+    ) {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        guard !apiKey.isEmpty else {
+            completion(.failure(NSError(domain: "JustSpeak", code: -1, userInfo: [NSLocalizedDescriptionKey: "GEMINI_API_KEY is empty."])))
+            return
+        }
+        
+        let wavData = createWavData(from: pcmData, sampleRate: 16000, channels: 1)
+        let base64Wav = wavData.base64EncodedString()
+        
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
+        guard let url = URL(string: urlString) else {
+            completion(.failure(NSError(domain: "JustSpeak", code: -2, userInfo: [NSLocalizedDescriptionKey: "Invalid REST URL."])))
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 10.0
+        
+        let payload: [String: Any]
+        if model.contains("transcribe") {
+            // Dedicated STT Foundation Model (Pure Audio, zero developer instruction requirement)
+            payload = [
+                "contents": [
+                    [
+                        "parts": [
+                            [
+                                "inlineData": [
+                                    "mimeType": "audio/wav",
+                                    "data": base64Wav
+                                ]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        } else {
+            // General Multimodal LLM (Prompt & System Instruction guided)
+            var promptText = "Transcribe this audio precisely. Fix punctuation, capitalization, and grammar. Remove filler words (um, uh, you know). Preserve technical terms, acronyms, code snippets, numbers, and formatting. Output ONLY the polished transcription without commentary, explanations, or quotes."
+            var systemText = "You are a professional voice dictation engine. Transcribe and polish the spoken audio into clean text. Output ONLY the final text."
+            
+            if !languageCodes.isEmpty {
+                let langList = languageCodes.joined(separator: ", ")
+                promptText += "\nTarget language(s): \(langList)"
+                systemText += "\nTarget language(s): \(langList)"
+            }
+            
+            if !customVocabulary.isEmpty {
+                let vocabList = customVocabulary.joined(separator: ", ")
+                promptText += "\nCustom vocabulary & technical terms to recognize accurately: \(vocabList)"
+                systemText += "\nCustom vocabulary: \(vocabList)"
+            }
+            
+            payload = [
+                "contents": [
+                    [
+                        "parts": [
+                            [
+                                "inlineData": [
+                                    "mimeType": "audio/wav",
+                                    "data": base64Wav
+                                ]
+                            ],
+                            [
+                                "text": promptText
+                            ]
+                        ]
+                    ]
+                ],
+                "generationConfig": [
+                    "temperature": 0.0
+                ],
+                "systemInstruction": [
+                    "parts": [
+                        [
+                            "text": systemText
+                        ]
+                    ]
+                ]
+            ]
+        }
+        
+        guard let requestBody = try? JSONSerialization.data(withJSONObject: payload) else {
+            completion(.failure(NSError(domain: "JustSpeak", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize REST JSON."])))
+            return
+        }
+        request.httpBody = requestBody
+        
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+            
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            
+            guard let data = data else {
+                completion(.failure(NSError(domain: "JustSpeak", code: -4, userInfo: [NSLocalizedDescriptionKey: "No data received from Gemini REST API."])))
+                return
+            }
+            
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let rawStr = String(data: data, encoding: .utf8) ?? "Unknown"
+                completion(.failure(NSError(domain: "JustSpeak", code: -5, userInfo: [NSLocalizedDescriptionKey: "Invalid JSON response: \(rawStr)"])))
+                return
+            }
+            
+            if let errorObj = json["error"] as? [String: Any],
+               let message = errorObj["message"] as? String {
+                completion(.failure(NSError(domain: "GeminiAPI", code: (errorObj["code"] as? Int) ?? -1, userInfo: [NSLocalizedDescriptionKey: message])))
+                return
+            }
+            
+            if let candidates = json["candidates"] as? [[String: Any]],
+               let firstCandidate = candidates.first {
+                if let content = firstCandidate["content"] as? [String: Any],
+                   let parts = content["parts"] as? [[String: Any]],
+                   let firstPart = parts.first,
+                   let text = firstPart["text"] as? String {
+                    completion(.success((text: text, latencyMs: elapsedMs)))
+                } else {
+                    // Speech model returned empty transcription (e.g. silent or non-speech audio)
+                    completion(.success((text: "", latencyMs: elapsedMs)))
+                }
+            } else {
+                completion(.failure(NSError(domain: "JustSpeak", code: -6, userInfo: [NSLocalizedDescriptionKey: "Could not extract candidate text from response."])))
+            }
+        }
+        
+        task.resume()
+    }
+}
+
+// MARK: - Hotkey & Global Input Monitor (with Tap Auto-Recovery)
+
+final class HotkeyManager {
+    enum KeyBinding {
+        case rightOption
+        case leftOption
+        case rightControl
+        case leftControl
+        case rightCmd
+        case leftCmd
+        case fn
+        case fKey(CGKeyCode)
+        case custom(CGKeyCode)
+        
+        static func from(string: String) -> KeyBinding {
+            switch string.lowercased() {
+            case "right_option", "right_alt", "roption": return .rightOption
+            case "left_option", "left_alt", "loption": return .leftOption
+            case "right_control", "right_ctrl", "rctrl": return .rightControl
+            case "left_control", "left_ctrl", "lctrl": return .leftControl
+            case "right_cmd", "right_command", "rcmd": return .rightCmd
+            case "left_cmd", "left_command", "lcmd": return .leftCmd
+            case "fn", "globe": return .fn
+            case "f13": return .fKey(0x69)
+            case "f14": return .fKey(0x6B)
+            case "f15": return .fKey(0x71)
+            case "f16": return .fKey(0x6A)
+            case "f17": return .fKey(0x40)
+            case "f18": return .fKey(0x4F)
+            case "f19": return .fKey(0x50)
+            case "f20": return .fKey(0x5A)
+            default:
+                if let code = UInt16(string) {
+                    return .custom(CGKeyCode(code))
+                }
+                return .rightOption
+            }
+        }
+        
+        var name: String {
+            switch self {
+            case .rightOption: return "Right Option (⌥ Right)"
+            case .leftOption: return "Left Option (⌥ Left)"
+            case .rightControl: return "Right Control (⌃ Right)"
+            case .leftControl: return "Left Control (⌃ Left)"
+            case .rightCmd: return "Right Command (⌘ Right)"
+            case .leftCmd: return "Left Command (⌘ Left)"
+            case .fn: return "Fn / Globe (🌐)"
+            case .fKey(let code): return "F-Key (keyCode: \(code))"
+            case .custom(let code): return "Custom Key (keyCode: \(code))"
+            }
+        }
+    }
+    
+    private let binding: KeyBinding
+    private let mode: String
+    private var isKeyDown: Bool = false
+    private var lastStateChangeTime: CFAbsoluteTime = 0
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    
+    var onKeyDown: (() -> Void)?
+    var onKeyUp: (() -> Void)?
+    
+    init(binding: KeyBinding, mode: String) {
+        self.binding = binding
+        self.mode = mode
+    }
+    
+    func start() -> Bool {
+        let eventMask = (1 << CGEventType.flagsChanged.rawValue) |
+                        (1 << CGEventType.keyDown.rawValue) |
+                        (1 << CGEventType.keyUp.rawValue)
+        
+        let selfPointer = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: CGEventMask(eventMask),
+            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
+                let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
+                
+                // Auto-recover tap if disabled by macOS timeout
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let t = manager.eventTap {
+                        CGEvent.tapEnable(tap: t, enable: true)
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+                
+                manager.handleCGEvent(type: type, event: event)
+                return Unmanaged.passUnretained(event)
+            },
+            userInfo: selfPointer
+        ) else {
+            return false
+        }
+        
+        self.eventTap = tap
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        self.runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        
+        return true
+    }
+    
+    private func handleCGEvent(type: CGEventType, event: CGEvent) {
+        let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        let flags = event.flags
+        
+        switch binding {
+        case .rightOption:
+            if type == .flagsChanged && keyCode == 61 {
+                let isPressed = flags.contains(.maskAlternate)
+                updateKeyState(pressed: isPressed)
+            }
+        case .leftOption:
+            if type == .flagsChanged && keyCode == 58 {
+                let isPressed = flags.contains(.maskAlternate)
+                updateKeyState(pressed: isPressed)
+            }
+        case .rightControl:
+            if type == .flagsChanged && keyCode == 62 {
+                let isPressed = flags.contains(.maskControl)
+                updateKeyState(pressed: isPressed)
+            }
+        case .leftControl:
+            if type == .flagsChanged && keyCode == 59 {
+                let isPressed = flags.contains(.maskControl)
+                updateKeyState(pressed: isPressed)
+            }
+        case .rightCmd:
+            if type == .flagsChanged && keyCode == 54 {
+                let isPressed = flags.contains(.maskCommand)
+                updateKeyState(pressed: isPressed)
+            }
+        case .leftCmd:
+            if type == .flagsChanged && keyCode == 55 {
+                let isPressed = flags.contains(.maskCommand)
+                updateKeyState(pressed: isPressed)
+            }
+        case .fn:
+            if type == .flagsChanged && keyCode == 63 {
+                let isPressed = flags.contains(.maskSecondaryFn)
+                updateKeyState(pressed: isPressed)
+            }
+        case .fKey(let targetCode), .custom(let targetCode):
+            if keyCode == targetCode {
+                if type == .keyDown {
+                    updateKeyState(pressed: true)
+                } else if type == .keyUp {
+                    updateKeyState(pressed: false)
+                }
+            }
+        }
+    }
+    
+    private func updateKeyState(pressed: Bool) {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard (now - lastStateChangeTime) > 0.08 else { return } // 80ms debounce
+        
+        if mode == "toggle" {
+            if pressed && !isKeyDown {
+                isKeyDown = true
+                lastStateChangeTime = now
+                onKeyDown?()
+            } else if pressed && isKeyDown {
+                isKeyDown = false
+                lastStateChangeTime = now
+                onKeyUp?()
+            }
+        } else {
+            // Push-to-Talk (Hold)
+            if pressed && !isKeyDown {
+                isKeyDown = true
+                lastStateChangeTime = now
+                onKeyDown?()
+            } else if !pressed && isKeyDown {
+                isKeyDown = false
+                lastStateChangeTime = now
+                onKeyUp?()
+            }
+        }
+    }
+    
+    func stop() {
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+        }
+    }
+}
+
+// MARK: - macOS Permissions Validator
+
+struct PermissionChecker {
+    static func verifyAll() -> (accessibility: Bool, microphone: Bool) {
+        let isAxTrusted = AXIsProcessTrusted()
+        
+        var isMicAuthorized = false
+        if #available(macOS 14.0, *) {
+            isMicAuthorized = (AVAudioApplication.shared.recordPermission == .granted)
+        } else {
+            isMicAuthorized = (AVCaptureDevice.authorizationStatus(for: .audio) == .authorized)
+        }
+        
+        return (isAxTrusted, isMicAuthorized)
+    }
+    
+    static func printDetailedStatus() {
+        print("\n\(ANSI.bold)════════════════════════════════════════════════════════════════════════════\(ANSI.reset)")
+        print("\(ANSI.bold)  JustSpeak macOS Permissions Diagnostic\(ANSI.reset)")
+        print("\(ANSI.bold)════════════════════════════════════════════════════════════════════════════\(ANSI.reset)\n")
+        
+        let (ax, mic) = verifyAll()
+        
+        let axStatus = ax ? "\(ANSI.green)✓ GRANTED\(ANSI.reset)" : "\(ANSI.red)✗ NOT GRANTED\(ANSI.reset)"
+        let micStatus = mic ? "\(ANSI.green)✓ GRANTED\(ANSI.reset)" : "\(ANSI.red)✗ NOT GRANTED\(ANSI.reset)"
+        
+        print("  1. Accessibility & CGEventTap:   [\(axStatus)]")
+        print("  2. Microphone Access:            [\(micStatus)]")
+        print("  3. Input Monitoring (Terminal):  [\(ax ? "\(ANSI.green)✓ ACTIVE\(ANSI.reset)" : "\(ANSI.yellow)? CHECK SETTINGS\(ANSI.reset)")]\n")
+        
+        if !ax || !mic {
+            print("\(ANSI.yellow)\(ANSI.bold)How to grant required permissions on macOS:\(ANSI.reset)")
+            if !ax {
+                print("  • \(ANSI.bold)Accessibility:\(ANSI.reset) System Settings → Privacy & Security → Accessibility → Toggle ON your Terminal app (Terminal / iTerm2 / VS Code / Cursor / Ghostty)")
+                print("  • \(ANSI.bold)Input Monitoring:\(ANSI.reset) System Settings → Privacy & Security → Input Monitoring → Toggle ON your Terminal app")
+                
+                let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+                _ = AXIsProcessTrustedWithOptions(options)
+            }
+            if !mic {
+                print("  • \(ANSI.bold)Microphone:\(ANSI.reset) System Settings → Privacy & Security → Microphone → Toggle ON your Terminal app")
+            }
+            print("")
+        } else {
+            print("\(ANSI.green)\(ANSI.bold)All required macOS permissions are properly configured! Ready to speak.\(ANSI.reset)\n")
+        }
+    }
+}
+
+// MARK: - Apple Intelligence & macOS Human Interface Design Palette
+
+enum AppleDesign {
+    // Apple Intelligence Display P3 Wide-Gamut Palette
+    static let siriCyan    = NSColor(displayP3Red: 0.00, green: 0.82, blue: 1.00, alpha: 1.0) // #00D1FF
+    static let siriIndigo  = NSColor(displayP3Red: 0.44, green: 0.24, blue: 0.96, alpha: 1.0) // #703DF5
+    static let siriMagenta = NSColor(displayP3Red: 1.00, green: 0.20, blue: 0.60, alpha: 1.0) // #FF3399
+    static let siriAmber   = NSColor(displayP3Red: 1.00, green: 0.65, blue: 0.12, alpha: 1.0) // #FFA61F
+    static let appleGreen  = NSColor(displayP3Red: 0.18, green: 0.80, blue: 0.44, alpha: 1.0) // #2ECC71
+    static let appleCoral  = NSColor(displayP3Red: 1.00, green: 0.27, blue: 0.23, alpha: 1.0) // #FF453A
+    static let appleGold   = NSColor(displayP3Red: 1.00, green: 0.80, blue: 0.00, alpha: 1.0) // #FFCC00
+    
+    // Continuous Apple Intelligence 4-phase chromatic loop: Cyan -> Indigo -> Magenta -> Amber -> Cyan
+    static func siriSpectrum(at t: CGFloat) -> NSColor {
+        let wrapped = t.truncatingRemainder(dividingBy: 1.0)
+        let pos = (wrapped < 0 ? wrapped + 1.0 : wrapped) * 4.0
+        let seg = Int(pos) % 4
+        let frac = pos - CGFloat(Int(pos))
+        
+        let c1: NSColor
+        let c2: NSColor
+        switch seg {
+        case 0: c1 = siriCyan; c2 = siriIndigo
+        case 1: c1 = siriIndigo; c2 = siriMagenta
+        case 2: c1 = siriMagenta; c2 = siriAmber
+        default: c1 = siriAmber; c2 = siriCyan
+        }
+        
+        var r1: CGFloat = 0, g1: CGFloat = 0, b1: CGFloat = 0, a1: CGFloat = 0
+        var r2: CGFloat = 0, g2: CGFloat = 0, b2: CGFloat = 0, a2: CGFloat = 0
+        c1.getRed(&r1, green: &g1, blue: &b1, alpha: &a1)
+        c2.getRed(&r2, green: &g2, blue: &b2, alpha: &a2)
+        
+        return NSColor(
+            displayP3Red: r1 + (r2 - r1) * frac,
+            green: g1 + (g2 - g1) * frac,
+            blue: b1 + (b2 - b1) * frac,
+            alpha: 1.0
+        )
+    }
+}
+
+// MARK: - Hardware Notch Geometry Detection
+
+struct NotchGeometry {
+    let rect: NSRect
+    let hasPhysicalNotch: Bool
+    
+    static func detect(screen: NSScreen) -> NotchGeometry {
+        if #available(macOS 12.0, *),
+           let left = screen.auxiliaryTopLeftArea,
+           let right = screen.auxiliaryTopRightArea {
+            let width = right.minX - left.maxX
+            let height = screen.frame.height - left.origin.y
+            let rect = NSRect(
+                x: left.maxX,
+                y: screen.frame.height - height,
+                width: width,
+                height: height
+            )
+            return NotchGeometry(rect: rect, hasPhysicalNotch: true)
+        } else {
+            let width: CGFloat = 196
+            let height: CGFloat = 34
+            let rect = NSRect(
+                x: (screen.frame.width - width) / 2.0,
+                y: screen.frame.height - height,
+                width: width,
+                height: height
+            )
+            return NotchGeometry(rect: rect, hasPhysicalNotch: false)
+        }
+    }
+}
+
+// MARK: - Apple Intelligence Glowing Notch Bezel Aura (Hardware Bezel Illumination)
+
+final class AppleNotchAuraView: NSView {
+    enum GlowState {
+        case idle
+        case listening
+        case processing
+        case success
+        case error
+    }
+    
+    var notchRect: NSRect = .zero
+    var audioLevel: CGFloat = 0.0 // 0.0 ... 1.0
+    var state: GlowState = .idle
+    
+    private var phase: CGFloat = 0.0
+    private var displayTimer: Timer?
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        self.wantsLayer = true
+        self.layer?.masksToBounds = false
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        self.wantsLayer = true
+        self.layer?.masksToBounds = false
+    }
+    
+    func startAnimation() {
+        displayTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let speed: CGFloat = (self.state == .processing) ? 0.024 : 0.007
+            self.phase = (self.phase + speed).truncatingRemainder(dividingBy: 1.0)
+            self.needsDisplay = true
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.displayTimer = timer
+    }
+    
+    func stopAnimation() {
+        displayTimer?.invalidate()
+        displayTimer = nil
+    }
+    
+    private func createNotchPath(in bounds: NSRect) -> CGPath {
+        let path = CGMutablePath()
+        let cornerRadius: CGFloat = 14.0
+        let outerCornerRadius: CGFloat = 6.0
+        
+        let topY = bounds.height
+        let bottomY = bounds.height - notchRect.height
+        let leftX = (bounds.width - notchRect.width) / 2.0
+        let rightX = leftX + notchRect.width
+        
+        path.move(to: CGPoint(x: leftX - outerCornerRadius, y: topY))
+        path.addQuadCurve(to: CGPoint(x: leftX, y: topY - outerCornerRadius),
+                          control: CGPoint(x: leftX, y: topY))
+        path.addLine(to: CGPoint(x: leftX, y: bottomY + cornerRadius))
+        path.addQuadCurve(to: CGPoint(x: leftX + cornerRadius, y: bottomY),
+                          control: CGPoint(x: leftX, y: bottomY))
+        path.addLine(to: CGPoint(x: rightX - cornerRadius, y: bottomY))
+        path.addQuadCurve(to: CGPoint(x: rightX, y: bottomY + cornerRadius),
+                          control: CGPoint(x: rightX, y: bottomY))
+        path.addLine(to: CGPoint(x: rightX, y: topY - outerCornerRadius))
+        path.addQuadCurve(to: CGPoint(x: rightX + outerCornerRadius, y: topY),
+                          control: CGPoint(x: rightX, y: topY))
+        
+        return path
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        if state == .idle { return }
+        
+        let path = createNotchPath(in: self.bounds)
+        let leftX = (bounds.width - notchRect.width) / 2.0
+        let rightX = leftX + notchRect.width
+        
+        // 16-Stop Continuous Apple Intelligence Chromatic Gradient
+        let stops = 16
+        var cgColors: [CGColor] = []
+        var locations: [CGFloat] = []
+        for i in 0...stops {
+            let loc = CGFloat(i) / CGFloat(stops)
+            let color: NSColor
+            if state == .success {
+                color = AppleDesign.appleGreen
+            } else if state == .error {
+                color = AppleDesign.appleCoral
+            } else {
+                color = AppleDesign.siriSpectrum(at: loc + phase)
+            }
+            cgColors.append(color.cgColor)
+            locations.append(loc)
+        }
+        
+        let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        guard let gradient = CGGradient(colorsSpace: colorSpace, colors: cgColors as CFArray, locations: locations) else { return }
+        
+        // 1. Layer 1: Ethereal Atmospheric Aurora Bloom
+        let auraBlur: CGFloat = (state == .listening) ? (16.0 + 20.0 * audioLevel) : 16.0
+        let auraWidth: CGFloat = (state == .listening) ? (7.0 + 8.0 * audioLevel) : 7.0
+        let dominantGlowColor: NSColor
+        if state == .success {
+            dominantGlowColor = AppleDesign.appleGreen
+        } else if state == .error {
+            dominantGlowColor = AppleDesign.appleCoral
+        } else {
+            dominantGlowColor = AppleDesign.siriSpectrum(at: phase + 0.5)
+        }
+        
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: -3),
+            blur: auraBlur,
+            color: dominantGlowColor.withAlphaComponent(0.70 + 0.25 * audioLevel).cgColor
+        )
+        context.addPath(path)
+        context.setLineWidth(auraWidth)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.replacePathWithStrokedPath()
+        context.clip()
+        
+        context.drawLinearGradient(
+            gradient,
+            start: CGPoint(x: leftX - 16, y: 0),
+            end: CGPoint(x: rightX + 16, y: 0),
+            options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+        )
+        context.restoreGState()
+        
+        // 2. Layer 2: Precision Apple Intelligence Chromatic Ribbon
+        context.saveGState()
+        context.addPath(path)
+        context.setLineWidth(2.6)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.replacePathWithStrokedPath()
+        context.clip()
+        
+        context.drawLinearGradient(
+            gradient,
+            start: CGPoint(x: leftX - 16, y: 0),
+            end: CGPoint(x: rightX + 16, y: 0),
+            options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+        )
+        context.restoreGState()
+        
+        // 3. Layer 3: Refractive Specular Platinum Core Line
+        context.saveGState()
+        context.addPath(path)
+        context.setStrokeColor(NSColor(white: 1.0, alpha: 0.95).cgColor)
+        context.setLineWidth(0.8)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.strokePath()
+        context.restoreGState()
+    }
+}
+
+// MARK: - Apple Intelligence Living Siri Orb View
+
+final class AppleIntelligenceOrbView: NSView {
+    enum OrbState {
+        case listening
+        case processing
+        case success
+        case error
+    }
+    
+    var state: OrbState = .listening {
+        didSet {
+            needsDisplay = true
+        }
+    }
+    
+    var audioLevel: CGFloat = 0.0 {
+        didSet {
+            needsDisplay = true
+        }
+    }
+    
+    private var phase: CGFloat = 0.0
+    private var displayTimer: Timer?
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        self.wantsLayer = true
+        startAnimation()
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        self.wantsLayer = true
+        startAnimation()
+    }
+    
+    func startAnimation() {
+        displayTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let speed: CGFloat = (self.state == .processing) ? 0.030 : 0.010
+            self.phase = (self.phase + speed).truncatingRemainder(dividingBy: 1.0)
+            self.needsDisplay = true
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.displayTimer = timer
+    }
+    
+    func stopAnimation() {
+        displayTimer?.invalidate()
+        displayTimer = nil
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let bounds = self.bounds
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let maxRadius = min(bounds.width, bounds.height) / 2.0 - 1.0
+        
+        switch state {
+        case .listening:
+            drawLivingOrb(in: context, center: center, maxRadius: maxRadius)
+            
+        case .processing:
+            drawProcessingSwirl(in: context, center: center, maxRadius: maxRadius)
+            
+        case .success:
+            drawAppleCheckmark(in: context, center: center, size: maxRadius * 2.0)
+            
+        case .error:
+            drawAppleAlert(in: context, center: center, size: maxRadius * 2.0)
+        }
+    }
+    
+    private func drawLivingOrb(in context: CGContext, center: CGPoint, maxRadius: CGFloat) {
+        let baseRadius = maxRadius * (0.75 + 0.35 * audioLevel)
+        let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        
+        // 3 Overlapping pulsating chromatic lobes
+        let lobes = 3
+        for i in 0..<lobes {
+            let lobeAngle = CGFloat(i) * (2.0 * .pi / CGFloat(lobes)) + phase * 2.0 * .pi
+            let offsetDist = 2.0 * (1.0 + audioLevel)
+            let lobeCenter = CGPoint(
+                x: center.x + offsetDist * cos(lobeAngle),
+                y: center.y + offsetDist * sin(lobeAngle)
+            )
+            let lobeColor = AppleDesign.siriSpectrum(at: phase + CGFloat(i) / CGFloat(lobes))
+            
+            let colors = [
+                lobeColor.withAlphaComponent(0.85).cgColor,
+                lobeColor.withAlphaComponent(0.0).cgColor
+            ] as CFArray
+            let locs: [CGFloat] = [0.0, 1.0]
+            if let radialGrad = CGGradient(colorsSpace: colorSpace, colors: colors, locations: locs) {
+                context.saveGState()
+                context.drawRadialGradient(
+                    radialGrad,
+                    startCenter: lobeCenter,
+                    startRadius: 0,
+                    endCenter: lobeCenter,
+                    endRadius: baseRadius,
+                    options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+                )
+                context.restoreGState()
+            }
+        }
+        
+        // Luminous Specular Core
+        context.saveGState()
+        context.setFillColor(NSColor(white: 1.0, alpha: 0.95).cgColor)
+        context.setShadow(offset: .zero, blur: 4.0, color: NSColor.white.cgColor)
+        context.fillEllipse(in: CGRect(x: center.x - 2.0, y: center.y - 2.0, width: 4.0, height: 4.0))
+        context.restoreGState()
+    }
+    
+    private func drawProcessingSwirl(in context: CGContext, center: CGPoint, maxRadius: CGFloat) {
+        context.saveGState()
+        context.translateBy(x: center.x, y: center.y)
+        context.rotate(by: phase * 2.0 * .pi)
+        context.translateBy(x: -center.x, y: -center.y)
+        
+        let path = CGMutablePath()
+        let r = maxRadius * 0.85
+        path.addArc(center: center, radius: r, startAngle: 0, endAngle: 1.5 * .pi, clockwise: false)
+        
+        context.setStrokeColor(AppleDesign.siriCyan.cgColor)
+        context.setLineWidth(2.2)
+        context.setLineCap(.round)
+        context.setShadow(offset: .zero, blur: 6.0, color: AppleDesign.siriCyan.withAlphaComponent(0.85).cgColor)
+        context.addPath(path)
+        context.strokePath()
+        context.restoreGState()
+    }
+    
+    private func drawAppleCheckmark(in context: CGContext, center: CGPoint, size: CGFloat) {
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: center.x - 4.5, y: center.y - 0.5))
+        path.addLine(to: CGPoint(x: center.x - 1.5, y: center.y - 3.5))
+        path.addLine(to: CGPoint(x: center.x + 4.5, y: center.y + 3.5))
+        
+        context.saveGState()
+        context.setShadow(offset: .zero, blur: 6.0, color: AppleDesign.appleGreen.withAlphaComponent(0.85).cgColor)
+        context.setStrokeColor(AppleDesign.appleGreen.cgColor)
+        context.setLineWidth(2.2)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.addPath(path)
+        context.strokePath()
+        context.restoreGState()
+    }
+    
+    private func drawAppleAlert(in context: CGContext, center: CGPoint, size: CGFloat) {
+        let path = CGMutablePath()
+        let r = size / 2.0 - 2.0
+        path.move(to: CGPoint(x: center.x, y: center.y + r))
+        path.addLine(to: CGPoint(x: center.x + r, y: center.y - r))
+        path.addLine(to: CGPoint(x: center.x - r, y: center.y - r))
+        path.closeSubpath()
+        
+        context.saveGState()
+        context.setShadow(offset: .zero, blur: 6.0, color: AppleDesign.appleGold.withAlphaComponent(0.85).cgColor)
+        context.setFillColor(AppleDesign.appleGold.cgColor)
+        context.addPath(path)
+        context.fillPath()
+        context.restoreGState()
+    }
+}
+
+// MARK: - Apple Siri Fluid Equalizer Waveform View
+
+final class AppleSiriWaveformView: NSView {
+    private var levels: [CGFloat] = [0.12, 0.12, 0.12, 0.12]
+    private let barCount = 4
+    
+    // Apple Intelligence Chromatic Bar Sequence
+    private let barColors: [NSColor] = [
+        AppleDesign.siriCyan,
+        AppleDesign.siriIndigo,
+        AppleDesign.siriMagenta,
+        AppleDesign.siriAmber
+    ]
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        self.wantsLayer = true
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        self.wantsLayer = true
+    }
+    
+    func updateLevel(db: Double) {
+        let norm = max(0.08, min(1.0, CGFloat((db + 55.0) / 45.0)))
+        let multipliers: [CGFloat] = [0.65, 1.0, 0.92, 0.60]
+        for i in 0..<barCount {
+            let target = norm * multipliers[i]
+            levels[i] = levels[i] * 0.25 + target * 0.75
+        }
+        needsDisplay = true
+    }
+    
+    func reset() {
+        levels = [0.12, 0.12, 0.12, 0.12]
+        needsDisplay = true
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let bounds = self.bounds
+        let barWidth: CGFloat = 3.0
+        let spacing: CGFloat = 3.0
+        let totalWidth = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * spacing
+        let startX = (bounds.width - totalWidth) / 2.0
+        let maxBarHeight = bounds.height - 4.0
+        
+        for i in 0..<barCount {
+            let barHeight = max(4.0, levels[i] * maxBarHeight)
+            let x = startX + CGFloat(i) * (barWidth + spacing)
+            let y = (bounds.height - barHeight) / 2.0
+            let rect = CGRect(x: x, y: y, width: barWidth, height: barHeight)
+            let path = CGPath(roundedRect: rect, cornerWidth: barWidth / 2.0, cornerHeight: barWidth / 2.0, transform: nil)
+            
+            context.saveGState()
+            let color = barColors[i % barColors.count]
+            context.setShadow(offset: .zero, blur: 4.0, color: color.withAlphaComponent(0.60).cgColor)
+            context.addPath(path)
+            context.setFillColor(color.cgColor)
+            context.fillPath()
+            context.restoreGState()
+        }
+    }
+}
+
+// MARK: - Apple Dynamic Island Obsidian Acrylic Backplate View
+
+final class AppleIslandBackplateView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        self.wantsLayer = true
+        if #available(macOS 10.15, *) {
+            self.layer?.cornerCurve = .continuous
+        }
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        self.wantsLayer = true
+        if #available(macOS 10.15, *) {
+            self.layer?.cornerCurve = .continuous
+        }
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let bounds = self.bounds
+        let cornerRadius = bounds.height / 2.0
+        let pillPath = CGPath(roundedRect: bounds, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+        
+        // 1. Deep Obsidian Pitch-Black Acrylic Base
+        context.saveGState()
+        context.addPath(pillPath)
+        context.setFillColor(NSColor(calibratedRed: 0.05, green: 0.05, blue: 0.07, alpha: 0.92).cgColor)
+        context.fillPath()
+        context.restoreGState()
+        
+        // 2. Continuous Dual-Stage Specular Rim Light Gradient
+        let borderPath = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), cornerWidth: cornerRadius - 0.5, cornerHeight: cornerRadius - 0.5, transform: nil)
+        context.saveGState()
+        context.addPath(borderPath)
+        context.setLineWidth(1.0)
+        context.replacePathWithStrokedPath()
+        context.clip()
+        
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let strokeColors = [
+            NSColor(white: 1.0, alpha: 0.28).cgColor,
+            NSColor(white: 1.0, alpha: 0.10).cgColor,
+            NSColor(white: 1.0, alpha: 0.04).cgColor
+        ] as CFArray
+        let strokeLocations: [CGFloat] = [0.0, 0.5, 1.0]
+        if let strokeGradient = CGGradient(colorsSpace: colorSpace, colors: strokeColors, locations: strokeLocations) {
+            context.drawLinearGradient(
+                strokeGradient,
+                start: CGPoint(x: bounds.midX, y: bounds.maxY),
+                end: CGPoint(x: bounds.midX, y: bounds.minY),
+                options: []
+            )
+        }
+        context.restoreGState()
+    }
+}
+
+// MARK: - Unified Floating Dynamic Island HUD (Apple Native Craftsmanship)
+
+final class FloatingHUD {
+    private let notchPanel: NSPanel
+    private let notchGlowView: AppleNotchAuraView
+    
+    private let pillPanel: NSPanel
+    private let visualEffectView: NSVisualEffectView
+    private let backplateView: AppleIslandBackplateView
+    private let orbIcon: AppleIntelligenceOrbView
+    private let headerLabel: NSTextField
+    private let transcriptLabel: NSTextField
+    private let waveformView: AppleSiriWaveformView
+    
+    private var hideWorkItem: DispatchWorkItem?
+    private var currentWidth: CGFloat = 330
+    private let minPillWidth: CGFloat = 330
+    private let maxPillWidth: CGFloat = 520
+    private let pillHeight: CGFloat = 52
+    private let notchInfo: NotchGeometry
+    private let screenFrame: NSRect
+    
+    init() {
+        let screen = NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
+        self.screenFrame = screen.frame
+        self.notchInfo = NotchGeometry.detect(screen: screen)
+        
+        // 1. Setup Hardware Notch Glow Overlay Panel
+        let padding: CGFloat = 50.0
+        let glowWidth = notchInfo.rect.width + padding * 2
+        let glowHeight = notchInfo.rect.height + padding + 12.0
+        let glowX = notchInfo.rect.minX - padding
+        let glowY = screen.frame.height - glowHeight
+        
+        self.notchPanel = NSPanel(
+            contentRect: NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        notchPanel.level = .screenSaver
+        notchPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        notchPanel.isOpaque = false
+        notchPanel.backgroundColor = .clear
+        notchPanel.hasShadow = false
+        notchPanel.ignoresMouseEvents = true
+        notchPanel.alphaValue = 0.0
+        
+        self.notchGlowView = AppleNotchAuraView(frame: NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight))
+        notchGlowView.notchRect = notchInfo.rect
+        notchPanel.contentView = notchGlowView
+        
+        // 2. Setup Floating Dynamic Island Panel
+        let initialWidth = minPillWidth
+        let pillX = screen.frame.midX - initialWidth / 2.0
+        let pillY = screen.frame.height - notchInfo.rect.height - pillHeight - 12.0
+        
+        self.pillPanel = NSPanel(
+            contentRect: NSRect(x: pillX, y: pillY, width: initialWidth, height: pillHeight),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        pillPanel.level = .floating
+        pillPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        pillPanel.isOpaque = false
+        pillPanel.backgroundColor = .clear
+        pillPanel.hasShadow = true
+        pillPanel.ignoresMouseEvents = true
+        pillPanel.alphaValue = 0.0
+        
+        // Apple Liquid Acrylic Glass Backplate
+        self.visualEffectView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: initialWidth, height: pillHeight))
+        visualEffectView.material = .hudWindow
+        visualEffectView.blendingMode = .behindWindow
+        visualEffectView.state = .active
+        visualEffectView.wantsLayer = true
+        visualEffectView.layer?.cornerRadius = pillHeight / 2.0
+        if #available(macOS 10.15, *) {
+            visualEffectView.layer?.cornerCurve = .continuous
+        }
+        visualEffectView.layer?.masksToBounds = true
+        visualEffectView.layer?.shadowColor = NSColor.black.cgColor
+        visualEffectView.layer?.shadowOpacity = 0.55
+        visualEffectView.layer?.shadowRadius = 28.0
+        visualEffectView.layer?.shadowOffset = CGSize(width: 0, height: -7)
+        
+        self.backplateView = AppleIslandBackplateView(frame: NSRect(x: 0, y: 0, width: initialWidth, height: pillHeight))
+        visualEffectView.addSubview(backplateView)
+        
+        // Apple Intelligence Living Orb (Top-Left)
+        self.orbIcon = AppleIntelligenceOrbView(frame: NSRect(x: 16, y: 27, width: 18, height: 18))
+        visualEffectView.addSubview(orbIcon)
+        
+        // Micro-Header Label (Top-Center-Left)
+        self.headerLabel = NSTextField(labelWithString: "JUSTSPEAK • LIVE DICTATION")
+        headerLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
+        headerLabel.textColor = NSColor(white: 1.0, alpha: 0.60)
+        headerLabel.frame = NSRect(x: 38, y: 27, width: 230, height: 16)
+        visualEffectView.addSubview(headerLabel)
+        
+        // Apple Siri Equalizer (Top-Right)
+        self.waveformView = AppleSiriWaveformView(frame: NSRect(x: initialWidth - 48, y: 26, width: 32, height: 16))
+        visualEffectView.addSubview(waveformView)
+        
+        // Live Transcript / Preview Text (Bottom-Row)
+        self.transcriptLabel = NSTextField(labelWithString: "Hold Right ⌥ to speak...")
+        transcriptLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .regular)
+        transcriptLabel.textColor = NSColor(white: 1.0, alpha: 0.50)
+        transcriptLabel.frame = NSRect(x: 16, y: 7, width: initialWidth - 32, height: 20)
+        transcriptLabel.lineBreakMode = .byTruncatingTail
+        visualEffectView.addSubview(transcriptLabel)
+        
+        pillPanel.contentView = visualEffectView
+    }
+    
+    private func updatePillWidth(targetWidth: CGFloat) {
+        let clamped = max(minPillWidth, min(maxPillWidth, targetWidth))
+        guard abs(clamped - currentWidth) > 8.0 else { return }
+        currentWidth = clamped
+        
+        let newX = screenFrame.midX - currentWidth / 2.0
+        let newY = screenFrame.height - notchInfo.rect.height - pillHeight - 12.0
+        let newRect = NSRect(x: newX, y: newY, width: currentWidth, height: pillHeight)
+        
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.20
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
+            pillPanel.animator().setFrame(newRect, display: true)
+            visualEffectView.frame = NSRect(x: 0, y: 0, width: currentWidth, height: pillHeight)
+            backplateView.frame = NSRect(x: 0, y: 0, width: currentWidth, height: pillHeight)
+            waveformView.frame = NSRect(x: currentWidth - 48, y: 26, width: 32, height: 16)
+            transcriptLabel.frame = NSRect(x: 16, y: 7, width: currentWidth - 32, height: 20)
+        }
+    }
+    
+    func showListening() {
+        hideWorkItem?.cancel()
+        currentWidth = minPillWidth
+        
+        // Notch Glow State
+        notchGlowView.state = .listening
+        notchGlowView.audioLevel = 0.0
+        notchGlowView.startAnimation()
+        
+        // Pill Layout & Content
+        orbIcon.state = .listening
+        orbIcon.audioLevel = 0.0
+        headerLabel.stringValue = "JUSTSPEAK • LIVE DICTATION"
+        headerLabel.textColor = NSColor(white: 1.0, alpha: 0.65)
+        transcriptLabel.stringValue = "Hold Right ⌥ to speak..."
+        transcriptLabel.textColor = NSColor(white: 1.0, alpha: 0.50)
+        waveformView.reset()
+        
+        let pillX = screenFrame.midX - minPillWidth / 2.0
+        let pillY = screenFrame.height - notchInfo.rect.height - pillHeight - 12.0
+        pillPanel.setFrame(NSRect(x: pillX, y: pillY, width: minPillWidth, height: pillHeight), display: true)
+        visualEffectView.frame = NSRect(x: 0, y: 0, width: minPillWidth, height: pillHeight)
+        backplateView.frame = NSRect(x: 0, y: 0, width: minPillWidth, height: pillHeight)
+        waveformView.frame = NSRect(x: minPillWidth - 48, y: 26, width: 32, height: 16)
+        transcriptLabel.frame = NSRect(x: 16, y: 7, width: minPillWidth - 32, height: 20)
+        
+        notchPanel.orderFrontRegardless()
+        pillPanel.orderFrontRegardless()
+        
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
+            notchPanel.animator().alphaValue = 1.0
+            pillPanel.animator().alphaValue = 1.0
+        }
+    }
+    
+    func updateAudioLevel(db: Double) {
+        let norm = max(0.0, min(1.0, CGFloat((db + 55.0) / 45.0)))
+        notchGlowView.audioLevel = norm
+        orbIcon.audioLevel = norm
+        waveformView.updateLevel(db: db)
+    }
+    
+    func updateLiveText(_ text: String) {
+        let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        guard !clean.isEmpty else { return }
+        
+        transcriptLabel.stringValue = "\(clean) |"
+        transcriptLabel.textColor = NSColor.white
+        
+        // Fluid Dynamic Island auto-expansion based on text width
+        let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 13.5)
+        let textWidth = (clean as NSString).size(withAttributes: [.font: font]).width
+        let neededWidth = max(minPillWidth, textWidth + 64.0)
+        updatePillWidth(targetWidth: neededWidth)
+    }
+    
+    func showProcessing() {
+        hideWorkItem?.cancel()
+        notchGlowView.state = .processing
+        orbIcon.state = .processing
+        
+        headerLabel.stringValue = "JUSTSPEAK • POLISHING"
+        headerLabel.textColor = AppleDesign.siriCyan
+        transcriptLabel.stringValue = "Formatting text..."
+        transcriptLabel.textColor = NSColor(white: 1.0, alpha: 0.85)
+        waveformView.reset()
+    }
+    
+    func showSuccess(text: String) {
+        hideWorkItem?.cancel()
+        notchGlowView.state = .success
+        orbIcon.state = .success
+        
+        headerLabel.stringValue = "JUSTSPEAK • COPIED & PASTED"
+        headerLabel.textColor = AppleDesign.appleGreen
+        let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        transcriptLabel.stringValue = clean.isEmpty ? "Done" : clean
+        transcriptLabel.textColor = NSColor.white
+        waveformView.reset()
+        
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.hide()
+        }
+        hideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.85, execute: workItem)
+    }
+    
+    func showError(message: String) {
+        hideWorkItem?.cancel()
+        notchGlowView.state = .error
+        orbIcon.state = .error
+        
+        headerLabel.stringValue = "JUSTSPEAK • ERROR"
+        headerLabel.textColor = AppleDesign.appleCoral
+        transcriptLabel.stringValue = message
+        transcriptLabel.textColor = NSColor(white: 1.0, alpha: 0.85)
+        waveformView.reset()
+        
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.hide()
+        }
+        hideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: workItem)
+    }
+    
+    func hide() {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.20
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            self.notchPanel.animator().alphaValue = 0.0
+            self.pillPanel.animator().alphaValue = 0.0
+        }, completionHandler: {
+            if self.notchPanel.alphaValue == 0.0 {
+                self.notchPanel.orderOut(nil)
+                self.pillPanel.orderOut(nil)
+                self.notchGlowView.stopAnimation()
+            }
+        })
+    }
+}
+
+// MARK: - Orchestrator (Core State Machine)
+
+final class JustSpeakApp {
+    private let config: Config
+    private let audioCapture = AudioCaptureEngine()
+    private var liveClient: GeminiLiveClient?
+    private var hotkeyManager: HotkeyManager?
+    private var hud: FloatingHUD?
+    
+    private var isProcessing: Bool = false
+    private let processingLock = NSLock()
+    
+    init(config: Config) {
+        self.config = config
+        if config.enableLiveWebSocket && !config.geminiApiKey.isEmpty {
+            self.liveClient = GeminiLiveClient(
+                apiKey: config.geminiApiKey,
+                model: config.geminiLiveModel,
+                smartTranscription: config.smartTranscription,
+                languageCodes: config.languageCodes,
+                customVocabulary: config.customVocabulary
+            )
+        }
+        if config.showHUD {
+            self.hud = FloatingHUD()
+        }
+    }
+    
+    func start() {
+        printBanner()
+        
+        // Handle SIGINT (Ctrl+C) and SIGTERM cleanly
+        signal(SIGINT) { _ in
+            print("\n\(ANSI.bold)Exiting JustSpeak. Goodbye!\(ANSI.reset)")
+            exit(0)
+        }
+        signal(SIGTERM) { _ in
+            exit(0)
+        }
+        
+        // 1. Verify Permissions
+        let (ax, mic) = PermissionChecker.verifyAll()
+        if !ax || !mic {
+            PermissionChecker.printDetailedStatus()
+            if !ax {
+                Logger.error("PERM", "Missing Accessibility permission. Run 'make check-permissions' for help.")
+            }
+        }
+        
+        // 2. Validate API Key
+        if config.geminiApiKey.isEmpty {
+            Logger.warn("CONFIG", "GEMINI_API_KEY is not set. Add your key to .env or export GEMINI_API_KEY.")
+            Logger.warn("CONFIG", "Get your API key at: https://aistudio.google.com/")
+        }
+        
+        // 3. Initialize Audio Capture Engine
+        guard audioCapture.setup() else {
+            Logger.error("MAIN", "Failed to start Audio Capture Engine.")
+            exit(1)
+        }
+        
+        // Wire audio chunks to Gemini Live WebSocket streaming
+        audioCapture.onAudioChunk = { [weak self] chunk in
+            self?.liveClient?.sendAudioChunk(chunk)
+        }
+        
+        // Wire audio level (dB) to Floating HUD
+        audioCapture.onAudioLevel = { [weak self] db in
+            DispatchQueue.main.async {
+                self?.hud?.updateAudioLevel(db: db)
+            }
+        }
+        
+        // 4. Pre-warm Gemini Live WebSocket & wire streaming text to HUD
+        if config.enableLiveWebSocket {
+            liveClient?.onLiveTextUpdate = { [weak self] text in
+                DispatchQueue.main.async {
+                    self?.hud?.updateLiveText(text)
+                }
+            }
+            liveClient?.connect()
+        }
+        
+        // 5. Setup Hotkey Listener
+        let binding = HotkeyManager.KeyBinding.from(string: config.hotkey)
+        let hotkey = HotkeyManager(binding: binding, mode: config.hotkeyMode)
+        
+        hotkey.onKeyDown = { [weak self] in
+            self?.handleKeyDown()
+        }
+        
+        hotkey.onKeyUp = { [weak self] in
+            self?.handleKeyUp()
+        }
+        
+        guard hotkey.start() else {
+            Logger.error("HOTKEY", "Failed to initialize global CGEventTap. Please grant Accessibility permissions to this terminal.")
+            PermissionChecker.printDetailedStatus()
+            exit(1)
+        }
+        self.hotkeyManager = hotkey
+        
+        Logger.success("READY", "JustSpeak active! Hold \(ANSI.bold)\(binding.name)\(ANSI.reset) to speak, release to paste.")
+        print("\(ANSI.gray)Press Ctrl+C to quit at any time.\(ANSI.reset)\n")
+        
+        // Run AppKit RunLoop with Accessory activation policy (no Dock icon, full window support)
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+    
+    private func handleKeyDown() {
+        processingLock.lock()
+        // Protect re-entrancy / double-tap race
+        guard !isProcessing else {
+            processingLock.unlock()
+            return
+        }
+        processingLock.unlock()
+        
+        if config.soundFeedback {
+            SoundManager.playStartSound()
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            self?.hud?.showListening()
+        }
+        
+        liveClient?.startNewTurn()
+        audioCapture.startRecording()
+    }
+    
+    private func handleKeyUp() {
+        let (pcmData, duration, chunks) = audioCapture.stopRecording()
+        
+        // Discard accidental micro-clicks (< 150ms or < 2KB of audio)
+        guard duration >= 0.15 && pcmData.count > 2000 else {
+            Logger.warn("INPUT", "Ignored short click (\(String(format: "%.0f", duration * 1000.0))ms). Hold key while speaking.")
+            DispatchQueue.main.async { [weak self] in
+                self?.hud?.hide()
+            }
+            return
+        }
+        
+        processingLock.lock()
+        guard !isProcessing else {
+            processingLock.unlock()
+            return
+        }
+        isProcessing = true
+        processingLock.unlock()
+        
+        DispatchQueue.main.async { [weak self] in
+            self?.hud?.showProcessing()
+        }
+        
+        Logger.info("AUDIO", "Captured \(String(format: "%.2fs", duration)) audio (\(chunks) chunks, \(String(format: "%.1f", Double(pcmData.count)/1024.0)) KB). Committing turn...")
+        
+        let processingStartTime = CFAbsoluteTimeGetCurrent()
+        
+        // Strategy: Try Live WebSocket first; if not ready or on error, fallback seamlessly to REST
+        if config.enableLiveWebSocket, let liveClient = self.liveClient, liveClient.isReady {
+            let commitStartTime = CFAbsoluteTimeGetCurrent()
+            let dynamicTimeout = max(config.restFallbackTimeout, min(8.0, duration * 0.4 + 3.0))
+            
+            var didFallback = false
+            let fallbackTimer = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.processingLock.lock()
+                guard self.isProcessing else {
+                    self.processingLock.unlock()
+                    return
+                }
+                self.processingLock.unlock()
+                
+                didFallback = true
+                let reason = "WebSocket Settlement Timeout (> \(String(format: "%.1f", dynamicTimeout))s)"
+                Logger.warn("WS", "\(reason); executing REST fallback...")
+                self.executeRestFallback(pcmData: pcmData, duration: duration, startTime: processingStartTime, reason: reason)
+            }
+            
+            DispatchQueue.global().asyncAfter(deadline: .now() + dynamicTimeout, execute: fallbackTimer)
+            
+            liveClient.commitTurn { [weak self] result in
+                fallbackTimer.cancel()
+                guard let self = self, !didFallback else { return }
+                
+                switch result {
+                case .success(let payload):
+                    let roundtripMs = (CFAbsoluteTimeGetCurrent() - commitStartTime) * 1000.0
+                    self.handleTranscribedText(
+                        payload.text,
+                        transport: "Live WebSocket (\(self.config.geminiLiveModel))",
+                        firstTokenMs: payload.firstTokenMs,
+                        roundtripMs: roundtripMs,
+                        audioDuration: duration,
+                        totalStartTime: processingStartTime,
+                        fallbackReason: nil
+                    )
+                    
+                case .failure(let error):
+                    let reason = "WebSocket Disconnected / Error (\(error.localizedDescription))"
+                    Logger.warn("WS", "\(reason). Falling back to REST...")
+                    self.executeRestFallback(pcmData: pcmData, duration: duration, startTime: processingStartTime, reason: reason)
+                }
+            }
+        } else {
+            // Direct REST
+            let reason = !config.enableLiveWebSocket ? "Live WebSockets Disabled in Config" : "Live WebSocket Initial Handshake Pending"
+            executeRestFallback(pcmData: pcmData, duration: duration, startTime: processingStartTime, reason: reason)
+        }
+    }
+    
+    private func executeRestFallback(pcmData: Data, duration: Double, startTime: CFAbsoluteTime, reason: String) {
+        let restStartTime = CFAbsoluteTimeGetCurrent()
+        GeminiRestClient.transcribe(
+            pcmData: pcmData,
+            apiKey: config.geminiApiKey,
+            model: config.geminiModel,
+            languageCodes: config.languageCodes,
+            customVocabulary: config.customVocabulary
+        ) { [weak self] result in
+            guard let self = self else { return }
+            
+            switch result {
+            case .success(let payload):
+                let roundtripMs = (CFAbsoluteTimeGetCurrent() - restStartTime) * 1000.0
+                self.handleTranscribedText(
+                    payload.text,
+                    transport: "REST API (\(self.config.geminiModel))",
+                    firstTokenMs: 0,
+                    roundtripMs: roundtripMs,
+                    audioDuration: duration,
+                    totalStartTime: startTime,
+                    fallbackReason: reason
+                )
+                
+            case .failure(let error):
+                Logger.error("REST", "Transcription failed: \(error.localizedDescription)")
+                if self.config.soundFeedback { SoundManager.playErrorSound() }
+                DispatchQueue.main.async { [weak self] in
+                    self?.hud?.showError(message: "Transcription Failed")
+                }
+                self.processingLock.lock()
+                self.isProcessing = false
+                self.processingLock.unlock()
+            }
+        }
+    }
+    
+    private func handleTranscribedText(
+        _ rawText: String,
+        transport: String,
+        firstTokenMs: Double,
+        roundtripMs: Double,
+        audioDuration: Double,
+        totalStartTime: CFAbsoluteTime,
+        fallbackReason: String? = nil
+    ) {
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            Logger.warn("AI", "Received empty transcription from Gemini.")
+            DispatchQueue.main.async { [weak self] in
+                self?.hud?.showError(message: "Empty speech detected")
+            }
+            processingLock.lock()
+            isProcessing = false
+            processingLock.unlock()
+            return
+        }
+        
+        print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
+        print("\(ANSI.bold)\(text)\(ANSI.reset)")
+        print("\(ANSI.bold)\(ANSI.magenta)─────────────────────────────────────────────────────────────\(ANSI.reset)")
+        
+        // Active Window Injection (Paste + Auto-restore original clipboard after 350ms)
+        let (injected, injectMs) = TextInjector.inject(text: text, restorePreviousClipboard: config.restoreClipboard, completionSound: config.soundFeedback)
+        let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartTime) * 1000.0
+        
+        let injectStatus = injected ? "\(ANSI.green)Pasted via Cmd+V\(ANSI.reset)" : "\(ANSI.yellow)Copied to Clipboard\(ANSI.reset)"
+        
+        DispatchQueue.main.async { [weak self] in
+            self?.hud?.showSuccess(text: text)
+        }
+        
+        print("\n\(ANSI.bold)📊 Latency Diagnostic Breakdown:\(ANSI.reset)")
+        print("  • Primary Route:       \(ANSI.cyan)\(transport)\(ANSI.reset)")
+        if let reason = fallbackReason {
+            print("  • Fallback Used:       \(ANSI.bold)\(ANSI.yellow)YES ⚠️ [REST Fallback Route Invoked]\(ANSI.reset)")
+            print("  • Fallback Reason:     \(ANSI.yellow)\(reason)\(ANSI.reset)")
+            print("  • Fallback Model:      \(ANSI.bold)\(config.geminiModel)\(ANSI.reset)")
+        } else {
+            print("  • Fallback Used:       \(ANSI.green)NO (Direct Live Stream Complete)\(ANSI.reset)")
+        }
+        print("  • Audio Duration:      \(String(format: "%.2f", audioDuration))s")
+        if firstTokenMs > 0 {
+            print("  • First Token TTFT:    \(ANSI.bold)\(String(format: "%.1f", firstTokenMs)) ms\(ANSI.reset)")
+        }
+        print("  • API Roundtrip (RTT): \(ANSI.bold)\(String(format: "%.1f", roundtripMs)) ms\(ANSI.reset)")
+        print("  • Injection Latency:   \(String(format: "%.1f", injectMs)) ms (\(injectStatus))")
+        print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")
+        
+        processingLock.lock()
+        isProcessing = false
+        processingLock.unlock()
+    }
+    
+    private func printBanner() {
+        let langDisplay = config.languageCodes.isEmpty ? "\(ANSI.green)Auto (All 70+ Languages)\(ANSI.reset)" : "\(ANSI.green)\(config.languageCodes.map { $0.uppercased() }.joined(separator: ", "))\(ANSI.reset) \(ANSI.gray)(Prioritized)\(ANSI.reset)"
+        print("""
+        \(ANSI.bold)\(ANSI.cyan)
+             _           _   ____                   _    
+            | |_   _ ___| |_/ ___| _ __   ___  __ _| | __
+         _  | | | | / __| __\\___ \\| '_ \\ / _ \\/ _` | |/ /
+        | |_| | |_| \\__ \\ |_ ___) | |_) |  __/ (_| |   < 
+         \\___/ \\__,_|___/\\__|____/| .__/ \\___|\\__,_|_|\\_\\
+                                  |_|                    
+        \(ANSI.reset)\(ANSI.bold)Ultra-Low-Latency Push-to-Talk macOS Voice Dictation\(ANSI.reset)
+        \(ANSI.gray)Native Swift • CoreAudio Queue • Gemini Live WebSockets (TEXT Modality)\(ANSI.reset)
+        
+        Live WS Model:     \(ANSI.bold)\(config.geminiLiveModel)\(ANSI.reset)
+        REST Fallback:     \(ANSI.bold)\(config.geminiModel)\(ANSI.reset)
+        Language Support:  \(langDisplay)
+        Configured Hotkey: \(ANSI.bold)\(config.hotkey)\(ANSI.reset) (\(config.hotkeyMode))
+        Live WebSockets:   \(config.enableLiveWebSocket ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.yellow)Disabled (REST Only)\(ANSI.reset)")
+        Smart Transcribe:  \(config.smartTranscription ? "\(ANSI.green)Enabled (ITN + Disfluency Removal)\(ANSI.reset)" : "\(ANSI.gray)Verbatim Only\(ANSI.reset)")
+        Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")
+        Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+        Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+        """)
+    }
+}
+
+// MARK: - Standalone Diagnostic Tests
+
+struct Diagnostics {
+    static func runApiTest(config: Config) {
+        print("\n\(ANSI.bold)Testing Gemini API Connectivity... Model: \(config.geminiModel)\(ANSI.reset)")
+        
+        guard !config.geminiApiKey.isEmpty else {
+            Logger.error("TEST", "GEMINI_API_KEY is not configured in .env or environment.")
+            exit(1)
+        }
+        
+        let sampleRate = 16000
+        var pcmData = Data()
+        for i in 0..<sampleRate {
+            let sample = Int16(sin(2.0 * Double.pi * 440.0 * Double(i) / Double(sampleRate)) * 16000.0)
+            pcmData.append(contentsOf: sample.littleEndianBytes)
+        }
+        
+        let semaphore = DispatchSemaphore(value: 0)
+        
+        Logger.info("TEST", "Sending test audio to Gemini REST endpoint...")
+        GeminiRestClient.transcribe(pcmData: pcmData, apiKey: config.geminiApiKey, model: config.geminiModel, languageCodes: config.languageCodes, customVocabulary: config.customVocabulary) { result in
+            defer { semaphore.signal() }
+            switch result {
+            case .success(let payload):
+                Logger.success("TEST", "REST API Connectivity Successful! Latency: \(String(format: "%.1f", payload.latencyMs)) ms")
+                print("  Response: \"\(payload.text)\"")
+            case .failure(let error):
+                Logger.error("TEST", "REST API test failed: \(error.localizedDescription)")
+            }
+        }
+        
+        _ = semaphore.wait(timeout: .now() + 10.0)
+    }
+    
+    static func runAudioTest(config: Config) {
+        print("\n\(ANSI.bold)Testing 3-Second Microphone Capture & Transcription... Speak into your mic now!\(ANSI.reset)")
+        
+        let engine = AudioCaptureEngine()
+        guard engine.setup() else {
+            Logger.error("TEST", "Failed to start AudioCaptureEngine.")
+            return
+        }
+        
+        engine.startRecording()
+        SoundManager.playStartSound()
+        
+        for remaining in (1...3).reversed() {
+            print("\(ANSI.cyan)Recording... \(remaining)s remaining\(ANSI.reset)")
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+        
+        let (pcmData, duration, chunks) = engine.stopRecording()
+        SoundManager.playCommitSound()
+        engine.stopEngine()
+        
+        Logger.success("TEST", "Recorded \(String(format: "%.2f", duration))s audio (\(chunks) chunks, \(pcmData.count) bytes).")
+        
+        if config.geminiApiKey.isEmpty {
+            Logger.warn("TEST", "Set GEMINI_API_KEY to test AI transcription.")
+            return
+        }
+        
+        let sema = DispatchSemaphore(value: 0)
+        Logger.info("TEST", "Transcribing captured audio with Gemini...")
+        
+        let startTime = CFAbsoluteTimeGetCurrent()
+        GeminiRestClient.transcribe(pcmData: pcmData, apiKey: config.geminiApiKey, model: config.geminiModel, languageCodes: config.languageCodes, customVocabulary: config.customVocabulary) { result in
+            defer { sema.signal() }
+            switch result {
+            case .success(let payload):
+                let total = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+                Logger.success("TEST", "Transcription Completed in \(String(format: "%.1f", total)) ms!")
+                print("\n\(ANSI.bold)\(ANSI.green)Result:\(ANSI.reset) \"\(payload.text)\"\n")
+            case .failure(let error):
+                Logger.error("TEST", "Transcription failed: \(error.localizedDescription)")
+            }
+        }
+        
+        _ = sema.wait(timeout: .now() + 15.0)
+    }
+}
+
+// MARK: - CLI Entry Point
+
+let args = CommandLine.arguments
+let config = Config.load()
+
+if args.contains("--check-permissions") || args.contains("-p") {
+    PermissionChecker.printDetailedStatus()
+    exit(0)
+}
+
+if args.contains("--test-api") {
+    Diagnostics.runApiTest(config: config)
+    exit(0)
+}
+
+if args.contains("--test-audio") {
+    Diagnostics.runAudioTest(config: config)
+    exit(0)
+}
+
+if args.contains("--help") || args.contains("-h") {
+    print("""
+    JustSpeak - Ultra-Low-Latency Voice Dictation & Text Polishing
+    
+    Usage:
+      swift justspeak.swift [options]
+      make run
+    
+    Options:
+      --check-permissions, -p   Run diagnostic permissions checker
+      --test-audio              Test 3-second mic capture and AI transcription
+      --test-api                Test Gemini API connection and latency
+      --help, -h                Show this help message
+    
+    Configuration is managed via .env or environment variables.
+    """)
+    exit(0)
+}
+
+let app = JustSpeakApp(config: config)
+app.start()
