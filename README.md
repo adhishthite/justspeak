@@ -155,6 +155,8 @@ All settings can be configured in `.env` or set as environment variables:
 | `VAD_MODE` | `manual` | `manual` (push-to-talk hold defines speech bounds, server VAD off), `tuned` (pause-tolerant server VAD), `auto` (stock server VAD) |
 | `VAD_SILENCE_MS` | `1500` | Tuned mode only: pause length (ms) before server VAD ends speech (200-5000) |
 | `MIC_IDLE_TIMEOUT` | `300` | Seconds without a dictation before the mic is released (status-bar indicator off); next key-down re-arms it. `0` = always on |
+| `HISTORY` | `true` | Record every dictation (success, empty, or error) as one row in a local SQLite DB for later analysis |
+| `HISTORY_DB` | *(empty)* | Path to the history SQLite DB. Empty = `~/.justspeak/history.db` |
 | `LIVE_INPUT_PRICE_PER_1M` | `3.50` | USD per 1M audio input tokens for the live model (cost diagnostics only) |
 | `LIVE_OUTPUT_PRICE_PER_1M` | `21.00` | USD per 1M text output tokens for the live model (cost diagnostics only) |
 | `REST_INPUT_PRICE_PER_1M` | `0.30` | USD per 1M input tokens for the REST fallback model (cost diagnostics only) |
@@ -299,6 +301,28 @@ If a fallback occurs (e.g. network timeout or socket disconnect), JustSpeak logs
   • API Roundtrip (RTT): 1240.5 ms
   • Injection Latency:   4.3 ms (Pasted via Cmd+V)
   • Total Key-Up → Paste: 1244.8 ms ⚡
+```
+
+---
+
+## 🗄️ Dictation History
+
+Every dictation turn (success, empty, or error) is written as one row to a local SQLite database
+at `~/.justspeak/history.db` (`HISTORY_DB` to override, `HISTORY=false` to disable). It's plaintext
+on disk, mode `0600`, and never leaves your machine — use it to run your own cost/latency analytics:
+
+```bash
+# Total cost per day
+sqlite3 ~/.justspeak/history.db \
+  "SELECT date(ts_utc), COUNT(*), ROUND(SUM(cost_usd),4) FROM transcriptions WHERE outcome='success' GROUP BY 1 ORDER BY 1 DESC;"
+
+# Words dictated per day
+sqlite3 ~/.justspeak/history.db \
+  "SELECT date(ts_utc), SUM(word_count) FROM transcriptions GROUP BY 1 ORDER BY 1 DESC;"
+
+# Average / worst-case total latency
+sqlite3 ~/.justspeak/history.db \
+  "SELECT ROUND(AVG(total_ms),1), MAX(total_ms) FROM transcriptions WHERE outcome='success';"
 ```
 
 ---
