@@ -32,7 +32,7 @@ Hold [⌥ Right] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemin
 - **Custom Vocabulary**: Domain terms, acronyms, team names, and tech stack jargon loaded from [`vocabulary.txt`](vocabulary.txt) or `.env`.
 - **Bilingual & Code-Switching Support**: Built-in support for English (`en`), Marathi (`mr`), Hindi (`hi`), and 70+ languages with automatic acoustic language detection.
 - **Zero Unsigned Binaries (gMac Enterprise Compliant)**: Pure Swift script executed directly through Apple's signed `/usr/bin/swift` interpreter with zero third-party binary dependencies.
-- **Resilient Fallback Routing**: Automatic, transparent failover to Gemini REST API (`gemini-3.5-flash-lite` / `gemini-3.5-transcribe`) on WebSocket disconnection or timeouts.
+- **Resilient Fallback Routing**: Automatic, transparent failover to Gemini REST API (`gemini-3.5-flash-lite` / `gemini-3.5-transcribe`) on WebSocket disconnection or timeouts. Because the fallback *prompts* a general-purpose model to transcribe rather than calling a dedicated transcription model, its results pass through a validation gate first — an LLM asked to transcribe audio can answer or chat about it instead, and a rejected result is discarded rather than pasted. Silent clips are peak-detected locally and never reach the API at all, empty transcripts on real audio get one re-send (model nondeterminism), and 429 responses honor the server's `retryDelay`/`Retry-After` hint for a single retry before failing.
 
 ---
 
@@ -142,7 +142,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `GEMINI_LIVE_MODEL` | `gemini-3.5-transcribe-live` | Real-time WebSocket streaming model |
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | REST fallback STT model |
 | `SMART_TRANSCRIPTION` | `true` | Real-time Inverse Text Normalization ($26M, dates, formatting) and disfluency removal |
-| `LANGUAGE_CODES` | `en,mr` | Target / prioritized languages (e.g. `en,mr`, `en,hi`, or `auto` for unrestricted) |
+| `LANGUAGE_CODES` | `en-IN,mr-IN` | Region-qualified BCP-47 codes from the live-transcribe language table (e.g. `en-IN,mr-IN`, `en-US`, or `auto` for unrestricted) |
 | `CUSTOM_VOCABULARY` | *(empty)* | Comma-separated list of words/phrases to boost |
 | `CUSTOM_VOCABULARY_FILE` | `vocabulary.txt` | File containing one word/phrase per line (`#` comments allowed) |
 | `HOTKEY` | `right_option` | Trigger key (`right_option`, `left_option`, `right_control`, `left_control`, `right_cmd`, `left_cmd`, `fn`, `f18`, `f19`, `f13`) |
@@ -151,7 +151,20 @@ All settings can be configured in `.env` or set as environment variables:
 | `SHOW_HUD` | `true` | Native floating Dynamic Island capsule + Apple Notch Bezel Aura |
 | `ENABLE_LIVE_WEBSOCKET` | `true` | Stream audio chunks via Live WebSockets (`true`) or REST only (`false`) |
 | `REST_FALLBACK_TIMEOUT` | `4.0` | Maximum seconds to wait for WebSocket response before falling back to REST |
-| `RESTORE_CLIPBOARD` | `true` | Automatically restore previous clipboard contents 350ms after injection |
+| `POST_ROLL_MS` | `250` | Adaptive trailing capture: continuous-quiet window (ms) after key release before the turn commits; audio keeps streaming while speech energy persists (0-500) |
+| `POST_ROLL_MAX_MS` | `1500` | Hard cap (ms) on the adaptive trailing capture above; set equal to `POST_ROLL_MS` (or `0`) to disable adaptation (0-5000) |
+| `TRAIL_SILENCE_DB` | `-40.0` | RMS dBFS below which the mic is considered quiet for the adaptive trailing capture above (-80.0 to -10.0) |
+| `VAD_MODE` | `manual` | `manual` (push-to-talk hold defines speech bounds, server VAD off), `tuned` (pause-tolerant server VAD), `auto` (stock server VAD) |
+| `VAD_SILENCE_MS` | `1500` | Tuned mode only: pause length (ms) before server VAD ends speech (200-5000) |
+| `MIC_IDLE_TIMEOUT` | `300` | Seconds without a dictation before the mic is released (status-bar indicator off); next key-down re-arms it. `0` = always on |
+| `HISTORY` | `true` | Record every dictation (success, empty, or error) as one row in a local SQLite DB for later analysis |
+| `HISTORY_DB` | *(empty)* | Path to the history SQLite DB. Empty = `~/.justspeak/history.db` |
+| `LIVE_INPUT_PRICE_PER_1M` | `3.50` | USD per 1M audio input tokens for the live model (cost diagnostics only) |
+| `LIVE_OUTPUT_PRICE_PER_1M` | `21.00` | USD per 1M text output tokens for the live model (cost diagnostics only) |
+| `REST_INPUT_PRICE_PER_1M` | `0.30` | USD per 1M input tokens for the REST fallback model (cost diagnostics only) |
+| `REST_OUTPUT_PRICE_PER_1M` | `2.50` | USD per 1M output tokens for the REST fallback model (cost diagnostics only) |
+| `RESTORE_CLIPBOARD` | `true` | Automatically restore previous clipboard contents ~1s after injection, only if nothing else has written the clipboard in the meantime |
+| `TRAILING_SPACE` | `true` | Append one space after each injected dictation so back-to-back dictations don't fuse |
 | `LOG_LEVEL` | `verbose` | `verbose` (live dB meters & latency diagnostics) or `normal` |
 
 ---
@@ -199,6 +212,16 @@ WebSockets
 CUSTOM_VOCABULARY="Adhish, Kunal, LangGraph, Vertex AI, Kubernetes, FastAPI"
 ```
 
+### Text Replacements
+
+Any vocabulary line or item containing `=>` is a deterministic **replacement rule** instead of a plain boost term:
+
+```text
+cooper netties => Kubernetes
+```
+
+`wrong` and `right` are trimmed independently; either side being empty drops the rule. These rules are enforced client-side, deterministically, right after transcription — unlike plain boost terms, which only bias what the recognizer *might* hear, a replacement rule guarantees the wrong form never reaches your document. The `right` side is also added to the boost vocabulary automatically (never the `wrong` form — that would just teach the recognizer to keep mishearing it the same way).
+
 ---
 
 ## 🌐 Multilingual & Bilingual Support
@@ -208,10 +231,10 @@ JustSpeak supports over 70 languages with native code-switching support:
 - **Configured Languages**: Priority language codes can be set in `.env`:
   ```ini
   # English and Marathi
-  LANGUAGE_CODES=en,mr
+  LANGUAGE_CODES=en-IN,mr-IN
   
   # English, Hindi, and Marathi
-  LANGUAGE_CODES=en,hi,mr
+  LANGUAGE_CODES=en-IN,hi-IN,mr-IN
   
   # Unrestricted Automatic Language Detection (All 70+ languages)
   LANGUAGE_CODES=auto
@@ -256,6 +279,8 @@ Run permission diagnostics anytime:
 make check-permissions
 ```
 
+**Paste safety:** if secure input is held (a password field, Terminal's Secure Keyboard Entry) or the frontmost app changes mid-dictation, JustSpeak never synthesizes a paste into the wrong place — it copies the transcript to the clipboard instead and prompts you to press ⌘V.
+
 ---
 
 ## 📊 Latency Diagnostics & Observability
@@ -291,6 +316,28 @@ If a fallback occurs (e.g. network timeout or socket disconnect), JustSpeak logs
   • API Roundtrip (RTT): 1240.5 ms
   • Injection Latency:   4.3 ms (Pasted via Cmd+V)
   • Total Key-Up → Paste: 1244.8 ms ⚡
+```
+
+---
+
+## 🗄️ Dictation History
+
+Every dictation turn (success, empty, or error) is written as one row to a local SQLite database
+at `~/.justspeak/history.db` (`HISTORY_DB` to override, `HISTORY=false` to disable). It's plaintext
+on disk, mode `0600`, and never leaves your machine — use it to run your own cost/latency analytics:
+
+```bash
+# Total cost per day
+sqlite3 ~/.justspeak/history.db \
+  "SELECT date(ts_utc), COUNT(*), ROUND(SUM(cost_usd),4) FROM transcriptions WHERE outcome='success' GROUP BY 1 ORDER BY 1 DESC;"
+
+# Words dictated per day
+sqlite3 ~/.justspeak/history.db \
+  "SELECT date(ts_utc), SUM(word_count) FROM transcriptions GROUP BY 1 ORDER BY 1 DESC;"
+
+# Average / worst-case total latency
+sqlite3 ~/.justspeak/history.db \
+  "SELECT ROUND(AVG(total_ms),1), MAX(total_ms) FROM transcriptions WHERE outcome='success';"
 ```
 
 ---
