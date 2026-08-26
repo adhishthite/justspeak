@@ -161,7 +161,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `LIVE_OUTPUT_PRICE_PER_1M` | `21.00` | USD per 1M text output tokens for the live model (cost diagnostics only) |
 | `REST_INPUT_PRICE_PER_1M` | `0.30` | USD per 1M input tokens for the REST fallback model (cost diagnostics only) |
 | `REST_OUTPUT_PRICE_PER_1M` | `2.50` | USD per 1M output tokens for the REST fallback model (cost diagnostics only) |
-| `RESTORE_CLIPBOARD` | `true` | Automatically restore previous clipboard contents 350ms after injection |
+| `RESTORE_CLIPBOARD` | `true` | Automatically restore previous clipboard contents ~1s after injection, only if nothing else has written the clipboard in the meantime |
 | `LOG_LEVEL` | `verbose` | `verbose` (live dB meters & latency diagnostics) or `normal` |
 
 ---
@@ -275,6 +275,8 @@ Run permission diagnostics anytime:
 ```bash
 make check-permissions
 ```
+
+**Paste safety:** if secure input is held (a password field, Terminal's Secure Keyboard Entry) or the frontmost app changes mid-dictation, JustSpeak never synthesizes a paste into the wrong place — it copies the transcript to the clipboard instead and prompts you to press ⌘V.
 
 ---
 
