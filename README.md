@@ -151,6 +151,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `SHOW_HUD` | `true` | Native floating Dynamic Island capsule + Apple Notch Bezel Aura |
 | `ENABLE_LIVE_WEBSOCKET` | `true` | Stream audio chunks via Live WebSockets (`true`) or REST only (`false`) |
 | `REST_FALLBACK_TIMEOUT` | `4.0` | Maximum seconds to wait for WebSocket response before falling back to REST |
+| `POST_ROLL_MS` | `100` | Grace period (ms) after key release to catch trailing phonemes before finalizing (0-500) |
 | `RESTORE_CLIPBOARD` | `true` | Automatically restore previous clipboard contents 350ms after injection |
 | `LOG_LEVEL` | `verbose` | `verbose` (live dB meters & latency diagnostics) or `normal` |
 

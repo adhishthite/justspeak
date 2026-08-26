@@ -103,6 +103,7 @@ struct Config {
     var showHUD: Bool = true
     var enableLiveWebSocket: Bool = true
     var restFallbackTimeout: Double = 4.0
+    var postRollMs: Int = 100
     var restoreClipboard: Bool = true
     var logLevel: String = "verbose"
     
@@ -187,6 +188,7 @@ struct Config {
                         case "ENABLE_LIVE_WEBSOCKET": config.enableLiveWebSocket = (value.lowercased() == "true" || value == "1")
                         case "RESTORE_CLIPBOARD": config.restoreClipboard = (value.lowercased() == "true" || value == "1")
                         case "REST_FALLBACK_TIMEOUT": if let t = Double(value) { config.restFallbackTimeout = t }
+                        case "POST_ROLL_MS": if let ms = Int(value) { config.postRollMs = min(500, max(0, ms)) }
                         case "LOG_LEVEL": config.logLevel = value.lowercased()
                         default: break
                         }
@@ -211,6 +213,7 @@ struct Config {
         if let ws = env["ENABLE_LIVE_WEBSOCKET"] { config.enableLiveWebSocket = (ws.lowercased() == "true" || ws == "1") }
         if let r = env["RESTORE_CLIPBOARD"] { config.restoreClipboard = (r.lowercased() == "true" || r == "1") }
         if let timeout = env["REST_FALLBACK_TIMEOUT"], let t = Double(timeout) { config.restFallbackTimeout = t }
+        if let postRoll = env["POST_ROLL_MS"], let ms = Int(postRoll) { config.postRollMs = min(500, max(0, ms)) }
         if let log = env["LOG_LEVEL"] { config.logLevel = log.lowercased() }
         
         if let raw = rawLanguages {
@@ -446,7 +449,7 @@ struct TextInjector {
             keyUp.flags = .maskCommand
             
             keyDown.post(tap: .cghidEventTap)
-            usleep(25_000) // 25ms key press hold
+            usleep(10_000) // 10ms key press hold - sufficient for a synthesized Cmd+V to register
             keyUp.post(tap: .cghidEventTap)
             
             eventSuccess = true
@@ -501,6 +504,7 @@ final class AudioCaptureEngine {
     // Pre-roll rolling ring buffer (~250ms = 4000 samples @ 16kHz = 8000 bytes)
     private var preRollRingBuffer = Data()
     private let maxPreRollBytes = 8000
+    private var preRollBytesInTurn = 0
     
     // Streaming chunk accumulator (~150ms chunks = 4800 bytes)
     private var pendingChunkBuffer = Data()
@@ -583,10 +587,10 @@ final class AudioCaptureEngine {
         if status == .haveData, outputBuffer.frameLength > 0, let int16Pointer = outputBuffer.int16ChannelData?[0] {
             let byteCount = Int(outputBuffer.frameLength) * 2
             let chunkData = Data(bytes: int16Pointer, count: byteCount)
-            
+
             lock.lock()
             let currentlyRecording = isRecording
-            
+
             if !currentlyRecording {
                 // Maintain 250ms pre-roll circular buffer while idle
                 preRollRingBuffer.append(chunkData)
@@ -596,15 +600,37 @@ final class AudioCaptureEngine {
                 lock.unlock()
                 return
             }
-            
+
             recordedPCMData.append(chunkData)
             pendingChunkBuffer.append(chunkData)
             chunkCount += 1
-            
-            // Calculate RMS and render meter at 10Hz throttle (avoids terminal flooding)
+
+            // 10Hz meter throttle decision must happen under the lock since it mutates
+            // lastMeterUpdateTime; only snapshot the meter's inputs when actually needed.
             let now = CFAbsoluteTimeGetCurrent()
+            var shouldUpdateMeter = false
+            var elapsed: Double = 0
+            var kbStreamed: Double = 0
+            var chunkCountSnapshot = 0
             if (now - lastMeterUpdateTime) > 0.10 {
                 lastMeterUpdateTime = now
+                shouldUpdateMeter = true
+                elapsed = now - recordingStartTime
+                kbStreamed = Double(recordedPCMData.count) / 1024.0
+                chunkCountSnapshot = chunkCount
+            }
+
+            // Coalesce audio into ~150ms frames before dispatching to WebSocket
+            var toStream: Data? = nil
+            if pendingChunkBuffer.count >= streamingChunkTargetBytes {
+                toStream = pendingChunkBuffer
+                pendingChunkBuffer.removeAll(keepingCapacity: true)
+            }
+            lock.unlock()
+
+            // RMS math, meter rendering, and callbacks all run off the lock. int16Pointer is
+            // still valid here - it points into outputBuffer, a local var alive for this call.
+            if shouldUpdateMeter {
                 var sumSquare: Double = 0.0
                 let sampleCount = Int(outputBuffer.frameLength)
                 for i in 0..<sampleCount {
@@ -613,22 +639,14 @@ final class AudioCaptureEngine {
                 }
                 let rms = sqrt(sumSquare / Double(max(sampleCount, 1)))
                 let db = 20.0 * log10(max(rms, 1.0) / 32768.0)
-                
-                let elapsed = now - recordingStartTime
+
                 let meterBars = renderVolumeMeter(db: db)
-                let kbStreamed = Double(recordedPCMData.count) / 1024.0
-                Logger.meter("\(ANSI.bold)\(ANSI.yellow)🎙️  RECORDING\(ANSI.reset) [\(meterBars)] \(String(format: "%5.1f", db)) dB | \(String(format: "%.2fs", elapsed)) | \(String(format: "%.1f", kbStreamed)) KB streamed (#\(chunkCount))")
+                Logger.meter("\(ANSI.bold)\(ANSI.yellow)🎙️  RECORDING\(ANSI.reset) [\(meterBars)] \(String(format: "%5.1f", db)) dB | \(String(format: "%.2fs", elapsed)) | \(String(format: "%.1f", kbStreamed)) KB streamed (#\(chunkCountSnapshot))")
                 onAudioLevel?(db)
             }
-            
-            // Coalesce audio into ~150ms frames before dispatching to WebSocket
-            if pendingChunkBuffer.count >= streamingChunkTargetBytes {
-                let toStream = pendingChunkBuffer
-                pendingChunkBuffer.removeAll(keepingCapacity: true)
-                lock.unlock()
+
+            if let toStream = toStream {
                 onAudioChunk?(toStream)
-            } else {
-                lock.unlock()
             }
         }
     }
@@ -648,9 +666,11 @@ final class AudioCaptureEngine {
         lock.lock()
         recordedPCMData.removeAll(keepingCapacity: true)
         pendingChunkBuffer.removeAll(keepingCapacity: true)
-        
+
         // Prepend rolling pre-roll buffer to prevent clipped first syllable
+        preRollBytesInTurn = 0
         if !preRollRingBuffer.isEmpty {
+            preRollBytesInTurn = preRollRingBuffer.count
             recordedPCMData.append(preRollRingBuffer)
             pendingChunkBuffer.append(preRollRingBuffer)
             preRollRingBuffer.removeAll(keepingCapacity: true)
@@ -663,39 +683,52 @@ final class AudioCaptureEngine {
         lock.unlock()
     }
     
-    func stopRecording(gracePeriodMs: Int = 150) -> (pcmData: Data, duration: Double, chunkCount: Int) {
+    func stopRecording(gracePeriodMs: Int = 150) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int) {
+        // True hold duration is measured at entry, BEFORE the post-roll sleep - otherwise the
+        // grace period pads every tap past the caller's micro-click duration threshold.
+        let stopRequestTime = CFAbsoluteTimeGetCurrent()
+
         // 1. Brief post-roll grace period (150ms) to allow final acoustic phonemes from mic hardware buffer to arrive
         if gracePeriodMs > 0 {
             usleep(useconds_t(gracePeriodMs * 1000))
         }
-        
+
         // 2. Synchronously drain all in-flight audio processing tasks on the serial queue
         audioProcessingQueue.sync { }
-        
+
         lock.lock()
         isRecording = false
-        
-        // 3. Flush any trailing pending chunk
+
+        // 3. Real captured byte count: taken before the silence flush below is appended, and
+        // excluding the prepended pre-roll, so callers see genuine key-held speech audio only.
+        let capturedBytes = max(0, recordedPCMData.count - preRollBytesInTurn)
+
+        // 4. Collect any trailing pending chunk; fired via onAudioChunk after the lock is released
+        var trailingChunk: Data? = nil
         if !pendingChunkBuffer.isEmpty {
-            let trailing = pendingChunkBuffer
+            trailingChunk = pendingChunkBuffer
             pendingChunkBuffer.removeAll(keepingCapacity: true)
-            onAudioChunk?(trailing)
         }
-        
-        // 4. Append 700ms acoustic lookahead silence flush (22,400 bytes @ 16kHz 16-bit mono)
+
+        // 5. Append 700ms acoustic lookahead silence flush (22,400 bytes @ 16kHz 16-bit mono)
         // This satisfies the bidirectional acoustic lookahead window required by speech encoders to finalize trailing words
         let silenceFlushBytes = 22400
         let silenceData = Data(count: silenceFlushBytes)
         recordedPCMData.append(silenceData)
-        onAudioChunk?(silenceData)
-        
+
         let data = recordedPCMData
-        let duration = CFAbsoluteTimeGetCurrent() - recordingStartTime
+        let duration = stopRequestTime - recordingStartTime
         let chunks = chunkCount
         lock.unlock()
-        
+
+        // 6. Fire chunk callbacks outside the lock. Ordering preserved: trailing real audio first, then silence.
+        if let trailing = trailingChunk {
+            onAudioChunk?(trailing)
+        }
+        onAudioChunk?(silenceData)
+
         Logger.endMeter()
-        return (data, duration, chunks)
+        return (data, duration, chunks, capturedBytes)
     }
     
     func stopEngine() {
@@ -757,14 +790,15 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         
         reconnectWorkItem?.cancel()
         
-        let wsUrlString = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=\(apiKey)"
+        let wsUrlString = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         guard let url = URL(string: wsUrlString) else {
             Logger.error("WS", "Invalid WebSocket URL.")
             return
         }
-        
+
         var request = URLRequest(url: url)
         request.timeoutInterval = 10.0
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         
         let task = urlSession.webSocketTask(with: request)
         self.webSocketTask = task
@@ -904,37 +938,38 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
         }
-        
+
+        // Actions to perform once the lock is released: logging, meter text, and callbacks
+        // must never run while `lock` is held.
+        var serverErrorMessage: String? = nil
+        var didCompleteSetup = false
+        var shouldScheduleReconnect = false
+        var liveTextUpdate: (label: String, elapsedMs: Double, fullText: String, textCopy: String)? = nil
+        var turnCompletionFire: (completion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?, text: String, firstTokenMs: Double, totalMs: Double)? = nil
+
         lock.lock()
-        defer { lock.unlock() }
-        
+
         // 0. Server error handling
         if let errorObj = json["error"] as? [String: Any] {
-            let message = (errorObj["message"] as? String) ?? "Unknown server error"
-            Logger.error("WS", "Server error: \(message)")
+            serverErrorMessage = (errorObj["message"] as? String) ?? "Unknown server error"
         }
-        
+
         // 1. Handshake confirmation
         if json["setupComplete"] != nil {
             self.isConnected = true
             self.isReady = true
             self.reconnectAttempts = 0
-            Logger.success("WS", "Gemini Live session established & ready for streaming.")
-            return
+            didCompleteSetup = true
         }
-        
         // 2. Server goAway notification (Server scheduled disconnect)
-        if json["goAway"] != nil {
-            Logger.warn("WS", "Server sent goAway signal. Preemptively scheduling reconnect...")
-            self.scheduleReconnect()
-            return
+        else if json["goAway"] != nil {
+            shouldScheduleReconnect = true
         }
-        
         // 3. Server content (transcription streaming)
-        if let serverContent = json["serverContent"] as? [String: Any] {
+        else if let serverContent = json["serverContent"] as? [String: Any] {
             var updatedText: String? = nil
             var isUserSpeech = false
-            
+
             // PRIORITY 1: Finalized inputTranscription (e.g. gemini-3.5-transcribe-live)
             if let inputTrans = serverContent["inputTranscription"] as? [String: Any],
                let text = inputTrans["text"] as? String, !text.isEmpty {
@@ -969,7 +1004,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                       let text = outputTranscription["text"] as? String, !text.isEmpty {
                 updatedText = currentTurnText + text
             }
-            
+
             if let newText = updatedText {
                 let now = CFAbsoluteTimeGetCurrent()
                 self.lastTokenReceivedTime = now
@@ -983,33 +1018,53 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 let textCopy = currentTurnText
                 let elapsedMs = turnCommitTime > 0 ? (now - turnCommitTime) * 1000.0 : 0
                 let label = isUserSpeech ? "⚡ DICTATING" : "⚡ STREAMING"
-                Logger.meter("\(ANSI.bold)\(ANSI.cyan)\(label)\(ANSI.reset) [\(String(format: "%.0f", elapsedMs))ms]: \(ANSI.bold)\(currentTurnText.replacingOccurrences(of: "\n", with: " "))\(ANSI.reset)")
-                onLiveTextUpdate?(textCopy)
+                liveTextUpdate = (label: label, elapsedMs: elapsedMs, fullText: currentTurnText, textCopy: textCopy)
             }
-            
+
             // Explicit turn completion / generation completion
             let isTurnComplete = (serverContent["turnComplete"] as? Bool) ?? (serverContent["turnComplete"] != nil)
             let isGenComplete = (serverContent["generationComplete"] as? Bool) ?? (serverContent["generationComplete"] != nil)
-            
+
             if (isTurnComplete || isGenComplete) && !currentTurnText.isEmpty && !hasFiredTurnCompletion {
                 hasFiredTurnCompletion = true
                 isCommitting = false
                 settleWorkItem?.cancel()
                 settleWorkItem = nil
-                
-                Logger.endMeter()
+
                 let totalLatencyMs = (CFAbsoluteTimeGetCurrent() - turnCommitTime) * 1000.0
                 let text = currentTurnText
                 currentTurnText = ""
                 let firstToken = firstTokenLatencyMs
                 firstTokenLatencyMs = 0
-                
+
                 let completion = self.turnCompletion
                 self.turnCompletion = nil
-                
-                DispatchQueue.global().async {
-                    completion?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
-                }
+
+                turnCompletionFire = (completion: completion, text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)
+            }
+        }
+
+        lock.unlock()
+
+        // Logging & callbacks all run off the lock, in the same relative order as before.
+        if let msg = serverErrorMessage {
+            Logger.error("WS", "Server error: \(msg)")
+        }
+        if didCompleteSetup {
+            Logger.success("WS", "Gemini Live session established & ready for streaming.")
+        }
+        if shouldScheduleReconnect {
+            Logger.warn("WS", "Server sent goAway signal. Preemptively scheduling reconnect...")
+            self.scheduleReconnect()
+        }
+        if let update = liveTextUpdate {
+            Logger.meter("\(ANSI.bold)\(ANSI.cyan)\(update.label)\(ANSI.reset) [\(String(format: "%.0f", update.elapsedMs))ms]: \(ANSI.bold)\(update.fullText.replacingOccurrences(of: "\n", with: " "))\(ANSI.reset)")
+            onLiveTextUpdate?(update.textCopy)
+        }
+        if let fire = turnCompletionFire {
+            Logger.endMeter()
+            DispatchQueue.global().async {
+                fire.completion?(.success((text: fire.text, firstTokenMs: fire.firstTokenMs, totalMs: fire.totalMs)))
             }
         }
     }
@@ -1268,15 +1323,16 @@ struct GeminiRestClient {
         let wavData = createWavData(from: pcmData, sampleRate: 16000, channels: 1)
         let base64Wav = wavData.base64EncodedString()
         
-        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
         guard let url = URL(string: urlString) else {
             completion(.failure(NSError(domain: "JustSpeak", code: -2, userInfo: [NSLocalizedDescriptionKey: "Invalid REST URL."])))
             return
         }
-        
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         request.timeoutInterval = 10.0
         
         let payload: [String: Any]
@@ -1556,9 +1612,10 @@ final class HotkeyManager {
     
     private func updateKeyState(pressed: Bool) {
         let now = CFAbsoluteTimeGetCurrent()
-        guard (now - lastStateChangeTime) > 0.08 else { return } // 80ms debounce
-        
+
         if mode == "toggle" {
+            // Both toggle transitions fire on a press edge, so the 80ms debounce applies to both.
+            guard (now - lastStateChangeTime) > 0.08 else { return } // 80ms debounce
             if pressed && !isKeyDown {
                 isKeyDown = true
                 lastStateChangeTime = now
@@ -1569,8 +1626,11 @@ final class HotkeyManager {
                 onKeyUp?()
             }
         } else {
-            // Push-to-Talk (Hold)
+            // Push-to-Talk (Hold): debounce only the press edge. A release must never be
+            // swallowed - dropping it would leave isKeyDown stuck true (mic stuck recording)
+            // after a press+release faster than the debounce window.
             if pressed && !isKeyDown {
+                guard (now - lastStateChangeTime) > 0.08 else { return } // 80ms debounce
                 isKeyDown = true
                 lastStateChangeTime = now
                 onKeyDown?()
@@ -1908,15 +1968,13 @@ final class AppleIntelligenceOrbView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         self.wantsLayer = true
-        startAnimation()
     }
-    
+
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         self.wantsLayer = true
-        startAnimation()
     }
-    
+
     func startAnimation() {
         displayTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -2194,9 +2252,9 @@ final class FloatingHUD {
     private let minPillWidth: CGFloat = 330
     private let maxPillWidth: CGFloat = 520
     private let pillHeight: CGFloat = 52
-    private let notchInfo: NotchGeometry
-    private let screenFrame: NSRect
-    
+    private var notchInfo: NotchGeometry
+    private var screenFrame: NSRect
+
     init() {
         let screen = NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
         self.screenFrame = screen.frame
@@ -2287,10 +2345,46 @@ final class FloatingHUD {
         transcriptLabel.frame = NSRect(x: 16, y: 7, width: initialWidth - 32, height: 20)
         transcriptLabel.lineBreakMode = .byTruncatingTail
         visualEffectView.addSubview(transcriptLabel)
-        
+
         pillPanel.contentView = visualEffectView
+
+        // Re-run screen-dependent layout whenever the display configuration changes
+        // (monitor plugged/unplugged, resolution change, etc.) so the notch aura and
+        // pill don't stay pinned to stale geometry. FloatingHUD isn't an NSObject subclass,
+        // so use the block-based observer API rather than a @objc selector target.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyScreenLayout()
+        }
     }
-    
+
+    // Recomputes screenFrame, notchInfo, and repositions the notch/pill panels to match -
+    // the same geometry math used to place them in init().
+    private func applyScreenLayout() {
+        let screen = NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
+        self.screenFrame = screen.frame
+        self.notchInfo = NotchGeometry.detect(screen: screen)
+
+        // Notch Glow Overlay Panel geometry
+        let padding: CGFloat = 50.0
+        let glowWidth = notchInfo.rect.width + padding * 2
+        let glowHeight = notchInfo.rect.height + padding + 12.0
+        let glowX = notchInfo.rect.minX - padding
+        let glowY = screenFrame.height - glowHeight
+        notchPanel.setFrame(NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight), display: true)
+        notchGlowView.frame = NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight)
+        notchGlowView.notchRect = notchInfo.rect
+        notchGlowView.needsDisplay = true
+
+        // Floating Dynamic Island Panel geometry (preserves currentWidth)
+        let pillX = screenFrame.midX - currentWidth / 2.0
+        let pillY = screenFrame.height - notchInfo.rect.height - pillHeight - 12.0
+        pillPanel.setFrame(NSRect(x: pillX, y: pillY, width: currentWidth, height: pillHeight), display: true)
+    }
+
     private func updatePillWidth(targetWidth: CGFloat) {
         let clamped = max(minPillWidth, min(maxPillWidth, targetWidth))
         guard abs(clamped - currentWidth) > 8.0 else { return }
@@ -2319,10 +2413,11 @@ final class FloatingHUD {
         notchGlowView.state = .listening
         notchGlowView.audioLevel = 0.0
         notchGlowView.startAnimation()
-        
+
         // Pill Layout & Content
         orbIcon.state = .listening
         orbIcon.audioLevel = 0.0
+        orbIcon.startAnimation()
         headerLabel.stringValue = "JUSTSPEAK • LIVE DICTATION"
         headerLabel.textColor = NSColor(white: 1.0, alpha: 0.65)
         transcriptLabel.stringValue = "Hold Right ⌥ to speak..."
@@ -2429,6 +2524,7 @@ final class FloatingHUD {
                 self.notchPanel.orderOut(nil)
                 self.pillPanel.orderOut(nil)
                 self.notchGlowView.stopAnimation()
+                self.orbIcon.stopAnimation()
             }
         })
     }
@@ -2443,9 +2539,25 @@ final class JustSpeakApp {
     private var hotkeyManager: HotkeyManager?
     private var hud: FloatingHUD?
     
+    // Cross-thread "is a turn active" flag - read synchronously from the event-tap thread in
+    // handleKeyDown (must stay fast/non-blocking), written only from sessionQueue-executed code.
     private var isProcessing: Bool = false
     private let processingLock = NSLock()
-    
+
+    // Serial queue that owns all turn lifecycle state below. Both the WS commit completion and
+    // the REST fallback timer used to race directly against a captured `var didFallback` bool
+    // with no synchronization, so a slow-arriving WS result and a just-fired fallback timer could
+    // both call handleTranscribedText and paste the turn twice. Funneling every route through
+    // this serial queue makes turn settlement a single-writer state machine.
+    private let sessionQueue = DispatchQueue(label: "com.justspeak.session", qos: .userInteractive)
+    private var currentTurnId: UInt64 = 0
+    private var turnSettled: Bool = false
+    private var pendingFallbackTimer: DispatchWorkItem?
+
+    // Retained so the GCD signal sources aren't deallocated once start() returns control to app.run()
+    private var sigintSource: DispatchSourceSignal?
+    private var sigtermSource: DispatchSourceSignal?
+
     init(config: Config) {
         self.config = config
         if config.enableLiveWebSocket && !config.geminiApiKey.isEmpty {
@@ -2465,14 +2577,26 @@ final class JustSpeakApp {
     func start() {
         printBanner()
         
-        // Handle SIGINT (Ctrl+C) and SIGTERM cleanly
-        signal(SIGINT) { _ in
+        // Handle SIGINT (Ctrl+C) and SIGTERM cleanly. C signal handlers must not call
+        // async-signal-unsafe functions like print(), so ignore the raw signal and do the
+        // actual work in a GCD dispatch source on the main queue instead.
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+
+        let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sigint.setEventHandler {
             print("\n\(ANSI.bold)Exiting JustSpeak. Goodbye!\(ANSI.reset)")
             exit(0)
         }
-        signal(SIGTERM) { _ in
+        sigint.resume()
+        self.sigintSource = sigint
+
+        let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        sigterm.setEventHandler {
             exit(0)
         }
+        sigterm.resume()
+        self.sigtermSource = sigterm
         
         // 1. Verify Permissions
         let (ax, mic) = PermissionChecker.verifyAll()
@@ -2516,7 +2640,24 @@ final class JustSpeakApp {
             }
             liveClient?.connect()
         }
-        
+
+        // Pre-warm the REST fallback route's connection (DNS + TCP + TLS handshake) so that if
+        // the REST fallback is ever needed, it isn't paying cold-connection cost on the critical
+        // path. Uses URLSession.shared, the same pool GeminiRestClient makes its calls from.
+        if !config.geminiApiKey.isEmpty {
+            let prewarmStart = CFAbsoluteTimeGetCurrent()
+            if let prewarmUrl = URL(string: "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1") {
+                var prewarmRequest = URLRequest(url: prewarmUrl)
+                prewarmRequest.timeoutInterval = 10.0
+                prewarmRequest.setValue(config.geminiApiKey, forHTTPHeaderField: "x-goog-api-key")
+                URLSession.shared.dataTask(with: prewarmRequest) { _, response, _ in
+                    let elapsedMs = (CFAbsoluteTimeGetCurrent() - prewarmStart) * 1000.0
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                    Logger.debug("REST", "Connection pre-warmed (\(String(format: "%.0f", elapsedMs))ms, HTTP \(status))")
+                }.resume()
+            }
+        }
+
         // 5. Setup Hotkey Listener
         let binding = HotkeyManager.KeyBinding.from(string: config.hotkey)
         let hotkey = HotkeyManager(binding: binding, mode: config.hotkeyMode)
@@ -2567,17 +2708,38 @@ final class JustSpeakApp {
     }
     
     private func handleKeyUp() {
-        let (pcmData, duration, chunks) = audioCapture.stopRecording()
-        
-        // Discard accidental micro-clicks (< 150ms or < 2KB of audio)
-        guard duration >= 0.15 && pcmData.count > 2000 else {
+        // Capture the physical release instant before anything else - this becomes the true
+        // start of "Total Key-Up -> Paste" latency measurement.
+        let keyUpTime = CFAbsoluteTimeGetCurrent()
+
+        // Flip the HUD to "processing" immediately on the main queue. The tap thread must not
+        // block on stopRecording's post-roll sleep + queue drain, so the rest of the turn is
+        // handed off to sessionQueue right away.
+        DispatchQueue.main.async { [weak self] in
+            self?.hud?.showProcessing()
+        }
+
+        sessionQueue.async { [weak self] in
+            self?.runTurnPipeline(keyUpTime: keyUpTime)
+        }
+    }
+
+    /// Runs entirely on sessionQueue: finalizes the capture, arbitrates the WS-vs-REST turn
+    /// lifecycle, and is the only place that mutates currentTurnId / turnSettled / pendingFallbackTimer.
+    private func runTurnPipeline(keyUpTime: CFAbsoluteTime) {
+        let pipelineStartTime = CFAbsoluteTimeGetCurrent()
+        let (pcmData, duration, chunks, capturedBytes) = audioCapture.stopRecording(gracePeriodMs: config.postRollMs)
+
+        // Discard accidental micro-clicks (< 150ms or < 2KB of real captured audio, ignoring
+        // the fixed pre-roll/silence-flush padding that stopRecording always appends)
+        guard duration >= 0.15 && capturedBytes > 2000 else {
             Logger.warn("INPUT", "Ignored short click (\(String(format: "%.0f", duration * 1000.0))ms). Hold key while speaking.")
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.hide()
             }
             return
         }
-        
+
         processingLock.lock()
         guard !isProcessing else {
             processingLock.unlock()
@@ -2585,69 +2747,84 @@ final class JustSpeakApp {
         }
         isProcessing = true
         processingLock.unlock()
-        
-        DispatchQueue.main.async { [weak self] in
-            self?.hud?.showProcessing()
-        }
-        
+
+        currentTurnId += 1
+        let turnId = currentTurnId
+        turnSettled = false
+
         Logger.info("AUDIO", "Captured \(String(format: "%.2fs", duration)) audio (\(chunks) chunks, \(String(format: "%.1f", Double(pcmData.count)/1024.0)) KB). Committing turn...")
-        
-        let processingStartTime = CFAbsoluteTimeGetCurrent()
-        
+
+        let commitDispatchTime = CFAbsoluteTimeGetCurrent()
+        let captureFinalizeMs = (commitDispatchTime - pipelineStartTime) * 1000.0
+
         // Strategy: Try Live WebSocket first; if not ready or on error, fallback seamlessly to REST
         if config.enableLiveWebSocket, let liveClient = self.liveClient, liveClient.isReady {
-            let commitStartTime = CFAbsoluteTimeGetCurrent()
+            let commitStartTime = commitDispatchTime
             let dynamicTimeout = max(config.restFallbackTimeout, min(8.0, duration * 0.4 + 3.0))
-            
-            var didFallback = false
+
             let fallbackTimer = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
-                self.processingLock.lock()
-                guard self.isProcessing else {
-                    self.processingLock.unlock()
-                    return
-                }
-                self.processingLock.unlock()
-                
-                didFallback = true
+                guard self.currentTurnId == turnId, !self.turnSettled else { return }
+                self.pendingFallbackTimer = nil
                 let reason = "WebSocket Settlement Timeout (> \(String(format: "%.1f", dynamicTimeout))s)"
-                Logger.warn("WS", "\(reason); executing REST fallback...")
-                self.executeRestFallback(pcmData: pcmData, duration: duration, startTime: processingStartTime, reason: reason)
+                Logger.warn("WS", "\(reason); executing REST fallback (hedge - WS may still land first)...")
+                self.executeRestFallback(turnId: turnId, pcmData: pcmData, duration: duration, keyUpTime: keyUpTime, captureFinalizeMs: captureFinalizeMs, reason: reason)
             }
-            
-            DispatchQueue.global().asyncAfter(deadline: .now() + dynamicTimeout, execute: fallbackTimer)
-            
+            pendingFallbackTimer = fallbackTimer
+            sessionQueue.asyncAfter(deadline: .now() + dynamicTimeout, execute: fallbackTimer)
+
             liveClient.commitTurn { [weak self] result in
-                fallbackTimer.cancel()
-                guard let self = self, !didFallback else { return }
-                
-                switch result {
-                case .success(let payload):
-                    let roundtripMs = (CFAbsoluteTimeGetCurrent() - commitStartTime) * 1000.0
-                    self.handleTranscribedText(
-                        payload.text,
-                        transport: "Live WebSocket (\(self.config.geminiLiveModel))",
-                        firstTokenMs: payload.firstTokenMs,
-                        roundtripMs: roundtripMs,
-                        audioDuration: duration,
-                        totalStartTime: processingStartTime,
-                        fallbackReason: nil
-                    )
-                    
-                case .failure(let error):
-                    let reason = "WebSocket Disconnected / Error (\(error.localizedDescription))"
-                    Logger.warn("WS", "\(reason). Falling back to REST...")
-                    self.executeRestFallback(pcmData: pcmData, duration: duration, startTime: processingStartTime, reason: reason)
+                guard let self = self else { return }
+                self.sessionQueue.async {
+                    switch result {
+                    case .success(let payload):
+                        let roundtripMs = (CFAbsoluteTimeGetCurrent() - commitStartTime) * 1000.0
+                        self.settle(turnId: turnId, route: "WS", outcome: .success(
+                            text: payload.text,
+                            transport: "Live WebSocket (\(self.config.geminiLiveModel))",
+                            firstTokenMs: payload.firstTokenMs,
+                            roundtripMs: roundtripMs,
+                            audioDuration: duration,
+                            keyUpTime: keyUpTime,
+                            captureFinalizeMs: captureFinalizeMs,
+                            fallbackReason: nil
+                        ))
+
+                    case .failure(let error):
+                        guard self.currentTurnId == turnId, !self.turnSettled else { return }
+                        // If the hedge timer already fired, a REST call for this turn is in flight
+                        // (pendingFallbackTimer was nilled when it ran) - don't launch a duplicate.
+                        guard self.pendingFallbackTimer != nil else {
+                            Logger.debug("SESSION", "WS failed for turn #\(turnId); hedge REST already in flight.")
+                            return
+                        }
+                        // WS gave a definitive answer (an error); the hedge timer no longer needs
+                        // to fire a second, redundant REST call.
+                        self.pendingFallbackTimer?.cancel()
+                        self.pendingFallbackTimer = nil
+                        let reason = "WebSocket Disconnected / Error (\(error.localizedDescription))"
+                        Logger.warn("WS", "\(reason). Falling back to REST...")
+                        self.executeRestFallback(turnId: turnId, pcmData: pcmData, duration: duration, keyUpTime: keyUpTime, captureFinalizeMs: captureFinalizeMs, reason: reason)
+                    }
                 }
             }
         } else {
             // Direct REST
             let reason = !config.enableLiveWebSocket ? "Live WebSockets Disabled in Config" : "Live WebSocket Initial Handshake Pending"
-            executeRestFallback(pcmData: pcmData, duration: duration, startTime: processingStartTime, reason: reason)
+            executeRestFallback(turnId: turnId, pcmData: pcmData, duration: duration, keyUpTime: keyUpTime, captureFinalizeMs: captureFinalizeMs, reason: reason)
         }
     }
-    
-    private func executeRestFallback(pcmData: Data, duration: Double, startTime: CFAbsoluteTime, reason: String) {
+
+    /// Result of a settled turn, handed to settle(). Success carries every field the latency
+    /// diagnostic printout needs; failure is the REST-fallback-failed error path.
+    private enum TurnOutcome {
+        case success(text: String, transport: String, firstTokenMs: Double, roundtripMs: Double, audioDuration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, fallbackReason: String?)
+        case failure(Error)
+    }
+
+    /// Launches the REST fallback for turnId. Does NOT settle the turn by itself - WS and REST
+    /// race, and whichever result reaches settle() first for a still-live turnId wins.
+    private func executeRestFallback(turnId: UInt64, pcmData: Data, duration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, reason: String) {
         let restStartTime = CFAbsoluteTimeGetCurrent()
         GeminiRestClient.transcribe(
             pcmData: pcmData,
@@ -2657,33 +2834,67 @@ final class JustSpeakApp {
             customVocabulary: config.customVocabulary
         ) { [weak self] result in
             guard let self = self else { return }
-            
-            switch result {
-            case .success(let payload):
-                let roundtripMs = (CFAbsoluteTimeGetCurrent() - restStartTime) * 1000.0
-                self.handleTranscribedText(
-                    payload.text,
-                    transport: "REST API (\(self.config.geminiModel))",
-                    firstTokenMs: 0,
-                    roundtripMs: roundtripMs,
-                    audioDuration: duration,
-                    totalStartTime: startTime,
-                    fallbackReason: reason
-                )
-                
-            case .failure(let error):
-                Logger.error("REST", "Transcription failed: \(error.localizedDescription)")
-                if self.config.soundFeedback { SoundManager.playErrorSound() }
-                DispatchQueue.main.async { [weak self] in
-                    self?.hud?.showError(message: "Transcription Failed")
+            self.sessionQueue.async {
+                switch result {
+                case .success(let payload):
+                    let roundtripMs = (CFAbsoluteTimeGetCurrent() - restStartTime) * 1000.0
+                    self.settle(turnId: turnId, route: "REST", outcome: .success(
+                        text: payload.text,
+                        transport: "REST API (\(self.config.geminiModel))",
+                        firstTokenMs: 0,
+                        roundtripMs: roundtripMs,
+                        audioDuration: duration,
+                        keyUpTime: keyUpTime,
+                        captureFinalizeMs: captureFinalizeMs,
+                        fallbackReason: reason
+                    ))
+
+                case .failure(let error):
+                    self.settle(turnId: turnId, route: "REST", outcome: .failure(error))
                 }
-                self.processingLock.lock()
-                self.isProcessing = false
-                self.processingLock.unlock()
             }
         }
     }
-    
+
+    /// The sole place a live turn's result reaches handleTranscribedText or the error path.
+    /// Runs only on sessionQueue. A result for a turnId that isn't current, or one that arrives
+    /// after the turn already settled, is a loser of the WS/REST hedge race and is dropped.
+    private func settle(turnId: UInt64, route: String, outcome: TurnOutcome) {
+        guard turnId == currentTurnId, !turnSettled else {
+            Logger.debug("SESSION", "Stale result for turn #\(turnId) ignored (\(route))")
+            return
+        }
+        turnSettled = true
+        pendingFallbackTimer?.cancel()
+        pendingFallbackTimer = nil
+
+        switch outcome {
+        case .success(let text, let transport, let firstTokenMs, let roundtripMs, let audioDuration, let keyUpTime, let captureFinalizeMs, let fallbackReason):
+            handleTranscribedText(
+                text,
+                transport: transport,
+                firstTokenMs: firstTokenMs,
+                roundtripMs: roundtripMs,
+                audioDuration: audioDuration,
+                totalStartTime: keyUpTime,
+                captureFinalizeMs: captureFinalizeMs,
+                fallbackReason: fallbackReason
+            )
+
+        case .failure(let error):
+            Logger.error("REST", "Transcription failed: \(error.localizedDescription)")
+            if config.soundFeedback { SoundManager.playErrorSound() }
+            DispatchQueue.main.async { [weak self] in
+                self?.hud?.showError(message: "Transcription Failed")
+            }
+            processingLock.lock()
+            isProcessing = false
+            processingLock.unlock()
+        }
+    }
+
+    /// Runs on sessionQueue (called only from settle). isProcessing is cleared here at the end,
+    /// which is now a sessionQueue-only write.
     private func handleTranscribedText(
         _ rawText: String,
         transport: String,
@@ -2691,6 +2902,7 @@ final class JustSpeakApp {
         roundtripMs: Double,
         audioDuration: Double,
         totalStartTime: CFAbsoluteTime,
+        captureFinalizeMs: Double,
         fallbackReason: String? = nil
     ) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2704,21 +2916,21 @@ final class JustSpeakApp {
             processingLock.unlock()
             return
         }
-        
+
         print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
         print("\(ANSI.bold)\(text)\(ANSI.reset)")
         print("\(ANSI.bold)\(ANSI.magenta)─────────────────────────────────────────────────────────────\(ANSI.reset)")
-        
+
         // Active Window Injection (Paste + Auto-restore original clipboard after 350ms)
         let (injected, injectMs) = TextInjector.inject(text: text, restorePreviousClipboard: config.restoreClipboard, completionSound: config.soundFeedback)
         let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartTime) * 1000.0
-        
+
         let injectStatus = injected ? "\(ANSI.green)Pasted via Cmd+V\(ANSI.reset)" : "\(ANSI.yellow)Copied to Clipboard\(ANSI.reset)"
-        
+
         DispatchQueue.main.async { [weak self] in
             self?.hud?.showSuccess(text: text)
         }
-        
+
         print("\n\(ANSI.bold)📊 Latency Diagnostic Breakdown:\(ANSI.reset)")
         print("  • Primary Route:       \(ANSI.cyan)\(transport)\(ANSI.reset)")
         if let reason = fallbackReason {
@@ -2729,13 +2941,14 @@ final class JustSpeakApp {
             print("  • Fallback Used:       \(ANSI.green)NO (Direct Live Stream Complete)\(ANSI.reset)")
         }
         print("  • Audio Duration:      \(String(format: "%.2f", audioDuration))s")
+        print("  • Capture Finalize:    \(String(format: "%.1f", captureFinalizeMs)) ms (post-roll + drain)")
         if firstTokenMs > 0 {
             print("  • First Token TTFT:    \(ANSI.bold)\(String(format: "%.1f", firstTokenMs)) ms\(ANSI.reset)")
         }
         print("  • API Roundtrip (RTT): \(ANSI.bold)\(String(format: "%.1f", roundtripMs)) ms\(ANSI.reset)")
         print("  • Injection Latency:   \(String(format: "%.1f", injectMs)) ms (\(injectStatus))")
         print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")
-        
+
         processingLock.lock()
         isProcessing = false
         processingLock.unlock()
@@ -2819,7 +3032,7 @@ struct Diagnostics {
             Thread.sleep(forTimeInterval: 1.0)
         }
         
-        let (pcmData, duration, chunks) = engine.stopRecording()
+        let (pcmData, duration, chunks, _) = engine.stopRecording()
         SoundManager.playCommitSound()
         engine.stopEngine()
         
