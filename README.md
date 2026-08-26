@@ -3,6 +3,9 @@
 > **Ultra-Low-Latency Push-to-Talk macOS Voice Dictation & Text Polishing Engine**  
 > *Native Swift • Apple CoreAudio Ring Buffer • Google Gemini Live WebSockets • Apple HIG Design*
 
+> [!NOTE]
+> **Built with Google / Gemini**: This project is built by a Googler as a technical demonstration and prototype showcasing ultra-low-latency bidirectional speech processing with Google's Gemini Live API. It is an independent open-source project and not an officially supported Google product.
+
 ---
 
 ## ⚡ Overview
@@ -303,6 +306,12 @@ If a fallback occurs (e.g. network timeout or socket disconnect), JustSpeak logs
 | `make setup` | Initialize local `.env` configuration from `.env.example` |
 | `make clean` | Clean temporary files and caches |
 | `make help` | Display all available Makefile targets |
+
+---
+
+## 🏛️ Disclaimer
+
+This is a personal open-source demonstration project developed by a Googler to showcase real-time voice dictation with Google Gemini Live WebSockets (`gemini-3.5-transcribe-live`). This repository is intended as an architectural reference and demo. It is not an officially supported Google product and is distributed "as is" without warranty.
 
 ---
 
