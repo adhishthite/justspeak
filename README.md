@@ -209,6 +209,16 @@ WebSockets
 CUSTOM_VOCABULARY="Adhish, Kunal, LangGraph, Vertex AI, Kubernetes, FastAPI"
 ```
 
+### Text Replacements
+
+Any vocabulary line or item containing `=>` is a deterministic **replacement rule** instead of a plain boost term:
+
+```text
+cooper netties => Kubernetes
+```
+
+`wrong` and `right` are trimmed independently; either side being empty drops the rule. These rules are enforced client-side, deterministically, right after transcription — unlike plain boost terms, which only bias what the recognizer *might* hear, a replacement rule guarantees the wrong form never reaches your document. The `right` side is also added to the boost vocabulary automatically (never the `wrong` form — that would just teach the recognizer to keep mishearing it the same way).
+
 ---
 
 ## 🌐 Multilingual & Bilingual Support

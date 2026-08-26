@@ -8,6 +8,11 @@
 #      cp vocabulary.example.txt vocabulary.txt
 #   2. Or set CUSTOM_VOCABULARY="word1, word2, word3" in your .env
 #   3. Or set CUSTOM_VOCABULARY_FILE="path/to/my_vocab.txt" in your .env
+#
+# A line containing "=>" is a deterministic replacement rule instead of a plain boost
+# term - the misheard form is rewritten to the right-hand side after transcription, and
+# the right-hand side is also added to the boost vocabulary:
+#   cooper netties => Kubernetes
 
 # Names & Proper Nouns
 Adhish

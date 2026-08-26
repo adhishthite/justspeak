@@ -90,6 +90,13 @@ struct Logger {
 
 // MARK: - Configuration Manager
 
+// A "wrong => right" vocabulary entry: enforced deterministically post-transcription
+// (see ReplacementEngine), with the right-hand side also fed into the boost vocabulary.
+struct ReplacementRule {
+    let wrong: String
+    let right: String
+}
+
 struct Config {
     var geminiApiKey: String = ""
     var geminiModel: String = "gemini-3.5-flash-lite"
@@ -100,6 +107,7 @@ struct Config {
     var languageCodes: [String] = ["en-IN", "mr-IN"]
     var customVocabulary: [String] = []
     var customVocabularyFile: String = ""
+    var replacementRules: [ReplacementRule] = []
     var hotkey: String = "right_option"
     var hotkeyMode: String = "push_to_talk" // "push_to_talk" or "toggle"
     var soundFeedback: Bool = true
@@ -157,7 +165,30 @@ struct Config {
         }
         return items
     }
-    
+
+    // Splits raw vocabulary items into plain boost terms and "wrong => right" replacement
+    // rules (first "=>" wins; either side empty after trim discards the item). Rules are
+    // deduped by lowercased "wrong", first occurrence wins - matching the boost-term dedupe.
+    static func splitVocabularyItems(_ items: [String]) -> (vocab: [String], rules: [ReplacementRule]) {
+        var vocab: [String] = []
+        var rules: [ReplacementRule] = []
+        var seenWrong = Set<String>()
+        for item in items {
+            guard let arrow = item.range(of: "=>") else {
+                vocab.append(item)
+                continue
+            }
+            let wrong = item[item.startIndex..<arrow.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            let right = item[arrow.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if wrong.isEmpty || right.isEmpty { continue }
+            let key = wrong.lowercased()
+            if seenWrong.contains(key) { continue }
+            seenWrong.insert(key)
+            rules.append(ReplacementRule(wrong: wrong, right: right))
+        }
+        return (vocab, rules)
+    }
+
     // Canonical BCP-47 casing: language lowercase, script Titlecase, region UPPERCASE
     // ("en-in" -> "en-IN", "pa-guru-in" -> "pa-Guru-IN"). The live-transcribe language table
     // uses region-qualified codes with this casing, so normalize instead of lowercasing away.
@@ -314,6 +345,13 @@ struct Config {
             }
         }
         
+        // Pull "wrong => right" replacement rules out of the raw items; the right-hand side
+        // still boosts recognition - never the wrong form, which would just teach the
+        // recognizer to keep mishearing it the same way.
+        let vocabSplit = splitVocabularyItems(combinedVocab)
+        config.replacementRules = vocabSplit.rules
+        combinedVocab = vocabSplit.vocab + vocabSplit.rules.map { $0.right }
+
         // Deduplicate while preserving order
         var seen = Set<String>()
         var deduped: [String] = []
@@ -535,6 +573,58 @@ struct TextInjector {
         
         let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
         return (eventSuccess, elapsed)
+    }
+}
+
+// MARK: - Replacement Engine (Deterministic Wrong→Right Enforcement)
+
+// Post-transcription enforcement layer: the model can be *biased* toward the right spelling
+// via boost vocabulary, but this layer *guarantees* it - longest-match-first, word-boundary,
+// case-preserving (ALL-CAPS / Title / lower propagation).
+enum ReplacementEngine {
+    static func apply(_ text: String, rules: [ReplacementRule]) -> String {
+        guard !rules.isEmpty else { return text }
+        var result = text
+        // Longest wrong-form first so "gemini api" wins over "gemini".
+        for rule in rules.sorted(by: { $0.wrong.count > $1.wrong.count }) {
+            guard !rule.wrong.isEmpty else { continue }
+            // Lookarounds instead of \b: word boundaries silently never match when the wrong
+            // form starts/ends with punctuation ("e.g.", "c++").
+            let pattern = "(?<![\\w])\(NSRegularExpression.escapedPattern(for: rule.wrong))(?![\\w])"
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            let ns = result as NSString
+            let matches = regex.matches(in: result, range: NSRange(location: 0, length: ns.length)).reversed()
+            let mutable = NSMutableString(string: result)
+            for match in matches {
+                let original = ns.substring(with: match.range)
+                let replacement = propagateCase(from: original, to: rule.right, wrong: rule.wrong)
+                mutable.replaceCharacters(in: match.range, with: replacement)
+            }
+            result = mutable as String
+        }
+        return result
+    }
+
+    // "KUBERNETES"->"GRPC" stays caps; "Kubernetes"->"GRPC" follows the rule's canonical
+    // casing unless the match was ALL-CAPS or the rule carries EXPLICIT casing. A rule is
+    // explicitly cased when its right side contains uppercase (gRPC, iPhone) - or when its
+    // WRONG side does ("NPM"->"npm" is a deliberate lowercase rule; ALL-CAPS propagation
+    // would silently undo it) - or when wrong/right are the same word modulo case.
+    static func propagateCase(from original: String, to replacement: String, wrong: String = "") -> String {
+        let hasExplicitCasing = replacement.dropFirst().contains(where: { $0.isUppercase })
+            || replacement.first?.isUppercase == true
+            || wrong.contains(where: { $0.isUppercase })
+            || (!wrong.isEmpty && wrong.lowercased() == replacement.lowercased())
+        if hasExplicitCasing {
+            return replacement // dictionary term carries its own casing (gRPC, iPhone)
+        }
+        if original == original.uppercased(), original.count > 1 {
+            return replacement.uppercased()
+        }
+        if original.first?.isUppercase == true {
+            return replacement.prefix(1).uppercased() + replacement.dropFirst()
+        }
+        return replacement
     }
 }
 
@@ -3659,8 +3749,8 @@ final class JustSpeakApp {
         inputTokens: Int? = nil,
         outputTokens: Int? = nil
     ) {
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
             Logger.warn("AI", "Received empty transcription from Gemini.")
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: "No speech detected")
@@ -3695,6 +3785,9 @@ final class JustSpeakApp {
             processingLock.unlock()
             return
         }
+
+        // Deterministic wrong->right enforcement (client-side guarantee on top of boost bias).
+        let text = ReplacementEngine.apply(trimmed, rules: config.replacementRules)
 
         print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
         print("\(ANSI.bold)\(text)\(ANSI.reset)")
@@ -3801,7 +3894,7 @@ final class JustSpeakApp {
         VAD Mode:          \(config.vadMode == "manual" ? "\(ANSI.green)Manual (push-to-talk defines speech bounds)\(ANSI.reset)" : config.vadMode == "tuned" ? "\(ANSI.yellow)Tuned Server VAD (\(config.vadSilenceMs)ms silence window)\(ANSI.reset)" : "\(ANSI.gray)Auto (stock server VAD)\(ANSI.reset)")
         Mic Idle Timeout:  \(config.micIdleTimeoutSec > 0 ? "\(ANSI.green)\(config.micIdleTimeoutSec)s (indicator turns off when idle)\(ANSI.reset)" : "\(ANSI.gray)Disabled (mic always on)\(ANSI.reset)")
         History DB:        \(config.historyEnabled ? "\(ANSI.green)\(history?.path ?? "Disabled")\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
-        Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")
+        Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")\(config.replacementRules.isEmpty ? "" : " \(ANSI.gray)(+ \(config.replacementRules.count) replacement rules)\(ANSI.reset)")
         Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
         Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
         """)
