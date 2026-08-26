@@ -32,7 +32,7 @@ Hold [⌥ Right] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemin
 - **Custom Vocabulary**: Domain terms, acronyms, team names, and tech stack jargon loaded from [`vocabulary.txt`](vocabulary.txt) or `.env`.
 - **Bilingual & Code-Switching Support**: Built-in support for English (`en`), Marathi (`mr`), Hindi (`hi`), and 70+ languages with automatic acoustic language detection.
 - **Zero Unsigned Binaries (gMac Enterprise Compliant)**: Pure Swift script executed directly through Apple's signed `/usr/bin/swift` interpreter with zero third-party binary dependencies.
-- **Resilient Fallback Routing**: Automatic, transparent failover to Gemini REST API (`gemini-3.5-flash-lite` / `gemini-3.5-transcribe`) on WebSocket disconnection or timeouts.
+- **Resilient Fallback Routing**: Automatic, transparent failover to Gemini REST API (`gemini-3.5-flash-lite` / `gemini-3.5-transcribe`) on WebSocket disconnection or timeouts. Because the fallback *prompts* a general-purpose model to transcribe rather than calling a dedicated transcription model, its results pass through a validation gate first — an LLM asked to transcribe audio can answer or chat about it instead, and a rejected result is discarded rather than pasted. Silent clips are peak-detected locally and never reach the API at all, empty transcripts on real audio get one re-send (model nondeterminism), and 429 responses honor the server's `retryDelay`/`Retry-After` hint for a single retry before failing.
 
 ---
 

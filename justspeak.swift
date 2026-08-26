@@ -1994,6 +1994,62 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     }
 }
 
+// MARK: - REST-Only Validation Gate (no reference transcript)
+
+/// Guards the REST fallback only: gemini-3.5-flash-lite is PROMPTED to transcribe audio, and
+/// its documented failure mode is answering (or chatting about) the audio instead of
+/// transcribing it. The WS route uses a dedicated transcription model and never sees this
+/// gate. Ported from Jot's ValidationGate, minus the checks that need a raw reference
+/// transcript to compare against (length-ratio, word-containment, trigram similarity) - the
+/// REST path has no second model call to validate against.
+enum RestValidationGate {
+    /// Strips model artifacts that are not failures: code fences, "Transcript:"/"CLEAN:"
+    /// labels, wrapping quotes.
+    static func clean(_ text: String) -> String {
+        var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("```") {
+            s = s.replacingOccurrences(of: "```[a-z]*\n?", with: "", options: .regularExpression)
+            s = s.replacingOccurrences(of: "```", with: "")
+            s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        for label in ["CLEAN:", "Clean:", "Transcript:", "TRANSCRIPT:", "Transcription:"] where s.hasPrefix(label) {
+            s = String(s.dropFirst(label.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if s.count > 1, s.hasPrefix("\""), s.hasSuffix("\"") {
+            s = String(s.dropFirst().dropLast())
+        }
+        return s
+    }
+
+    // Jot's broad opener check ("Sure," / "Okay," ...) only fires when the first word differs
+    // from a raw reference transcript - people legitimately DICTATE replies that open with
+    // those words, and the REST path has no reference to compare against. So this gate keeps
+    // only phrasings that are near-certainly the model's own voice: transcript framing
+    // ("Here's the transcription", "The audio says"), transcription refusals, and AI
+    // self-identification. Bare "language model" / "as an AI engineer" style dictations pass.
+    private static let answerPattern = try! NSRegularExpression(
+        pattern: #"^(here('s| is) (the |your )?(transcript|transcription)\b|the (audio|recording|speaker) (says|said|contains)\b|this (audio|recording) (contains|is)\b|i can('|no)t (transcribe|process) (this|the|that)\b|i('m| am) (sorry, but i can('|no)t|unable to) (transcribe|process)\b)"#,
+        options: [.caseInsensitive]
+    )
+    private static let selfReferencePattern = try! NSRegularExpression(
+        pattern: #"as an ai[,.]|as an ai (language model|assistant|model)\b|i('m| am) (just )?an ai[,.]|i('m| am) (just )?an ai (assistant|language model|model)\b"#,
+        options: [.caseInsensitive]
+    )
+
+    /// nil = pass. Checks ported from Jot that don't require a raw reference transcript:
+    /// AI self-reference and model-voice transcript framing.
+    static func rejectionReason(_ cleaned: String) -> String? {
+        let range = NSRange(cleaned.startIndex..., in: cleaned)
+        if selfReferencePattern.firstMatch(in: cleaned, range: range) != nil {
+            return "ai_selfreference"
+        }
+        if answerPattern.firstMatch(in: cleaned, range: range) != nil {
+            return "answer_pattern"
+        }
+        return nil
+    }
+}
+
 // MARK: - Gemini REST Fallback Client (Single-Turn Audio)
 
 struct GeminiRestClient {
@@ -2003,6 +2059,7 @@ struct GeminiRestClient {
         model: String,
         languageCodes: [String] = [],
         customVocabulary: [String] = [],
+        isRetry: Bool = false,
         completion: @escaping (Result<(text: String, latencyMs: Double, inputTokens: Int?, outputTokens: Int?), Error>) -> Void
     ) {
         let startTime = CFAbsoluteTimeGetCurrent()
@@ -2097,29 +2154,50 @@ struct GeminiRestClient {
         
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
             let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
-            
+
             if let error = error {
                 completion(.failure(error))
                 return
             }
-            
+
             guard let data = data else {
                 completion(.failure(NSError(domain: "JustSpeak", code: -4, userInfo: [NSLocalizedDescriptionKey: "No data received from Gemini REST API."])))
                 return
             }
-            
+
+            // 429: per-minute throttles carry a short retryDelay - honor it once. Only a real
+            // daily/hard quota (quotaId contains "PerDay") is terminal; anything else clears on
+            // its own and is worth one retry if the wait is short.
+            if (response as? HTTPURLResponse)?.statusCode == 429 {
+                let bodyStr = String(data: data, encoding: .utf8) ?? ""
+                if bodyStr.contains("PerDay") {
+                    completion(.failure(NSError(domain: "GeminiAPI", code: 429, userInfo: [NSLocalizedDescriptionKey: "Daily quota exhausted for \(model) - retry won't help until reset."])))
+                    return
+                }
+                let delay = Self.retryDelaySeconds(from: data, response: response as? HTTPURLResponse) ?? 2.0
+                if !isRetry, delay <= 8.0 {
+                    Logger.warn("REST", "429 rate limited on \(model) - retrying once after \(String(format: "%.1f", delay))s.")
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        Self.transcribe(pcmData: pcmData, apiKey: apiKey, model: model, languageCodes: languageCodes, customVocabulary: customVocabulary, isRetry: true, completion: completion)
+                    }
+                    return
+                }
+                completion(.failure(NSError(domain: "GeminiAPI", code: 429, userInfo: [NSLocalizedDescriptionKey: "Rate limited (429) on \(model); retry delay \(String(format: "%.1f", delay))s \(isRetry ? "after one retry" : "exceeds budget") - not retrying."])))
+                return
+            }
+
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 let rawStr = String(data: data, encoding: .utf8) ?? "Unknown"
                 completion(.failure(NSError(domain: "JustSpeak", code: -5, userInfo: [NSLocalizedDescriptionKey: "Invalid JSON response: \(rawStr)"])))
                 return
             }
-            
+
             if let errorObj = json["error"] as? [String: Any],
                let message = errorObj["message"] as? String {
                 completion(.failure(NSError(domain: "GeminiAPI", code: (errorObj["code"] as? Int) ?? -1, userInfo: [NSLocalizedDescriptionKey: message])))
                 return
             }
-            
+
             // API-metered usage rides on every generateContent response.
             var inputTokens: Int? = nil
             var outputTokens: Int? = nil
@@ -2134,7 +2212,17 @@ struct GeminiRestClient {
                    let parts = content["parts"] as? [[String: Any]],
                    let firstPart = parts.first,
                    let text = firstPart["text"] as? String {
-                    completion(.success((text: text, latencyMs: elapsedMs, inputTokens: inputTokens, outputTokens: outputTokens)))
+                    // The REST path prompts a general-purpose model to transcribe; its documented
+                    // failure mode is answering instead of transcribing. Gate before this text
+                    // ever reaches insertion (Feature: RestValidationGate).
+                    let cleanedText = RestValidationGate.clean(text)
+                    if let reason = RestValidationGate.rejectionReason(cleanedText) {
+                        let prefix = String(cleanedText.prefix(80))
+                        Logger.warn("GATE", "REST result rejected (\(reason)): \(prefix)")
+                        completion(.failure(NSError(domain: "JustSpeak", code: -7, userInfo: [NSLocalizedDescriptionKey: "REST result rejected by validation gate: \(reason)"])))
+                    } else {
+                        completion(.success((text: cleanedText, latencyMs: elapsedMs, inputTokens: inputTokens, outputTokens: outputTokens)))
+                    }
                 } else {
                     // Speech model returned empty transcription (e.g. silent or non-speech audio)
                     completion(.success((text: "", latencyMs: elapsedMs, inputTokens: inputTokens, outputTokens: outputTokens)))
@@ -2145,6 +2233,21 @@ struct GeminiRestClient {
         }
         
         task.resume()
+    }
+
+    /// Extracts a short retry hint from a 429: the `Retry-After` header (seconds), else the
+    /// google.rpc.RetryInfo "retryDelay": "2s" detail in the response body. nil if neither parses.
+    private static func retryDelaySeconds(from data: Data, response: HTTPURLResponse?) -> Double? {
+        if let header = response?.value(forHTTPHeaderField: "Retry-After"), let seconds = Double(header) {
+            return seconds
+        }
+        guard let body = String(data: data, encoding: .utf8) else { return nil }
+        if let range = body.range(of: #""retryDelay"\s*:\s*"([0-9.]+)s""#, options: .regularExpression) {
+            let match = String(body[range])
+            let digits = match.drop(while: { !$0.isNumber }).prefix(while: { $0.isNumber || $0 == "." })
+            return Double(digits)
+        }
+        return nil
     }
 }
 
@@ -3402,6 +3505,10 @@ final class JustSpeakApp {
     private var isProcessing: Bool = false
     private let processingLock = NSLock()
 
+    // Peak level, in dBFS, below which a captured clip is treated as room tone rather than
+    // speech - below this peak no speech exists in the clip, so don't bill an API call for it.
+    private let silentClipPeakDb: Double = -55.0
+
     // Frontmost app snapshotted at key-down (main thread); compared again right before paste
     // so a focus change mid-turn downgrades to clipboard-only instead of pasting into the wrong app.
     private var turnFrontmostPID: pid_t?
@@ -3650,6 +3757,29 @@ final class JustSpeakApp {
         }
     }
 
+    /// Peak amplitude of the captured clip, in dBFS, for the silent-clip gate. Scans everything
+    /// in pcmData except the trailing 22,400-byte silence flush stopRecording always appends (a
+    /// fixed guard, not real audio, that would otherwise mask genuine silence). Samples are
+    /// assembled from raw byte pairs rather than a bound-memory reinterpret so this never relies
+    /// on Data's underlying storage being 2-byte aligned. Returns nil when the clip is too short
+    /// to have anything past the guard - callers should treat that as "not silent".
+    private static func peakDbFS(of pcmData: Data, guardBytes: Int = 22400) -> Double? {
+        guard pcmData.count > guardBytes else { return nil }
+        let scanCount = pcmData.count - guardBytes
+        let base = pcmData.startIndex
+        var maxAbs: Int16 = 0
+        var offset = 0
+        while offset + 1 < scanCount {
+            let lo = pcmData[base + offset]
+            let hi = pcmData[base + offset + 1]
+            let sample = Int16(bitPattern: UInt16(lo) | (UInt16(hi) << 8))
+            let absSample = sample == Int16.min ? Int16.max : abs(sample)
+            if absSample > maxAbs { maxAbs = absSample }
+            offset += 2
+        }
+        return 20 * log10(max(Double(maxAbs), 1.0) / 32768.0)
+    }
+
     /// Runs entirely on sessionQueue: finalizes the capture, arbitrates the WS-vs-REST turn
     /// lifecycle, and is the only place that mutates currentTurnId / turnSettled / pendingFallbackTimer.
     private func runTurnPipeline(keyUpTime: CFAbsoluteTime) {
@@ -3664,6 +3794,44 @@ final class JustSpeakApp {
                 self?.hud?.hide()
                 self?.scheduleMicIdleRelease()
             }
+            return
+        }
+
+        // Silent-clip gate: peak-scan the captured audio before spending an API call on it. Runs
+        // on sessionQueue, ahead of both the WS and REST routes, so room tone never leaves the
+        // machine. Abandons the turn the same way the micro-click guard above does (isProcessing
+        // is never set, the WS turn is never committed).
+        if let peakDb = Self.peakDbFS(of: pcmData), peakDb < silentClipPeakDb {
+            Logger.warn("INPUT", "No speech detected in clip (peak \(String(format: "%.1f", peakDb)) dBFS) - skipping API call.")
+            DispatchQueue.main.async { [weak self] in
+                self?.hud?.showError(message: "No speech detected")
+                self?.scheduleMicIdleRelease()
+            }
+            history?.record(TranscriptionHistoryStore.TurnRecord(
+                outcome: "empty",
+                text: nil,
+                charCount: 0,
+                wordCount: 0,
+                transport: nil,
+                model: nil,
+                isLiveRoute: nil,
+                fallbackReason: nil,
+                audioSeconds: duration,
+                firstTokenMs: nil,
+                roundtripMs: nil,
+                captureFinalizeMs: nil,
+                injectMs: nil,
+                totalMs: nil,
+                injected: nil,
+                inputTokens: nil,
+                outputTokens: nil,
+                tokensMetered: nil,
+                costUSD: nil,
+                languageCodes: config.languageCodes.joined(separator: ","),
+                smartMode: config.smartTranscription,
+                vadMode: config.vadMode,
+                error: nil
+            ))
             return
         }
 
@@ -3774,7 +3942,10 @@ final class JustSpeakApp {
 
     /// Launches the REST fallback for turnId. Does NOT settle the turn by itself - WS and REST
     /// race, and whichever result reaches settle() first for a still-live turnId wins.
-    private func executeRestFallback(turnId: UInt64, pcmData: Data, duration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, reason: String) {
+    ///
+    /// isRetry marks the one allowed re-send after an empty transcript (model nondeterminism,
+    /// not silence - the silent-clip gate already filtered room tone before any call was made).
+    private func executeRestFallback(turnId: UInt64, pcmData: Data, duration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, reason: String, isRetry: Bool = false) {
         let restStartTime = CFAbsoluteTimeGetCurrent()
         GeminiRestClient.transcribe(
             pcmData: pcmData,
@@ -3787,6 +3958,15 @@ final class JustSpeakApp {
             self.sessionQueue.async {
                 switch result {
                 case .success(let payload):
+                    let trimmedText = payload.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmedText.isEmpty, duration >= 0.6, !isRetry {
+                        // Re-check turn liveness before spending a second call - a turn that
+                        // already settled (or was superseded) must not fire a redundant re-send.
+                        guard self.currentTurnId == turnId, !self.turnSettled else { return }
+                        Logger.warn("REST", "Empty transcript for \(String(format: "%.1f", duration))s of audio - re-sending once (model nondeterminism).")
+                        self.executeRestFallback(turnId: turnId, pcmData: pcmData, duration: duration, keyUpTime: keyUpTime, captureFinalizeMs: captureFinalizeMs, reason: reason, isRetry: true)
+                        return
+                    }
                     let roundtripMs = (CFAbsoluteTimeGetCurrent() - restStartTime) * 1000.0
                     self.settle(turnId: turnId, route: "REST", outcome: .success(
                         text: payload.text,
