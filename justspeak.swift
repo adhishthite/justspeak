@@ -762,7 +762,19 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private let languageCodes: [String]
     private let customVocabulary: [String]
     
-    private var settleWorkItem: DispatchWorkItem?
+    // Event-driven settlement timers for transcribe-model turn completion (see commitTurn/attemptSettle).
+    private static let settleMinPostCommitWait: Double = 0.35
+    private static let settleQuietWindow: Double = 0.25
+    private static let settleInitialWaitWithoutTokens: Double = 0.90
+    private static let settleMaxWait: Double = 2.20
+    // Timers are scheduled on DispatchTime but attemptSettle re-validates the rules against
+    // CFAbsoluteTime - two different clocks. A firing that lands marginally early by the
+    // CFAbsoluteTime measurement would return without settling and (being one-shot) leave no
+    // retry, so every deadline gets a small cushion to guarantee the rule holds at fire time.
+    private static let settleTimerCushion: Double = 0.01
+    private let settleQueue = DispatchQueue(label: "com.justspeak.settle")
+    private var settleWorkItem: DispatchWorkItem?       // reschedulable: initial-wait-without-tokens, then quiet-window checks
+    private var settleMaxWorkItem: DispatchWorkItem?    // fixed hard ceiling check
     private var reconnectWorkItem: DispatchWorkItem?
     private var reconnectAttempts: Int = 0
     
@@ -946,6 +958,9 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         var shouldScheduleReconnect = false
         var liveTextUpdate: (label: String, elapsedMs: Double, fullText: String, textCopy: String)? = nil
         var turnCompletionFire: (completion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?, text: String, firstTokenMs: Double, totalMs: Double)? = nil
+        // Set when a post-commit token arrives while committing: elapsed time since turnCommitTime,
+        // used after unlock to (re)schedule the quiet-window settle check.
+        var quietRescheduleElapsedSinceCommit: Double? = nil
 
         lock.lock()
 
@@ -1010,6 +1025,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 self.lastTokenReceivedTime = now
                 if self.isCommitting {
                     self.lastPostCommitTokenTime = now
+                    quietRescheduleElapsedSinceCommit = now - self.turnCommitTime
                 }
                 if currentTurnText.isEmpty && firstTokenLatencyMs == 0 && turnCommitTime > 0 {
                     firstTokenLatencyMs = (now - turnCommitTime) * 1000.0
@@ -1030,6 +1046,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 isCommitting = false
                 settleWorkItem?.cancel()
                 settleWorkItem = nil
+                settleMaxWorkItem?.cancel()
+                settleMaxWorkItem = nil
 
                 let totalLatencyMs = (CFAbsoluteTimeGetCurrent() - turnCommitTime) * 1000.0
                 let text = currentTurnText
@@ -1067,12 +1085,81 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 fire.completion?(.success((text: fire.text, firstTokenMs: fire.firstTokenMs, totalMs: fire.totalMs)))
             }
         }
+        // A post-commit token arrived: (re)schedule the quiet-window settle check, never
+        // earlier than minPostCommitWait after commit. Scheduling happens off-lock; the
+        // pointer swap that replaces the previous pending item is its own short lock scope.
+        if let elapsedSinceCommit = quietRescheduleElapsedSinceCommit {
+            let delay = max(Self.settleQuietWindow, Self.settleMinPostCommitWait - elapsedSinceCommit) + Self.settleTimerCushion
+            let item = DispatchWorkItem { [weak self] in self?.attemptSettle() }
+            lock.lock()
+            settleWorkItem?.cancel()
+            settleWorkItem = item
+            lock.unlock()
+            settleQueue.asyncAfter(deadline: .now() + delay, execute: item)
+        }
+    }
+
+    // Re-validates the settle rules against current authoritative state and, if any rule
+    // holds, performs the once-only settle sequence. Safe to call redundantly from a stale
+    // or overlapping timer: state (isCommitting/hasFiredTurnCompletion) is the source of
+    // truth, not which timer fired.
+    private func attemptSettle() {
+        lock.lock()
+        guard isCommitting, !hasFiredTurnCompletion else {
+            lock.unlock()
+            return
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let elapsedCommit = now - turnCommitTime
+        let text = currentTurnText
+        let postCommitTokenTime = lastPostCommitTokenTime
+
+        var settleWithText = false
+        if let postTime = postCommitTokenTime {
+            let quietSincePostToken = now - postTime
+            settleWithText = elapsedCommit >= Self.settleMinPostCommitWait && !text.isEmpty && quietSincePostToken >= Self.settleQuietWindow
+        } else if !text.isEmpty && elapsedCommit >= Self.settleInitialWaitWithoutTokens {
+            settleWithText = true
+        }
+
+        let timedOut = !settleWithText && elapsedCommit >= Self.settleMaxWait
+        guard settleWithText || timedOut else {
+            lock.unlock()
+            return
+        }
+
+        hasFiredTurnCompletion = true
+        isCommitting = false
+        settleWorkItem?.cancel()
+        settleWorkItem = nil
+        settleMaxWorkItem?.cancel()
+        settleMaxWorkItem = nil
+
+        let totalLatencyMs = elapsedCommit * 1000.0
+        currentTurnText = ""
+        let firstToken = firstTokenLatencyMs
+        firstTokenLatencyMs = 0
+        let cb = turnCompletion
+        turnCompletion = nil
+        lock.unlock()
+
+        Logger.endMeter()
+        DispatchQueue.global().async {
+            if !text.isEmpty {
+                cb?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
+            } else {
+                cb?(.failure(NSError(domain: "JustSpeak", code: -2, userInfo: [NSLocalizedDescriptionKey: "No speech recognized before timeout."])))
+            }
+        }
     }
     
     func startNewTurn() {
         lock.lock()
         self.settleWorkItem?.cancel()
         self.settleWorkItem = nil
+        self.settleMaxWorkItem?.cancel()
+        self.settleMaxWorkItem = nil
         self.isCommitting = false
         self.currentTurnText = ""
         self.firstTokenLatencyMs = 0
@@ -1097,24 +1184,18 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         }
     }
     
+    // Base64's alphabet (A-Za-z0-9+/=) needs no JSON escaping, so the fixed-shape
+    // envelope is built once and the payload is spliced in directly, skipping
+    // JSONSerialization on the hot per-chunk (~150ms) path.
+    private static let audioChunkJSONPrefix = "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\""
+    private static let audioChunkJSONSuffix = "\"}}}"
+
     func sendAudioChunk(_ pcmChunk: Data) {
         guard isReady else { return }
-        
+
         let base64Audio = pcmChunk.base64EncodedString()
-        let payload: [String: Any] = [
-            "realtimeInput": [
-                "audio": [
-                    "mimeType": "audio/pcm;rate=16000",
-                    "data": base64Audio
-                ]
-            ]
-        ]
-        
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: payload),
-              let jsonString = String(data: jsonData, encoding: .utf8) else {
-            return
-        }
-        
+        let jsonString = Self.audioChunkJSONPrefix + base64Audio + Self.audioChunkJSONSuffix
+
         webSocketTask?.send(.string(jsonString)) { error in
             if let error = error {
                 Logger.debug("WS", "Chunk send error: \(error.localizedDescription)")
@@ -1174,96 +1255,28 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
         }
         
-        // 4. For dedicated STT Transcribe models: Launch active token settlement monitor
+        // 4. For dedicated STT Transcribe models: schedule event-driven settlement checks
+        // instead of polling. Two one-shot items cover the four settle rules:
+        //   - settleWorkItem: fires at initialWaitWithoutTokens (rule: pre-commit text, no
+        //     post-commit tokens); handleIncomingMessage reschedules this same slot to the
+        //     quiet-window deadline each time a post-commit token arrives (rule: quiet window
+        //     after post-commit tokens).
+        //   - settleMaxWorkItem: fixed hard ceiling at maxWait, never rescheduled.
+        // Both call attemptSettle(), which re-validates against authoritative locked state
+        // rather than trusting which timer fired.
         if model.contains("transcribe") {
+            let initialItem = DispatchWorkItem { [weak self] in self?.attemptSettle() }
+            let maxItem = DispatchWorkItem { [weak self] in self?.attemptSettle() }
+
+            lock.lock()
             settleWorkItem?.cancel()
-            let settleItem = DispatchWorkItem { [weak self] in
-                guard let self = self else { return }
-                let minPostCommitWait: Double = 0.35
-                let quietWindow: Double = 0.25
-                let initialWaitWithoutTokens: Double = 0.90
-                let maxWait: Double = 2.20
-                
-                while true {
-                    Thread.sleep(forTimeInterval: 0.02)
-                    self.lock.lock()
-                    guard self.isCommitting, !self.hasFiredTurnCompletion else {
-                        self.lock.unlock()
-                        return
-                    }
-                    
-                    let now = CFAbsoluteTimeGetCurrent()
-                    let elapsedCommit = now - self.turnCommitTime
-                    let text = self.currentTurnText
-                    let postCommitTokenTime = self.lastPostCommitTokenTime
-                    
-                    // Settle check 1: If post-commit tokens arrived, settle once quiet window passes
-                    if let postTime = postCommitTokenTime {
-                        let quietSincePostToken = now - postTime
-                        if elapsedCommit >= minPostCommitWait && !text.isEmpty && quietSincePostToken >= quietWindow {
-                            self.hasFiredTurnCompletion = true
-                            self.isCommitting = false
-                            let totalLatencyMs = elapsedCommit * 1000.0
-                            self.currentTurnText = ""
-                            let firstToken = self.firstTokenLatencyMs
-                            self.firstTokenLatencyMs = 0
-                            let cb = self.turnCompletion
-                            self.turnCompletion = nil
-                            self.lock.unlock()
-                            
-                            Logger.endMeter()
-                            DispatchQueue.global().async {
-                                cb?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
-                            }
-                            return
-                        }
-                    } else if !text.isEmpty && elapsedCommit >= initialWaitWithoutTokens {
-                        // Settle check 2: We have pre-commit text, but no new tokens arrived
-                        self.hasFiredTurnCompletion = true
-                        self.isCommitting = false
-                        let totalLatencyMs = elapsedCommit * 1000.0
-                        self.currentTurnText = ""
-                        let firstToken = self.firstTokenLatencyMs
-                        self.firstTokenLatencyMs = 0
-                        let cb = self.turnCompletion
-                        self.turnCompletion = nil
-                        self.lock.unlock()
-                        
-                        Logger.endMeter()
-                        DispatchQueue.global().async {
-                            cb?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
-                        }
-                        return
-                    }
-                    
-                    // Max timeout ceiling
-                    if elapsedCommit >= maxWait {
-                        self.hasFiredTurnCompletion = true
-                        self.isCommitting = false
-                        let totalLatencyMs = elapsedCommit * 1000.0
-                        let capturedText = self.currentTurnText
-                        self.currentTurnText = ""
-                        let firstToken = self.firstTokenLatencyMs
-                        self.firstTokenLatencyMs = 0
-                        let cb = self.turnCompletion
-                        self.turnCompletion = nil
-                        self.lock.unlock()
-                        
-                        Logger.endMeter()
-                        DispatchQueue.global().async {
-                            if !capturedText.isEmpty {
-                                cb?(.success((text: capturedText, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
-                            } else {
-                                cb?(.failure(NSError(domain: "JustSpeak", code: -2, userInfo: [NSLocalizedDescriptionKey: "No speech recognized before timeout."])))
-                            }
-                        }
-                        return
-                    }
-                    self.lock.unlock()
-                }
-            }
-            self.settleWorkItem = settleItem
-            DispatchQueue.global().async(execute: settleItem)
+            settleMaxWorkItem?.cancel()
+            settleWorkItem = initialItem
+            settleMaxWorkItem = maxItem
+            lock.unlock()
+
+            settleQueue.asyncAfter(deadline: .now() + Self.settleInitialWaitWithoutTokens + Self.settleTimerCushion, execute: initialItem)
+            settleQueue.asyncAfter(deadline: .now() + Self.settleMaxWait + Self.settleTimerCushion, execute: maxItem)
         }
     }
     
@@ -1296,6 +1309,13 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     }
     
     func disconnect() {
+        lock.lock()
+        settleWorkItem?.cancel()
+        settleWorkItem = nil
+        settleMaxWorkItem?.cancel()
+        settleMaxWorkItem = nil
+        lock.unlock()
+
         reconnectWorkItem?.cancel()
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         isConnected = false
