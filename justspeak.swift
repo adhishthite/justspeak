@@ -112,6 +112,12 @@ struct Config {
     // Release the mic (status-bar indicator off) after this many seconds without a dictation;
     // the next key-down re-arms it. 0 = keep the mic always on (lowest latency, indicator lit).
     var micIdleTimeoutSec: Int = 300
+    // Token pricing (USD per 1M tokens), used only for the per-dictation cost line in the
+    // diagnostics. Defaults match Aug 2026 public-preview pricing for the two default models.
+    var liveInputPricePer1M: Double = 3.50   // gemini-3.5-transcribe-live audio input
+    var liveOutputPricePer1M: Double = 21.00 // gemini-3.5-transcribe-live text output
+    var restInputPricePer1M: Double = 0.30   // gemini-3.5-flash-lite input
+    var restOutputPricePer1M: Double = 2.50  // gemini-3.5-flash-lite output
     var restoreClipboard: Bool = true
     var logLevel: String = "verbose"
     
@@ -201,6 +207,10 @@ struct Config {
                         case "VAD_MODE": if ["manual", "tuned", "auto"].contains(value.lowercased()) { config.vadMode = value.lowercased() }
                         case "VAD_SILENCE_MS": if let ms = Int(value) { config.vadSilenceMs = min(5000, max(200, ms)) }
                         case "MIC_IDLE_TIMEOUT": if let sec = Int(value) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
+                        case "LIVE_INPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.liveInputPricePer1M = p }
+                        case "LIVE_OUTPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.liveOutputPricePer1M = p }
+                        case "REST_INPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.restInputPricePer1M = p }
+                        case "REST_OUTPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.restOutputPricePer1M = p }
                         case "LOG_LEVEL": config.logLevel = value.lowercased()
                         default: break
                         }
@@ -230,6 +240,10 @@ struct Config {
         if let vad = env["VAD_MODE"], ["manual", "tuned", "auto"].contains(vad.lowercased()) { config.vadMode = vad.lowercased() }
         if let vadSilence = env["VAD_SILENCE_MS"], let ms = Int(vadSilence) { config.vadSilenceMs = min(5000, max(200, ms)) }
         if let micIdle = env["MIC_IDLE_TIMEOUT"], let sec = Int(micIdle) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
+        if let p = env["LIVE_INPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.liveInputPricePer1M = v }
+        if let p = env["LIVE_OUTPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.liveOutputPricePer1M = v }
+        if let p = env["REST_INPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.restInputPricePer1M = v }
+        if let p = env["REST_OUTPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.restOutputPricePer1M = v }
         if let log = env["LOG_LEVEL"] { config.logLevel = log.lowercased() }
         
         if let raw = rawLanguages {
@@ -824,6 +838,24 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     // Set when a FINAL transcription arrives post-commit; cleared if a later interim shows
     // more content is still streaming in.
     private var lastPostCommitFinalTime: CFAbsoluteTime? = nil
+
+    // API-metered token usage. Server messages carry cumulative usageMetadata for the session,
+    // so per-turn usage is the delta from the counts snapshotted at startNewTurn. All under `lock`.
+    private var lastSeenPromptTokens: Int = 0
+    private var lastSeenResponseTokens: Int = 0
+    private var turnBaselinePromptTokens: Int = 0
+    private var turnBaselineResponseTokens: Int = 0
+
+    /// API-reported usage for the current/most recent turn, or nil if the server reported
+    /// nothing new this turn (caller falls back to a duration-based estimate).
+    var lastTurnUsage: (inputTokens: Int, outputTokens: Int)? {
+        lock.lock()
+        defer { lock.unlock() }
+        let dp = lastSeenPromptTokens - turnBaselinePromptTokens
+        let dr = lastSeenResponseTokens - turnBaselineResponseTokens
+        guard dp > 0 || dr > 0 else { return nil }
+        return (max(0, dp), max(0, dr))
+    }
     private var isCommitting: Bool = false
     private var hasFiredTurnCompletion: Bool = false
     private var turnCompletion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?
@@ -1084,12 +1116,23 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             serverErrorMessage = (errorObj["message"] as? String) ?? "Unknown server error"
         }
 
+        // 0b. Usage metadata can accompany any server message; keep the latest cumulative counts.
+        if let usage = json["usageMetadata"] as? [String: Any] {
+            if let p = usage["promptTokenCount"] as? Int { lastSeenPromptTokens = p }
+            if let r = usage["responseTokenCount"] as? Int { lastSeenResponseTokens = r }
+        }
+
         // 1. Handshake confirmation
         if json["setupComplete"] != nil {
             self.isConnected = true
             self.isReady = true
             self.reconnectAttempts = 0
             didCompleteSetup = true
+            // Fresh session: server-side cumulative token counters restart from zero.
+            self.lastSeenPromptTokens = 0
+            self.lastSeenResponseTokens = 0
+            self.turnBaselinePromptTokens = 0
+            self.turnBaselineResponseTokens = 0
         }
         // 2. Server goAway notification (Server scheduled disconnect)
         else if json["goAway"] != nil {
@@ -1357,6 +1400,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.lastPostCommitTokenTime = nil
         self.lastPostCommitFinalTime = nil
         self.turnCompletion = nil
+        self.turnBaselinePromptTokens = self.lastSeenPromptTokens
+        self.turnBaselineResponseTokens = self.lastSeenResponseTokens
         lock.unlock()
         
         // Dispatch manual activityStart: the key press IS the start of speech whenever
@@ -1525,7 +1570,7 @@ struct GeminiRestClient {
         model: String,
         languageCodes: [String] = [],
         customVocabulary: [String] = [],
-        completion: @escaping (Result<(text: String, latencyMs: Double), Error>) -> Void
+        completion: @escaping (Result<(text: String, latencyMs: Double, inputTokens: Int?, outputTokens: Int?), Error>) -> Void
     ) {
         let startTime = CFAbsoluteTimeGetCurrent()
         guard !apiKey.isEmpty else {
@@ -1642,16 +1687,24 @@ struct GeminiRestClient {
                 return
             }
             
+            // API-metered usage rides on every generateContent response.
+            var inputTokens: Int? = nil
+            var outputTokens: Int? = nil
+            if let usage = json["usageMetadata"] as? [String: Any] {
+                inputTokens = usage["promptTokenCount"] as? Int
+                outputTokens = usage["candidatesTokenCount"] as? Int
+            }
+
             if let candidates = json["candidates"] as? [[String: Any]],
                let firstCandidate = candidates.first {
                 if let content = firstCandidate["content"] as? [String: Any],
                    let parts = content["parts"] as? [[String: Any]],
                    let firstPart = parts.first,
                    let text = firstPart["text"] as? String {
-                    completion(.success((text: text, latencyMs: elapsedMs)))
+                    completion(.success((text: text, latencyMs: elapsedMs, inputTokens: inputTokens, outputTokens: outputTokens)))
                 } else {
                     // Speech model returned empty transcription (e.g. silent or non-speech audio)
-                    completion(.success((text: "", latencyMs: elapsedMs)))
+                    completion(.success((text: "", latencyMs: elapsedMs, inputTokens: inputTokens, outputTokens: outputTokens)))
                 }
             } else {
                 completion(.failure(NSError(domain: "JustSpeak", code: -6, userInfo: [NSLocalizedDescriptionKey: "Could not extract candidate text from response."])))
@@ -2951,7 +3004,8 @@ final class JustSpeakApp {
         signal(SIGTERM, SIG_IGN)
 
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        sigint.setEventHandler {
+        sigint.setEventHandler { [weak self] in
+            self?.printSessionUsageSummary()
             print("\n\(ANSI.bold)Exiting JustSpeak. Goodbye!\(ANSI.reset)")
             exit(0)
         }
@@ -3164,6 +3218,7 @@ final class JustSpeakApp {
                     switch result {
                     case .success(let payload):
                         let roundtripMs = (CFAbsoluteTimeGetCurrent() - commitStartTime) * 1000.0
+                        let usage = self.liveClient?.lastTurnUsage
                         self.settle(turnId: turnId, route: "WS", outcome: .success(
                             text: payload.text,
                             transport: "Live WebSocket (\(self.config.geminiLiveModel))",
@@ -3172,7 +3227,10 @@ final class JustSpeakApp {
                             audioDuration: duration,
                             keyUpTime: keyUpTime,
                             captureFinalizeMs: captureFinalizeMs,
-                            fallbackReason: nil
+                            fallbackReason: nil,
+                            isLiveRoute: true,
+                            inputTokens: usage?.inputTokens,
+                            outputTokens: usage?.outputTokens
                         ))
 
                     case .failure(let error):
@@ -3203,8 +3261,27 @@ final class JustSpeakApp {
     /// Result of a settled turn, handed to settle(). Success carries every field the latency
     /// diagnostic printout needs; failure is the REST-fallback-failed error path.
     private enum TurnOutcome {
-        case success(text: String, transport: String, firstTokenMs: Double, roundtripMs: Double, audioDuration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, fallbackReason: String?)
+        case success(text: String, transport: String, firstTokenMs: Double, roundtripMs: Double, audioDuration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, fallbackReason: String?, isLiveRoute: Bool, inputTokens: Int?, outputTokens: Int?)
         case failure(Error)
+    }
+
+    // Session-wide usage accumulators, printed on Ctrl+C exit. Guarded by statsLock: written
+    // on sessionQueue per turn, read from the main-queue signal handler.
+    private let statsLock = NSLock()
+    private var sessionTurns = 0
+    private var sessionInputTokens = 0
+    private var sessionOutputTokens = 0
+    private var sessionCostUSD = 0.0
+
+    func printSessionUsageSummary() {
+        statsLock.lock()
+        let turns = sessionTurns
+        let inTok = sessionInputTokens
+        let outTok = sessionOutputTokens
+        let cost = sessionCostUSD
+        statsLock.unlock()
+        guard turns > 0 else { return }
+        print("\n\(ANSI.bold)📈 Session Usage:\(ANSI.reset) \(turns) dictation\(turns == 1 ? "" : "s") | \(inTok) in / \(outTok) out tokens | ≈ $\(String(format: "%.4f", cost))")
     }
 
     /// Launches the REST fallback for turnId. Does NOT settle the turn by itself - WS and REST
@@ -3231,7 +3308,10 @@ final class JustSpeakApp {
                         audioDuration: duration,
                         keyUpTime: keyUpTime,
                         captureFinalizeMs: captureFinalizeMs,
-                        fallbackReason: reason
+                        fallbackReason: reason,
+                        isLiveRoute: false,
+                        inputTokens: payload.inputTokens,
+                        outputTokens: payload.outputTokens
                     ))
 
                 case .failure(let error):
@@ -3254,7 +3334,7 @@ final class JustSpeakApp {
         pendingFallbackTimer = nil
 
         switch outcome {
-        case .success(let text, let transport, let firstTokenMs, let roundtripMs, let audioDuration, let keyUpTime, let captureFinalizeMs, let fallbackReason):
+        case .success(let text, let transport, let firstTokenMs, let roundtripMs, let audioDuration, let keyUpTime, let captureFinalizeMs, let fallbackReason, let isLiveRoute, let inputTokens, let outputTokens):
             handleTranscribedText(
                 text,
                 transport: transport,
@@ -3263,7 +3343,10 @@ final class JustSpeakApp {
                 audioDuration: audioDuration,
                 totalStartTime: keyUpTime,
                 captureFinalizeMs: captureFinalizeMs,
-                fallbackReason: fallbackReason
+                fallbackReason: fallbackReason,
+                isLiveRoute: isLiveRoute,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens
             )
 
         case .failure(let error):
@@ -3293,7 +3376,10 @@ final class JustSpeakApp {
         audioDuration: Double,
         totalStartTime: CFAbsoluteTime,
         captureFinalizeMs: Double,
-        fallbackReason: String? = nil
+        fallbackReason: String? = nil,
+        isLiveRoute: Bool = true,
+        inputTokens: Int? = nil,
+        outputTokens: Int? = nil
     ) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
@@ -3337,6 +3423,26 @@ final class JustSpeakApp {
         }
         print("  • API Roundtrip (RTT): \(ANSI.bold)\(String(format: "%.1f", roundtripMs)) ms\(ANSI.reset)")
         print("  • Injection Latency:   \(String(format: "%.1f", injectMs)) ms (\(injectStatus))")
+
+        // Token usage & cost. API-metered when the server reported usageMetadata; otherwise a
+        // deterministic estimate from the documented rates (25 audio tokens/sec + ~1s of
+        // pre/post-roll & silence padding also billed; output ~4 chars/token).
+        let usageMetered = (inputTokens != nil || outputTokens != nil)
+        let effectiveInputTokens = inputTokens ?? Int((audioDuration + 1.0) * 25.0)
+        let effectiveOutputTokens = outputTokens ?? max(1, text.count / 4)
+        let inputPrice = isLiveRoute ? config.liveInputPricePer1M : config.restInputPricePer1M
+        let outputPrice = isLiveRoute ? config.liveOutputPricePer1M : config.restOutputPricePer1M
+        let turnCostUSD = Double(effectiveInputTokens) / 1_000_000.0 * inputPrice
+                        + Double(effectiveOutputTokens) / 1_000_000.0 * outputPrice
+        print("  • Tokens & Cost:       \(effectiveInputTokens) in / \(effectiveOutputTokens) out ≈ \(ANSI.bold)$\(String(format: "%.5f", turnCostUSD))\(ANSI.reset) \(ANSI.gray)(\(usageMetered ? "API metered" : "estimated"))\(ANSI.reset)")
+
+        statsLock.lock()
+        sessionTurns += 1
+        sessionInputTokens += effectiveInputTokens
+        sessionOutputTokens += effectiveOutputTokens
+        sessionCostUSD += turnCostUSD
+        statsLock.unlock()
+
         print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")
 
         processingLock.lock()
