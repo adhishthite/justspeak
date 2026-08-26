@@ -142,7 +142,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `GEMINI_LIVE_MODEL` | `gemini-3.5-transcribe-live` | Real-time WebSocket streaming model |
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | REST fallback STT model |
 | `SMART_TRANSCRIPTION` | `true` | Real-time Inverse Text Normalization ($26M, dates, formatting) and disfluency removal |
-| `LANGUAGE_CODES` | `en,mr` | Target / prioritized languages (e.g. `en,mr`, `en,hi`, or `auto` for unrestricted) |
+| `LANGUAGE_CODES` | `en-IN,mr-IN` | Region-qualified BCP-47 codes from the live-transcribe language table (e.g. `en-IN,mr-IN`, `en-US`, or `auto` for unrestricted) |
 | `CUSTOM_VOCABULARY` | *(empty)* | Comma-separated list of words/phrases to boost |
 | `CUSTOM_VOCABULARY_FILE` | `vocabulary.txt` | File containing one word/phrase per line (`#` comments allowed) |
 | `HOTKEY` | `right_option` | Trigger key (`right_option`, `left_option`, `right_control`, `left_control`, `right_cmd`, `left_cmd`, `fn`, `f18`, `f19`, `f13`) |
@@ -216,10 +216,10 @@ JustSpeak supports over 70 languages with native code-switching support:
 - **Configured Languages**: Priority language codes can be set in `.env`:
   ```ini
   # English and Marathi
-  LANGUAGE_CODES=en,mr
+  LANGUAGE_CODES=en-IN,mr-IN
   
   # English, Hindi, and Marathi
-  LANGUAGE_CODES=en,hi,mr
+  LANGUAGE_CODES=en-IN,hi-IN,mr-IN
   
   # Unrestricted Automatic Language Detection (All 70+ languages)
   LANGUAGE_CODES=auto

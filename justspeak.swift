@@ -94,7 +94,9 @@ struct Config {
     var geminiModel: String = "gemini-3.5-flash-lite"
     var geminiLiveModel: String = "gemini-3.5-transcribe-live"
     var smartTranscription: Bool = true
-    var languageCodes: [String] = ["en", "mr"]
+    // Region-qualified BCP-47 codes, matching the live-transcribe language table (en-IN, mr-IN,
+    // hi-IN, ...). Bare "en"/"mr" is not what the documented table lists.
+    var languageCodes: [String] = ["en-IN", "mr-IN"]
     var customVocabulary: [String] = []
     var customVocabularyFile: String = ""
     var hotkey: String = "right_option"
@@ -151,6 +153,19 @@ struct Config {
         return items
     }
     
+    // Canonical BCP-47 casing: language lowercase, script Titlecase, region UPPERCASE
+    // ("en-in" -> "en-IN", "pa-guru-in" -> "pa-Guru-IN"). The live-transcribe language table
+    // uses region-qualified codes with this casing, so normalize instead of lowercasing away.
+    static func normalizeLanguageCode(_ raw: String) -> String {
+        let parts = raw.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "-")
+        return parts.enumerated().map { idx, part in
+            let s = String(part)
+            if idx == 0 { return s.lowercased() }
+            if s.count == 4 { return s.prefix(1).uppercased() + s.dropFirst().lowercased() }
+            return s.uppercased()
+        }.joined(separator: "-")
+    }
+
     static func loadVocabularyFile(path: String) -> [String] {
         let expanded = NSString(string: path).expandingTildeInPath
         if let content = try? String(contentsOfFile: expanded, encoding: .utf8) {
@@ -248,7 +263,7 @@ struct Config {
         
         if let raw = rawLanguages {
             let parsedLangs = raw.components(separatedBy: ",")
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .map { normalizeLanguageCode($0) }
                 .filter { !$0.isEmpty }
             if parsedLangs.contains("auto") || parsedLangs.contains("all") {
                 config.languageCodes = []
@@ -900,7 +915,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         apiKey: String,
         model: String = "gemini-3.5-transcribe-live",
         smartTranscription: Bool = true,
-        languageCodes: [String] = ["en", "mr"],
+        languageCodes: [String] = ["en-IN", "mr-IN"],
         customVocabulary: [String] = [],
         vadMode: String = "manual",
         vadSilenceMs: Int = 1500
@@ -3451,7 +3466,7 @@ final class JustSpeakApp {
     }
     
     private func printBanner() {
-        let langDisplay = config.languageCodes.isEmpty ? "\(ANSI.green)Auto (All 70+ Languages)\(ANSI.reset)" : "\(ANSI.green)\(config.languageCodes.map { $0.uppercased() }.joined(separator: ", "))\(ANSI.reset) \(ANSI.gray)(Prioritized)\(ANSI.reset)"
+        let langDisplay = config.languageCodes.isEmpty ? "\(ANSI.green)Auto (All 80+ Languages)\(ANSI.reset)" : "\(ANSI.green)\(config.languageCodes.joined(separator: ", "))\(ANSI.reset) \(ANSI.gray)(Prioritized)\(ANSI.reset)"
         print("""
         \(ANSI.bold)\(ANSI.cyan)
              _           _   ____                   _    
