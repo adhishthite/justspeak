@@ -1795,37 +1795,97 @@ enum AppleDesign {
     static let siriIndigo  = NSColor(displayP3Red: 0.44, green: 0.24, blue: 0.96, alpha: 1.0) // #703DF5
     static let siriMagenta = NSColor(displayP3Red: 1.00, green: 0.20, blue: 0.60, alpha: 1.0) // #FF3399
     static let siriAmber   = NSColor(displayP3Red: 1.00, green: 0.65, blue: 0.12, alpha: 1.0) // #FFA61F
-    static let appleGreen  = NSColor(displayP3Red: 0.18, green: 0.80, blue: 0.44, alpha: 1.0) // #2ECC71
+    static let appleGreen  = NSColor(displayP3Red: 0.19, green: 0.82, blue: 0.35, alpha: 1.0) // #30D158 (Apple systemGreen)
     static let appleCoral  = NSColor(displayP3Red: 1.00, green: 0.27, blue: 0.23, alpha: 1.0) // #FF453A
     static let appleGold   = NSColor(displayP3Red: 1.00, green: 0.80, blue: 0.00, alpha: 1.0) // #FFCC00
     
+    // MARK: OKLCH interpolation (Ottosson's OKLab, pure math - no dependencies)
+    //
+    // The chromatic loop interpolates in OKLCH rather than raw P3 RGB: straight RGB lerps
+    // between distant hues dip through darker, muddier midpoints, while OKLCH holds perceived
+    // lightness and chroma constant and swings hue along the shortest arc - the gradient stays
+    // equally luminous the whole way around. Anchors remain authored as Display P3 values.
+
+    struct OKLCh {
+        let L: CGFloat
+        let C: CGFloat
+        let h: CGFloat // radians
+    }
+
+    private static func srgbToLinear(_ c: CGFloat) -> CGFloat {
+        let sign: CGFloat = c < 0 ? -1 : 1
+        let v = abs(c)
+        return sign * (v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4))
+    }
+
+    private static func linearToSrgb(_ c: CGFloat) -> CGFloat {
+        let sign: CGFloat = c < 0 ? -1 : 1
+        let v = abs(c)
+        return sign * (v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055)
+    }
+
+    private static func signedCbrt(_ v: CGFloat) -> CGFloat {
+        v < 0 ? -pow(-v, 1.0 / 3.0) : pow(v, 1.0 / 3.0)
+    }
+
+    // Wide-gamut anchors are carried through extended sRGB (components may leave 0...1),
+    // which the OKLab linear algebra handles without gamut clipping.
+    static func toOKLCh(_ color: NSColor) -> OKLCh {
+        let c = color.usingColorSpace(.extendedSRGB) ?? color
+        let r = srgbToLinear(c.redComponent)
+        let g = srgbToLinear(c.greenComponent)
+        let b = srgbToLinear(c.blueComponent)
+
+        let l = signedCbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+        let m = signedCbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+        let s = signedCbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+
+        let L = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s
+        let a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s
+        let bb = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
+
+        return OKLCh(L: L, C: sqrt(a * a + bb * bb), h: atan2(bb, a))
+    }
+
+    static func fromOKLCh(_ lch: OKLCh) -> NSColor {
+        let a = lch.C * cos(lch.h)
+        let bb = lch.C * sin(lch.h)
+
+        let l = pow(lch.L + 0.3963377774 * a + 0.2158037573 * bb, 3)
+        let m = pow(lch.L - 0.1055613458 * a - 0.0638541728 * bb, 3)
+        let s = pow(lch.L - 0.0894841775 * a - 1.2914855480 * bb, 3)
+
+        let r = linearToSrgb( 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s)
+        let g = linearToSrgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s)
+        let b = linearToSrgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+
+        return NSColor(colorSpace: .extendedSRGB, components: [r, g, b, 1.0], count: 4)
+    }
+
+    // Anchor stops converted once; siriSpectrum below is pure math per call.
+    private static let spectrumAnchors: [OKLCh] = [siriCyan, siriIndigo, siriMagenta, siriAmber].map(toOKLCh)
+
     // Continuous Apple Intelligence 4-phase chromatic loop: Cyan -> Indigo -> Magenta -> Amber -> Cyan
     static func siriSpectrum(at t: CGFloat) -> NSColor {
         let wrapped = t.truncatingRemainder(dividingBy: 1.0)
         let pos = (wrapped < 0 ? wrapped + 1.0 : wrapped) * 4.0
         let seg = Int(pos) % 4
         let frac = pos - CGFloat(Int(pos))
-        
-        let c1: NSColor
-        let c2: NSColor
-        switch seg {
-        case 0: c1 = siriCyan; c2 = siriIndigo
-        case 1: c1 = siriIndigo; c2 = siriMagenta
-        case 2: c1 = siriMagenta; c2 = siriAmber
-        default: c1 = siriAmber; c2 = siriCyan
-        }
-        
-        var r1: CGFloat = 0, g1: CGFloat = 0, b1: CGFloat = 0, a1: CGFloat = 0
-        var r2: CGFloat = 0, g2: CGFloat = 0, b2: CGFloat = 0, a2: CGFloat = 0
-        c1.getRed(&r1, green: &g1, blue: &b1, alpha: &a1)
-        c2.getRed(&r2, green: &g2, blue: &b2, alpha: &a2)
-        
-        return NSColor(
-            displayP3Red: r1 + (r2 - r1) * frac,
-            green: g1 + (g2 - g1) * frac,
-            blue: b1 + (b2 - b1) * frac,
-            alpha: 1.0
-        )
+
+        let c1 = spectrumAnchors[seg]
+        let c2 = spectrumAnchors[(seg + 1) % 4]
+
+        // Shortest-arc hue interpolation keeps the loop from detouring through the far
+        // side of the hue wheel between adjacent anchors.
+        var dh = c2.h - c1.h
+        if dh > .pi { dh -= 2 * .pi }
+        if dh < -.pi { dh += 2 * .pi }
+
+        return fromOKLCh(OKLCh(
+            L: c1.L + (c2.L - c1.L) * frac,
+            C: c1.C + (c2.C - c1.C) * frac,
+            h: c1.h + dh * frac
+        ))
     }
 }
 
@@ -2186,8 +2246,8 @@ final class AppleIntelligenceOrbView: NSView {
         path.closeSubpath()
         
         context.saveGState()
-        context.setShadow(offset: .zero, blur: 6.0, color: AppleDesign.appleGold.withAlphaComponent(0.85).cgColor)
-        context.setFillColor(AppleDesign.appleGold.cgColor)
+        context.setShadow(offset: .zero, blur: 6.0, color: AppleDesign.appleCoral.withAlphaComponent(0.85).cgColor)
+        context.setFillColor(AppleDesign.appleCoral.cgColor)
         context.addPath(path)
         context.fillPath()
         context.restoreGState()
@@ -2200,12 +2260,13 @@ final class AppleSiriWaveformView: NSView {
     private var levels: [CGFloat] = [0.12, 0.12, 0.12, 0.12]
     private let barCount = 4
     
-    // Apple Intelligence Chromatic Bar Sequence
+    // Tight cyan-to-indigo ramp: one hue family reads as one instrument. A different
+    // spectrum color per bar reads as four toys.
     private let barColors: [NSColor] = [
-        AppleDesign.siriCyan,
-        AppleDesign.siriIndigo,
-        AppleDesign.siriMagenta,
-        AppleDesign.siriAmber
+        AppleDesign.siriSpectrum(at: 0.00),
+        AppleDesign.siriSpectrum(at: 0.07),
+        AppleDesign.siriSpectrum(at: 0.14),
+        AppleDesign.siriSpectrum(at: 0.21)
     ]
     
     override init(frame frameRect: NSRect) {
@@ -2285,10 +2346,10 @@ final class AppleIslandBackplateView: NSView {
         let cornerRadius = bounds.height / 2.0
         let pillPath = CGPath(roundedRect: bounds, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
         
-        // 1. Deep Obsidian Pitch-Black Acrylic Base
+        // 1. Deep Obsidian Base - near-opaque so the pill matches the notch's hardware black
         context.saveGState()
         context.addPath(pillPath)
-        context.setFillColor(NSColor(calibratedRed: 0.05, green: 0.05, blue: 0.07, alpha: 0.92).cgColor)
+        context.setFillColor(NSColor(calibratedRed: 0.043, green: 0.043, blue: 0.059, alpha: 0.97).cgColor)
         context.fillPath()
         context.restoreGState()
         
@@ -2326,7 +2387,7 @@ final class FloatingHUD {
     private let notchGlowView: AppleNotchAuraView
     
     private let pillPanel: NSPanel
-    private let visualEffectView: NSVisualEffectView
+    private let pillContentView: NSView
     private let backplateView: AppleIslandBackplateView
     private let orbIcon: AppleIntelligenceOrbView
     private let headerLabel: NSTextField
@@ -2338,6 +2399,9 @@ final class FloatingHUD {
     private let minPillWidth: CGFloat = 330
     private let maxPillWidth: CGFloat = 520
     private let pillHeight: CGFloat = 52
+    // Tucked nearly flush beneath the notch so the pill reads as the notch extruding,
+    // not a separate floating window.
+    private let pillGap: CGFloat = 2.0
     private var notchInfo: NotchGeometry
     private var screenFrame: NSRect
 
@@ -2374,7 +2438,7 @@ final class FloatingHUD {
         // 2. Setup Floating Dynamic Island Panel
         let initialWidth = minPillWidth
         let pillX = screen.frame.midX - initialWidth / 2.0
-        let pillY = screen.frame.height - notchInfo.rect.height - pillHeight - 12.0
+        let pillY = screen.frame.height - notchInfo.rect.height - pillHeight - pillGap
         
         self.pillPanel = NSPanel(
             contentRect: NSRect(x: pillX, y: pillY, width: initialWidth, height: pillHeight),
@@ -2390,49 +2454,44 @@ final class FloatingHUD {
         pillPanel.ignoresMouseEvents = true
         pillPanel.alphaValue = 0.0
         
-        // Apple Liquid Acrylic Glass Backplate
-        self.visualEffectView = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: initialWidth, height: pillHeight))
-        visualEffectView.material = .hudWindow
-        visualEffectView.blendingMode = .behindWindow
-        visualEffectView.state = .active
-        visualEffectView.wantsLayer = true
-        visualEffectView.layer?.cornerRadius = pillHeight / 2.0
+        // Hardware-black container. The pill reads as a piece of the notch itself - opaque
+        // near-black like the bezel glass, not a translucent overlay - so no blur material.
+        // (The old NSVisualEffectView blur was painted over by the 0.9-alpha backplate anyway,
+        // and its layer shadow was dead code: masksToBounds clips layer shadows; the window
+        // shadow comes from pillPanel.hasShadow.)
+        self.pillContentView = NSView(frame: NSRect(x: 0, y: 0, width: initialWidth, height: pillHeight))
+        pillContentView.wantsLayer = true
+        pillContentView.layer?.cornerRadius = pillHeight / 2.0
         if #available(macOS 10.15, *) {
-            visualEffectView.layer?.cornerCurve = .continuous
+            pillContentView.layer?.cornerCurve = .continuous
         }
-        visualEffectView.layer?.masksToBounds = true
-        visualEffectView.layer?.shadowColor = NSColor.black.cgColor
-        visualEffectView.layer?.shadowOpacity = 0.55
-        visualEffectView.layer?.shadowRadius = 28.0
-        visualEffectView.layer?.shadowOffset = CGSize(width: 0, height: -7)
+        pillContentView.layer?.masksToBounds = true
         
         self.backplateView = AppleIslandBackplateView(frame: NSRect(x: 0, y: 0, width: initialWidth, height: pillHeight))
-        visualEffectView.addSubview(backplateView)
+        pillContentView.addSubview(backplateView)
         
         // Apple Intelligence Living Orb (Top-Left)
         self.orbIcon = AppleIntelligenceOrbView(frame: NSRect(x: 16, y: 27, width: 18, height: 18))
-        visualEffectView.addSubview(orbIcon)
+        pillContentView.addSubview(orbIcon)
         
-        // Micro-Header Label (Top-Center-Left)
-        self.headerLabel = NSTextField(labelWithString: "JUSTSPEAK • LIVE DICTATION")
-        headerLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
-        headerLabel.textColor = NSColor(white: 1.0, alpha: 0.60)
+        // Eyebrow state label (Top-Center-Left): a single state word in the NOW PLAYING idiom.
+        // State leads; the tool's name is not information the user needs at a glance.
+        self.headerLabel = NSTextField(labelWithString: "")
         headerLabel.frame = NSRect(x: 38, y: 27, width: 230, height: 16)
-        visualEffectView.addSubview(headerLabel)
+        pillContentView.addSubview(headerLabel)
         
         // Apple Siri Equalizer (Top-Right)
         self.waveformView = AppleSiriWaveformView(frame: NSRect(x: initialWidth - 48, y: 26, width: 32, height: 16))
-        visualEffectView.addSubview(waveformView)
+        pillContentView.addSubview(waveformView)
         
         // Live Transcript / Preview Text (Bottom-Row)
-        self.transcriptLabel = NSTextField(labelWithString: "Hold Right ⌥ to speak...")
+        self.transcriptLabel = NSTextField(labelWithString: "")
         transcriptLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .regular)
-        transcriptLabel.textColor = NSColor(white: 1.0, alpha: 0.50)
         transcriptLabel.frame = NSRect(x: 16, y: 7, width: initialWidth - 32, height: 20)
         transcriptLabel.lineBreakMode = .byTruncatingTail
-        visualEffectView.addSubview(transcriptLabel)
+        pillContentView.addSubview(transcriptLabel)
 
-        pillPanel.contentView = visualEffectView
+        pillPanel.contentView = pillContentView
 
         // Re-run screen-dependent layout whenever the display configuration changes
         // (monitor plugged/unplugged, resolution change, etc.) so the notch aura and
@@ -2467,7 +2526,7 @@ final class FloatingHUD {
 
         // Floating Dynamic Island Panel geometry (preserves currentWidth)
         let pillX = screenFrame.midX - currentWidth / 2.0
-        let pillY = screenFrame.height - notchInfo.rect.height - pillHeight - 12.0
+        let pillY = screenFrame.height - notchInfo.rect.height - pillHeight - pillGap
         pillPanel.setFrame(NSRect(x: pillX, y: pillY, width: currentWidth, height: pillHeight), display: true)
     }
 
@@ -2477,55 +2536,108 @@ final class FloatingHUD {
         currentWidth = clamped
         
         let newX = screenFrame.midX - currentWidth / 2.0
-        let newY = screenFrame.height - notchInfo.rect.height - pillHeight - 12.0
+        let newY = screenFrame.height - notchInfo.rect.height - pillHeight - pillGap
         let newRect = NSRect(x: newX, y: newY, width: currentWidth, height: pillHeight)
         
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.20
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
             pillPanel.animator().setFrame(newRect, display: true)
-            visualEffectView.frame = NSRect(x: 0, y: 0, width: currentWidth, height: pillHeight)
+            pillContentView.frame = NSRect(x: 0, y: 0, width: currentWidth, height: pillHeight)
             backplateView.frame = NSRect(x: 0, y: 0, width: currentWidth, height: pillHeight)
             waveformView.frame = NSRect(x: currentWidth - 48, y: 26, width: 32, height: 16)
             transcriptLabel.frame = NSRect(x: 16, y: 7, width: currentWidth - 32, height: 20)
         }
     }
     
+    // MARK: State typography
+
+    // Eyebrow state word: uppercase micro-type with wide tracking (the NOW PLAYING idiom).
+    private func setHeader(_ text: String, color: NSColor) {
+        headerLabel.attributedStringValue = NSAttributedString(
+            string: text.uppercased(),
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 9.0, weight: .semibold),
+                .foregroundColor: color,
+                .kern: 1.1
+            ]
+        )
+    }
+
+    // Transcript line; caret appends a slim tinted insertion mark while text is streaming.
+    private func setTranscript(_ text: String, color: NSColor, caret: Bool) {
+        let body = NSMutableAttributedString(
+            string: text,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
+                .foregroundColor: color
+            ]
+        )
+        if caret {
+            body.append(NSAttributedString(
+                string: " ▏",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
+                    .foregroundColor: AppleDesign.siriCyan
+                ]
+            ))
+        }
+        transcriptLabel.attributedStringValue = body
+    }
+
+    // Plain transcript text with any streaming caret stripped.
+    private var currentTranscriptText: String {
+        var text = transcriptLabel.attributedStringValue.string
+        if text.hasSuffix(" ▏") { text = String(text.dropLast(2)) }
+        return text
+    }
+
     func showListening() {
         hideWorkItem?.cancel()
         currentWidth = minPillWidth
-        
-        // Notch Glow State
-        notchGlowView.state = .listening
-        notchGlowView.audioLevel = 0.0
-        notchGlowView.startAnimation()
+
+        // Notch aura only exists where the hardware notch does; on external or non-notch
+        // displays the pill stands alone rather than glowing around a phantom cutout.
+        let hasNotch = notchInfo.hasPhysicalNotch
+        if hasNotch {
+            notchGlowView.state = .listening
+            notchGlowView.audioLevel = 0.0
+            notchGlowView.startAnimation()
+        }
 
         // Pill Layout & Content
         orbIcon.state = .listening
         orbIcon.audioLevel = 0.0
         orbIcon.startAnimation()
-        headerLabel.stringValue = "JUSTSPEAK • LIVE DICTATION"
-        headerLabel.textColor = NSColor(white: 1.0, alpha: 0.65)
-        transcriptLabel.stringValue = "Hold Right ⌥ to speak..."
-        transcriptLabel.textColor = NSColor(white: 1.0, alpha: 0.50)
+        setHeader("Listening", color: NSColor(white: 1.0, alpha: 0.55))
+        // The pill appears on key-down, so the user is already holding: say what to do next.
+        setTranscript("Speak, then release to paste", color: NSColor(white: 1.0, alpha: 0.45), caret: false)
+        transcriptLabel.lineBreakMode = .byTruncatingTail
         waveformView.reset()
-        
+
         let pillX = screenFrame.midX - minPillWidth / 2.0
-        let pillY = screenFrame.height - notchInfo.rect.height - pillHeight - 12.0
-        pillPanel.setFrame(NSRect(x: pillX, y: pillY, width: minPillWidth, height: pillHeight), display: true)
-        visualEffectView.frame = NSRect(x: 0, y: 0, width: minPillWidth, height: pillHeight)
+        let pillY = screenFrame.height - notchInfo.rect.height - pillHeight - pillGap
+        let finalRect = NSRect(x: pillX, y: pillY, width: minPillWidth, height: pillHeight)
+        pillContentView.frame = NSRect(x: 0, y: 0, width: minPillWidth, height: pillHeight)
         backplateView.frame = NSRect(x: 0, y: 0, width: minPillWidth, height: pillHeight)
         waveformView.frame = NSRect(x: minPillWidth - 48, y: 26, width: 32, height: 16)
         transcriptLabel.frame = NSRect(x: 16, y: 7, width: minPillWidth - 32, height: 20)
-        
-        notchPanel.orderFrontRegardless()
+
+        // Signature entrance: the pill slides out from beneath the notch, as if the notch
+        // itself extends. Reduced-motion preference gets a plain fade.
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let startRect = reduceMotion ? finalRect : finalRect.offsetBy(dx: 0, dy: 10)
+        pillPanel.setFrame(startRect, display: true)
+
+        if hasNotch { notchPanel.orderFrontRegardless() }
         pillPanel.orderFrontRegardless()
-        
+
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.16
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
-            notchPanel.animator().alphaValue = 1.0
+            context.duration = reduceMotion ? 0.16 : 0.28
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
+            if hasNotch { notchPanel.animator().alphaValue = 1.0 }
             pillPanel.animator().alphaValue = 1.0
+            pillPanel.animator().setFrame(finalRect, display: true)
         }
     }
     
@@ -2539,72 +2651,83 @@ final class FloatingHUD {
     func updateLiveText(_ text: String) {
         let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         guard !clean.isEmpty else { return }
-        
-        transcriptLabel.stringValue = "\(clean) |"
-        transcriptLabel.textColor = NSColor.white
-        
+
+        // While streaming, the newest words matter most: truncate at the head so the tail
+        // of the sentence is always visible, with a slim caret marking the live edge.
+        transcriptLabel.lineBreakMode = .byTruncatingHead
+        setTranscript(clean, color: .white, caret: true)
+
         // Fluid Dynamic Island auto-expansion based on text width
         let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 13.5)
         let textWidth = (clean as NSString).size(withAttributes: [.font: font]).width
         let neededWidth = max(minPillWidth, textWidth + 64.0)
         updatePillWidth(targetWidth: neededWidth)
     }
-    
+
     func showProcessing() {
         hideWorkItem?.cancel()
         notchGlowView.state = .processing
         orbIcon.state = .processing
-        
-        headerLabel.stringValue = "JUSTSPEAK • POLISHING"
-        headerLabel.textColor = AppleDesign.siriCyan
-        transcriptLabel.stringValue = "Formatting text..."
-        transcriptLabel.textColor = NSColor(white: 1.0, alpha: 0.85)
+
+        setHeader("Polishing", color: AppleDesign.siriCyan)
+        // Keep the user's words on screen, just dimmed - wiping them for a status message
+        // makes the pill feel like it lost the dictation.
+        let existing = currentTranscriptText
+        if existing.isEmpty || existing == "Speak, then release to paste" {
+            setTranscript("Polishing…", color: NSColor(white: 1.0, alpha: 0.70), caret: false)
+        } else {
+            setTranscript(existing, color: NSColor(white: 1.0, alpha: 0.70), caret: false)
+        }
         waveformView.reset()
     }
-    
+
     func showSuccess(text: String) {
         hideWorkItem?.cancel()
         notchGlowView.state = .success
         orbIcon.state = .success
-        
-        headerLabel.stringValue = "JUSTSPEAK • COPIED & PASTED"
-        headerLabel.textColor = AppleDesign.appleGreen
+
+        setHeader("Pasted", color: AppleDesign.appleGreen)
         let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
-        transcriptLabel.stringValue = clean.isEmpty ? "Done" : clean
-        transcriptLabel.textColor = NSColor.white
+        transcriptLabel.lineBreakMode = .byTruncatingTail
+        setTranscript(clean.isEmpty ? "Done" : clean, color: .white, caret: false)
         waveformView.reset()
-        
+
         let workItem = DispatchWorkItem { [weak self] in
             self?.hide()
         }
         hideWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.85, execute: workItem)
     }
-    
+
     func showError(message: String) {
         hideWorkItem?.cancel()
         notchGlowView.state = .error
         orbIcon.state = .error
-        
-        headerLabel.stringValue = "JUSTSPEAK • ERROR"
-        headerLabel.textColor = AppleDesign.appleCoral
-        transcriptLabel.stringValue = message
-        transcriptLabel.textColor = NSColor(white: 1.0, alpha: 0.85)
+
+        setHeader("Error", color: AppleDesign.appleCoral)
+        transcriptLabel.lineBreakMode = .byTruncatingTail
+        setTranscript(message, color: NSColor(white: 1.0, alpha: 0.85), caret: false)
         waveformView.reset()
-        
+
         let workItem = DispatchWorkItem { [weak self] in
             self?.hide()
         }
         hideWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: workItem)
     }
-    
+
     func hide() {
+        // Retract back beneath the notch, mirroring the entrance.
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let retractRect = pillPanel.frame.offsetBy(dx: 0, dy: 10)
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.20
+            context.duration = 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             self.notchPanel.animator().alphaValue = 0.0
             self.pillPanel.animator().alphaValue = 0.0
+            if !reduceMotion {
+                self.pillPanel.animator().setFrame(retractRect, display: true)
+            }
         }, completionHandler: {
             if self.notchPanel.alphaValue == 0.0 {
                 self.notchPanel.orderOut(nil)
@@ -2972,7 +3095,7 @@ final class JustSpeakApp {
             Logger.error("REST", "Transcription failed: \(error.localizedDescription)")
             if config.soundFeedback { SoundManager.playErrorSound() }
             DispatchQueue.main.async { [weak self] in
-                self?.hud?.showError(message: "Transcription Failed")
+                self?.hud?.showError(message: "Transcription failed — nothing pasted")
             }
             processingLock.lock()
             isProcessing = false
@@ -2996,7 +3119,7 @@ final class JustSpeakApp {
         guard !text.isEmpty else {
             Logger.warn("AI", "Received empty transcription from Gemini.")
             DispatchQueue.main.async { [weak self] in
-                self?.hud?.showError(message: "Empty speech detected")
+                self?.hud?.showError(message: "No speech detected")
             }
             processingLock.lock()
             isProcessing = false
