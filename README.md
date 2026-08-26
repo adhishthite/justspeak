@@ -164,6 +164,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `REST_INPUT_PRICE_PER_1M` | `0.30` | USD per 1M input tokens for the REST fallback model (cost diagnostics only) |
 | `REST_OUTPUT_PRICE_PER_1M` | `2.50` | USD per 1M output tokens for the REST fallback model (cost diagnostics only) |
 | `RESTORE_CLIPBOARD` | `true` | Automatically restore previous clipboard contents ~1s after injection, only if nothing else has written the clipboard in the meantime |
+| `TRAILING_SPACE` | `true` | Append one space after each injected dictation so back-to-back dictations don't fuse |
 | `LOG_LEVEL` | `verbose` | `verbose` (live dB meters & latency diagnostics) or `normal` |
 
 ---
