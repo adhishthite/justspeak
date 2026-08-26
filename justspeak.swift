@@ -761,6 +761,14 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private(set) var isReady: Bool = false
     
     private var currentTurnText: String = ""
+    // Multi-segment transcript accumulator. The server's VAD closes a speech segment at every
+    // pause: the finished segment arrives as a finalized transcription, then the NEXT segment's
+    // interim text starts empty - so treating any single message as "the whole turn so far"
+    // wipes every earlier segment (pause mid-utterance -> first sentence lost). Finalized
+    // segments accumulate in committedTranscript; interimTranscript holds only the in-progress
+    // segment; currentTurnText is always their merge.
+    private var committedTranscript: String = ""
+    private var interimTranscript: String = ""
     private var firstTokenLatencyMs: Double = 0
     private var turnCommitTime: CFAbsoluteTime = 0
     private var lastTokenReceivedTime: CFAbsoluteTime = 0
@@ -996,25 +1004,29 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             var updatedText: String? = nil
             var isUserSpeech = false
 
-            // PRIORITY 1: Finalized inputTranscription (e.g. gemini-3.5-transcribe-live)
+            // PRIORITY 1: Finalized inputTranscription (e.g. gemini-3.5-transcribe-live) -
+            // closes the current speech segment; earlier segments must be preserved.
             if let inputTrans = serverContent["inputTranscription"] as? [String: Any],
                let text = inputTrans["text"] as? String, !text.isEmpty {
-                updatedText = text
+                applyFinalTranscription(text)
+                updatedText = mergedTranscript()
                 isUserSpeech = true
             }
-            // PRIORITY 2: Progressive Interim Transcription
+            // PRIORITY 2: Progressive Interim Transcription - rewrites only the live segment.
             else if let interim = serverContent["interimInputTranscription"] as? [String: Any],
                     let text = interim["text"] as? String, !text.isEmpty {
-                updatedText = text
+                applyInterimTranscription(text)
+                updatedText = mergedTranscript()
                 isUserSpeech = true
             }
-            // PRIORITY 3: Alternative inputAudioTranscription
+            // PRIORITY 3: Alternative inputAudioTranscription (finalized form)
             else if let inputAudio = serverContent["inputAudioTranscription"] as? [String: Any],
                     let text = inputAudio["text"] as? String, !text.isEmpty {
-                updatedText = text
+                applyFinalTranscription(text)
+                updatedText = mergedTranscript()
                 isUserSpeech = true
             }
-            // PRIORITY 4: Multimodal text delta from modelTurn
+            // PRIORITY 4: Multimodal text delta from modelTurn (raw append, no segmentation)
             else if let modelTurn = serverContent["modelTurn"] as? [String: Any],
                     let parts = modelTurn["parts"] as? [[String: Any]] {
                 var delta = ""
@@ -1024,11 +1036,13 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                     }
                 }
                 if !delta.isEmpty {
-                    updatedText = currentTurnText + delta
+                    committedTranscript += delta
+                    updatedText = mergedTranscript()
                 }
             } else if let outputTranscription = serverContent["outputTranscription"] as? [String: Any],
                       let text = outputTranscription["text"] as? String, !text.isEmpty {
-                updatedText = currentTurnText + text
+                committedTranscript += text
+                updatedText = mergedTranscript()
             }
 
             if let newText = updatedText {
@@ -1063,6 +1077,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 let totalLatencyMs = (CFAbsoluteTimeGetCurrent() - turnCommitTime) * 1000.0
                 let text = currentTurnText
                 currentTurnText = ""
+                committedTranscript = ""
+                interimTranscript = ""
                 let firstToken = firstTokenLatencyMs
                 firstTokenLatencyMs = 0
 
@@ -1110,6 +1126,41 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    // MARK: Segment transcript accumulator (all three helpers assume `lock` is held)
+
+    private func mergedTranscript() -> String {
+        if committedTranscript.isEmpty { return interimTranscript }
+        if interimTranscript.isEmpty { return committedTranscript }
+        let needsSpace = !(committedTranscript.hasSuffix(" ") || committedTranscript.hasSuffix("\n") || interimTranscript.hasPrefix(" "))
+        return committedTranscript + (needsSpace ? " " : "") + interimTranscript
+    }
+
+    private func applyInterimTranscription(_ text: String) {
+        // Some server variants stream the interim as the full turn so far. If it already
+        // contains everything committed, only the suffix is the live segment - otherwise the
+        // interim IS the live segment and replaces only the previous interim.
+        if !committedTranscript.isEmpty && text.hasPrefix(committedTranscript) {
+            interimTranscript = String(text.dropFirst(committedTranscript.count))
+        } else {
+            interimTranscript = text
+        }
+    }
+
+    private func applyFinalTranscription(_ text: String) {
+        if committedTranscript.isEmpty {
+            committedTranscript = text
+        } else if text.hasPrefix(committedTranscript) {
+            // Cumulative final covering the whole turn - replace wholesale.
+            committedTranscript = text
+        } else if committedTranscript.hasSuffix(text) {
+            // Duplicate re-send of the segment just committed - nothing new.
+        } else {
+            let needsSpace = !(committedTranscript.hasSuffix(" ") || committedTranscript.hasSuffix("\n") || text.hasPrefix(" "))
+            committedTranscript += (needsSpace ? " " : "") + text
+        }
+        interimTranscript = ""
+    }
+
     // Re-validates the settle rules against current authoritative state and, if any rule
     // holds, performs the once-only settle sequence. Safe to call redundantly from a stale
     // or overlapping timer: state (isCommitting/hasFiredTurnCompletion) is the source of
@@ -1149,6 +1200,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
 
         let totalLatencyMs = elapsedCommit * 1000.0
         currentTurnText = ""
+        committedTranscript = ""
+        interimTranscript = ""
         let firstToken = firstTokenLatencyMs
         firstTokenLatencyMs = 0
         let cb = turnCompletion
@@ -1173,6 +1226,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.settleMaxWorkItem = nil
         self.isCommitting = false
         self.currentTurnText = ""
+        self.committedTranscript = ""
+        self.interimTranscript = ""
         self.firstTokenLatencyMs = 0
         self.hasFiredTurnCompletion = false
         self.turnCommitTime = 0
