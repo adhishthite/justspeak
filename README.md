@@ -42,7 +42,7 @@ JustSpeak was designed specifically for corporate gMac environments with strict 
 
 - **Zero Compiled Binaries**: No external Mach-O binaries, `.dylib` shared libraries, or native Node.js addons (`node-gyp`).
 - **Apple-Signed System Runtimes Only**: Executes purely via macOS system frameworks (`AVFoundation`, `CoreAudio`, `CoreGraphics`, `AppKit`) and `/usr/bin/swift`.
-- **Zero External Dependencies**: Self-contained single-file Swift implementation without package managers, CocoaPods, or dynamic linkers.
+- **Zero External Dependencies**: Self-contained Swift implementation without package managers, CocoaPods, or dynamic linkers. Source lives in `src/*.swift`; the `./justspeak` runner concatenates it into one generated script (`.build/justspeak.gen.swift`) and interprets it with Apple-signed `/usr/bin/swift` — no compiled binary is ever produced, so Santa never has anything to block. `#sourceLocation` directives injected at file boundaries keep compiler diagnostics pointing at the real `src/` file and line.
 - **Zero Local Audio Persistence**: Raw microphone audio is held in memory buffers during the keypress and discarded immediately after dispatch.
 
 ---

@@ -1,8 +1,7 @@
 # JustSpeak - Ultra-Low-Latency Push-to-Talk macOS Voice Dictation
 # Makefile Automation
 
-SWIFT ?= /usr/bin/swift
-SCRIPT = justspeak.swift
+RUNNER = ./justspeak
 
 .PHONY: all run start check-permissions test-api test-audio setup install clean check help
 
@@ -10,22 +9,22 @@ all: run
 
 ## run: Start the JustSpeak voice dictation tool (pure Apple-signed Swift runtime)
 run: setup
-	@$(SWIFT) $(SCRIPT)
+	@$(RUNNER)
 
 ## start: Alias for make run
 start: run
 
 ## check-permissions: Check macOS Accessibility, Microphone, and Input Monitoring permissions
 check-permissions:
-	@$(SWIFT) $(SCRIPT) --check-permissions
+	@$(RUNNER) --check-permissions
 
 ## test-api: Verify Gemini API key, endpoint reachability, and response latency
 test-api: setup
-	@$(SWIFT) $(SCRIPT) --test-api
+	@$(RUNNER) --test-api
 
 ## test-audio: Record a 3-second audio sample from the microphone and transcribe via Gemini
 test-audio: setup
-	@$(SWIFT) $(SCRIPT) --test-audio
+	@$(RUNNER) --test-audio
 
 ## setup: Initialize local .env configuration from .env.example
 setup:
@@ -42,7 +41,7 @@ check: check-permissions test-api
 
 ## clean: Remove temporary files and caches
 clean:
-	@rm -rf .DS_Store
+	@rm -rf .DS_Store .build
 	@echo "Cleaned working directory."
 
 ## help: Show this help summary
