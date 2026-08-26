@@ -104,7 +104,9 @@ struct Config {
     var enableLiveWebSocket: Bool = true
     var restFallbackTimeout: Double = 4.0
     var preRollMs: Int = 400
-    var postRollMs: Int = 100
+    // 250ms default: people release the key while the last word is still leaving their mouth;
+    // audio keeps streaming during the grace period, so the only cost is commit latency.
+    var postRollMs: Int = 250
     var vadMode: String = "manual" // "manual" (PTT key defines speech bounds), "tuned", or "auto"
     var vadSilenceMs: Int = 1500
     var restoreClipboard: Bool = true
@@ -779,6 +781,9 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private var turnCommitTime: CFAbsoluteTime = 0
     private var lastTokenReceivedTime: CFAbsoluteTime = 0
     private var lastPostCommitTokenTime: CFAbsoluteTime? = nil
+    // Set when a FINAL transcription arrives post-commit; cleared if a later interim shows
+    // more content is still streaming in.
+    private var lastPostCommitFinalTime: CFAbsoluteTime? = nil
     private var isCommitting: Bool = false
     private var hasFiredTurnCompletion: Bool = false
     private var turnCompletion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?
@@ -799,6 +804,13 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     // Event-driven settlement timers for transcribe-model turn completion (see commitTurn/attemptSettle).
     private static let settleMinPostCommitWait: Double = 0.35
     private static let settleQuietWindow: Double = 0.25
+    // With manual activity signaling the server owes an authoritative FINAL inputTranscription
+    // after activityEnd. Interims are documented as "speculative partial hypotheses", so in
+    // manual mode the interim-quiet fallback waits longer (don't paste speculation while the
+    // final is still processing), and an observed final settles after only a short grace in
+    // case a second segment's final is right behind it.
+    private static let settleFinalGrace: Double = 0.15
+    private static let settleInterimQuietManual: Double = 0.60
     private static let settleInitialWaitWithoutTokens: Double = 0.90
     private static let settleMaxWait: Double = 2.20
     // Timers are scheduled on DispatchTime but attemptSettle re-validates the rules against
@@ -1020,8 +1032,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         var liveTextUpdate: (label: String, elapsedMs: Double, fullText: String, textCopy: String)? = nil
         var turnCompletionFire: (completion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?, text: String, firstTokenMs: Double, totalMs: Double)? = nil
         // Set when a post-commit token arrives while committing: elapsed time since turnCommitTime,
-        // used after unlock to (re)schedule the quiet-window settle check.
+        // used after unlock to (re)schedule the settle check. Finals get the short authoritative
+        // grace; interims get the (mode-aware) quiet window.
         var quietRescheduleElapsedSinceCommit: Double? = nil
+        var quietRescheduleIsFinal = false
 
         lock.lock()
 
@@ -1045,6 +1059,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         else if let serverContent = json["serverContent"] as? [String: Any] {
             var updatedText: String? = nil
             var isUserSpeech = false
+            var isFinalTranscription = false
 
             // PRIORITY 1: Finalized inputTranscription (e.g. gemini-3.5-transcribe-live) -
             // closes the current speech segment; earlier segments must be preserved.
@@ -1053,6 +1068,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 applyFinalTranscription(text)
                 updatedText = mergedTranscript()
                 isUserSpeech = true
+                isFinalTranscription = true
             }
             // PRIORITY 2: Progressive Interim Transcription - rewrites only the live segment.
             else if let interim = serverContent["interimInputTranscription"] as? [String: Any],
@@ -1067,6 +1083,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 applyFinalTranscription(text)
                 updatedText = mergedTranscript()
                 isUserSpeech = true
+                isFinalTranscription = true
             }
             // PRIORITY 4: Multimodal text delta from modelTurn (raw append, no segmentation)
             else if let modelTurn = serverContent["modelTurn"] as? [String: Any],
@@ -1092,7 +1109,15 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 self.lastTokenReceivedTime = now
                 if self.isCommitting {
                     self.lastPostCommitTokenTime = now
+                    if isFinalTranscription {
+                        self.lastPostCommitFinalTime = now
+                    } else if isUserSpeech {
+                        // A speculative interim after a final means more content is still
+                        // streaming - the final we saw wasn't the last one.
+                        self.lastPostCommitFinalTime = nil
+                    }
                     quietRescheduleElapsedSinceCommit = now - self.turnCommitTime
+                    quietRescheduleIsFinal = isFinalTranscription
                 }
                 if currentTurnText.isEmpty && firstTokenLatencyMs == 0 && turnCommitTime > 0 {
                     firstTokenLatencyMs = (now - turnCommitTime) * 1000.0
@@ -1158,7 +1183,13 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         // earlier than minPostCommitWait after commit. Scheduling happens off-lock; the
         // pointer swap that replaces the previous pending item is its own short lock scope.
         if let elapsedSinceCommit = quietRescheduleElapsedSinceCommit {
-            let delay = max(Self.settleQuietWindow, Self.settleMinPostCommitWait - elapsedSinceCommit) + Self.settleTimerCushion
+            let delay: Double
+            if quietRescheduleIsFinal {
+                delay = Self.settleFinalGrace + Self.settleTimerCushion
+            } else {
+                let quiet = usesManualActivity ? Self.settleInterimQuietManual : Self.settleQuietWindow
+                delay = max(quiet, Self.settleMinPostCommitWait - elapsedSinceCommit) + Self.settleTimerCushion
+            }
             let item = DispatchWorkItem { [weak self] in self?.attemptSettle() }
             lock.lock()
             settleWorkItem?.cancel()
@@ -1218,11 +1249,20 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         let elapsedCommit = now - turnCommitTime
         let text = currentTurnText
         let postCommitTokenTime = lastPostCommitTokenTime
+        let postCommitFinalTime = lastPostCommitFinalTime
 
         var settleWithText = false
-        if let postTime = postCommitTokenTime {
+        if let finalTime = postCommitFinalTime {
+            // An authoritative final transcription landed: settle after only a short grace
+            // (long enough for a trailing segment's final to displace this timer), with no
+            // minimum-wait floor - waiting longer adds latency, not accuracy.
+            settleWithText = !text.isEmpty && (now - finalTime) >= Self.settleFinalGrace
+        } else if let postTime = postCommitTokenTime {
+            // Only speculative interims so far. In manual-activity mode a final is expected,
+            // so wait longer before pasting speculation; otherwise use the tight quiet window.
+            let quietWindow = usesManualActivity ? Self.settleInterimQuietManual : Self.settleQuietWindow
             let quietSincePostToken = now - postTime
-            settleWithText = elapsedCommit >= Self.settleMinPostCommitWait && !text.isEmpty && quietSincePostToken >= Self.settleQuietWindow
+            settleWithText = elapsedCommit >= Self.settleMinPostCommitWait && !text.isEmpty && quietSincePostToken >= quietWindow
         } else if !text.isEmpty && elapsedCommit >= Self.settleInitialWaitWithoutTokens {
             settleWithText = true
         }
@@ -1275,6 +1315,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.turnCommitTime = 0
         self.lastTokenReceivedTime = 0
         self.lastPostCommitTokenTime = nil
+        self.lastPostCommitFinalTime = nil
         self.turnCompletion = nil
         lock.unlock()
         
@@ -1317,6 +1358,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.turnCommitTime = CFAbsoluteTimeGetCurrent()
         self.isCommitting = true
         self.lastPostCommitTokenTime = nil
+        self.lastPostCommitFinalTime = nil
         self.turnCompletion = completion
         self.hasFiredTurnCompletion = false
         lock.unlock()
