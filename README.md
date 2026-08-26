@@ -154,6 +154,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `POST_ROLL_MS` | `250` | Grace period (ms) after key release to catch the tail of the final word before finalizing (0-500) |
 | `VAD_MODE` | `manual` | `manual` (push-to-talk hold defines speech bounds, server VAD off), `tuned` (pause-tolerant server VAD), `auto` (stock server VAD) |
 | `VAD_SILENCE_MS` | `1500` | Tuned mode only: pause length (ms) before server VAD ends speech (200-5000) |
+| `MIC_IDLE_TIMEOUT` | `300` | Seconds without a dictation before the mic is released (status-bar indicator off); next key-down re-arms it. `0` = always on |
 | `RESTORE_CLIPBOARD` | `true` | Automatically restore previous clipboard contents 350ms after injection |
 | `LOG_LEVEL` | `verbose` | `verbose` (live dB meters & latency diagnostics) or `normal` |
 

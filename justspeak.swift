@@ -109,6 +109,9 @@ struct Config {
     var postRollMs: Int = 250
     var vadMode: String = "manual" // "manual" (PTT key defines speech bounds), "tuned", or "auto"
     var vadSilenceMs: Int = 1500
+    // Release the mic (status-bar indicator off) after this many seconds without a dictation;
+    // the next key-down re-arms it. 0 = keep the mic always on (lowest latency, indicator lit).
+    var micIdleTimeoutSec: Int = 300
     var restoreClipboard: Bool = true
     var logLevel: String = "verbose"
     
@@ -197,6 +200,7 @@ struct Config {
                         case "POST_ROLL_MS": if let ms = Int(value) { config.postRollMs = min(500, max(0, ms)) }
                         case "VAD_MODE": if ["manual", "tuned", "auto"].contains(value.lowercased()) { config.vadMode = value.lowercased() }
                         case "VAD_SILENCE_MS": if let ms = Int(value) { config.vadSilenceMs = min(5000, max(200, ms)) }
+                        case "MIC_IDLE_TIMEOUT": if let sec = Int(value) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
                         case "LOG_LEVEL": config.logLevel = value.lowercased()
                         default: break
                         }
@@ -225,6 +229,7 @@ struct Config {
         if let postRoll = env["POST_ROLL_MS"], let ms = Int(postRoll) { config.postRollMs = min(500, max(0, ms)) }
         if let vad = env["VAD_MODE"], ["manual", "tuned", "auto"].contains(vad.lowercased()) { config.vadMode = vad.lowercased() }
         if let vadSilence = env["VAD_SILENCE_MS"], let ms = Int(vadSilence) { config.vadSilenceMs = min(5000, max(200, ms)) }
+        if let micIdle = env["MIC_IDLE_TIMEOUT"], let sec = Int(micIdle) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
         if let log = env["LOG_LEVEL"] { config.logLevel = log.lowercased() }
         
         if let raw = rawLanguages {
@@ -507,6 +512,7 @@ final class AudioCaptureEngine {
     
     private let lock = NSLock()
     private(set) var isRecording: Bool = false
+    private(set) var isEngineRunning: Bool = false // main-thread-only (setup/suspend/resume)
     private var recordedPCMData = Data()
     private var chunkCount: Int = 0
     private var recordingStartTime: CFAbsoluteTime = 0
@@ -568,10 +574,44 @@ final class AudioCaptureEngine {
         do {
             audioEngine.prepare()
             try audioEngine.start()
+            isEngineRunning = true
             Logger.success("MIC", "Audio engine pre-warmed & running in background (zero keydown wake-up latency).")
             return true
         } catch {
             Logger.error("MIC", "Could not start AVAudioEngine: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    // Releases the microphone (the macOS status-bar mic indicator turns off) while keeping the
+    // tap installed, so resumeEngine() only pays hardware spin-up. Refuses mid-dictation.
+    // Both suspend and resume are main-thread-only, matching where the idle timer and the
+    // key-down handler run.
+    func suspendEngine() {
+        lock.lock()
+        let recording = isRecording
+        lock.unlock()
+        guard isEngineRunning, !recording else { return }
+
+        audioEngine.stop()
+        isEngineRunning = false
+
+        // Minutes-old ambient audio must not be prepended to the next dictation as pre-roll.
+        lock.lock()
+        preRollRingBuffer.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    // Re-acquires the microphone after an idle suspend (~50-200ms hardware spin-up, blocking).
+    func resumeEngine() -> Bool {
+        guard !isEngineRunning else { return true }
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            isEngineRunning = true
+            return true
+        } catch {
+            Logger.error("MIC", "Could not restart AVAudioEngine after idle: \(error.localizedDescription)")
             return false
         }
     }
@@ -2652,12 +2692,19 @@ final class FloatingHUD {
     }
 
     // Transcript line; caret appends a slim tinted insertion mark while text is streaming.
-    private func setTranscript(_ text: String, color: NSColor, caret: Bool) {
+    // Truncation MUST ride inside the attributed string: a label rendering attributedStringValue
+    // takes its line-break mode from the string's NSParagraphStyle, not the cell - which is why
+    // setting transcriptLabel.lineBreakMode alone never worked. While streaming, truncate the
+    // HEAD so the newest words flow into view; finished text truncates the tail as usual.
+    private func setTranscript(_ text: String, color: NSColor, caret: Bool, truncation: NSLineBreakMode = .byTruncatingTail) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = truncation
         let body = NSMutableAttributedString(
             string: text,
             attributes: [
                 .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
-                .foregroundColor: color
+                .foregroundColor: color,
+                .paragraphStyle: paragraph
             ]
         )
         if caret {
@@ -2665,7 +2712,8 @@ final class FloatingHUD {
                 string: " ▏",
                 attributes: [
                     .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
-                    .foregroundColor: AppleDesign.siriCyan
+                    .foregroundColor: AppleDesign.siriCyan,
+                    .paragraphStyle: paragraph
                 ]
             ))
         }
@@ -2741,8 +2789,7 @@ final class FloatingHUD {
 
         // While streaming, the newest words matter most: truncate at the head so the tail
         // of the sentence is always visible, with a slim caret marking the live edge.
-        transcriptLabel.lineBreakMode = .byTruncatingHead
-        setTranscript(clean, color: .white, caret: true)
+        setTranscript(clean, color: .white, caret: true, truncation: .byTruncatingHead)
 
         // Fluid Dynamic Island auto-expansion based on text width
         let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 13.5)
@@ -2850,6 +2897,27 @@ final class JustSpeakApp {
     private var turnSettled: Bool = false
     private var pendingFallbackTimer: DispatchWorkItem?
 
+    // Main-thread-only: pending mic release for MIC_IDLE_TIMEOUT. Cancelled on every key-down,
+    // re-armed whenever a turn finishes.
+    private var micIdleWorkItem: DispatchWorkItem?
+
+    /// Main-thread-only. Schedules the mic to be released after the configured idle window so
+    /// the macOS mic indicator turns off between dictation sessions; 0 disables the timeout.
+    private func scheduleMicIdleRelease() {
+        micIdleWorkItem?.cancel()
+        micIdleWorkItem = nil
+        guard config.micIdleTimeoutSec > 0 else { return }
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.micIdleWorkItem = nil
+            self.audioCapture.suspendEngine()
+            Logger.info("MIC", "Mic released after \(self.config.micIdleTimeoutSec)s idle - indicator off. Next key-down re-arms it.")
+        }
+        micIdleWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(config.micIdleTimeoutSec), execute: item)
+    }
+
     // Retained so the GCD signal sources aren't deallocated once start() returns control to app.run()
     private var sigintSource: DispatchSourceSignal?
     private var sigtermSource: DispatchSourceSignal?
@@ -2918,6 +2986,10 @@ final class JustSpeakApp {
             exit(1)
         }
         
+        // The mic idle countdown starts at launch: no dictation for the configured window
+        // releases the mic until the next key-down.
+        scheduleMicIdleRelease()
+
         // Wire audio chunks to Gemini Live WebSocket streaming
         audioCapture.onAudioChunk = { [weak self] chunk in
             self?.liveClient?.sendAudioChunk(chunk)
@@ -2993,15 +3065,28 @@ final class JustSpeakApp {
             return
         }
         processingLock.unlock()
-        
+
+        micIdleWorkItem?.cancel()
+        micIdleWorkItem = nil
+
+        // Re-arm the mic if the idle timeout released it. The begin earcon plays only after
+        // the engine is actually capturing, so the sound always means "speak now" - never
+        // before a cold mic is ready.
+        if !audioCapture.isEngineRunning {
+            let wakeStart = CFAbsoluteTimeGetCurrent()
+            if audioCapture.resumeEngine() {
+                Logger.info("MIC", "Mic re-armed after idle (\(String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - wakeStart) * 1000.0))ms spin-up).")
+            }
+        }
+
         if config.soundFeedback {
             SoundManager.playStartSound()
         }
-        
+
         DispatchQueue.main.async { [weak self] in
             self?.hud?.showListening()
         }
-        
+
         liveClient?.startNewTurn()
         audioCapture.startRecording()
     }
@@ -3035,6 +3120,7 @@ final class JustSpeakApp {
             Logger.warn("INPUT", "Ignored short click (\(String(format: "%.0f", duration * 1000.0))ms). Hold key while speaking.")
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.hide()
+                self?.scheduleMicIdleRelease()
             }
             return
         }
@@ -3190,6 +3276,11 @@ final class JustSpeakApp {
             isProcessing = false
             processingLock.unlock()
         }
+
+        // Turn finished either way: start the mic idle countdown.
+        DispatchQueue.main.async { [weak self] in
+            self?.scheduleMicIdleRelease()
+        }
     }
 
     /// Runs on sessionQueue (called only from settle). isProcessing is cleared here at the end,
@@ -3273,6 +3364,7 @@ final class JustSpeakApp {
         Live WebSockets:   \(config.enableLiveWebSocket ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.yellow)Disabled (REST Only)\(ANSI.reset)")
         Smart Transcribe:  \(config.smartTranscription ? "\(ANSI.green)Enabled (ITN + Disfluency Removal)\(ANSI.reset)" : "\(ANSI.gray)Verbatim Only\(ANSI.reset)")
         VAD Mode:          \(config.vadMode == "manual" ? "\(ANSI.green)Manual (push-to-talk defines speech bounds)\(ANSI.reset)" : config.vadMode == "tuned" ? "\(ANSI.yellow)Tuned Server VAD (\(config.vadSilenceMs)ms silence window)\(ANSI.reset)" : "\(ANSI.gray)Auto (stock server VAD)\(ANSI.reset)")
+        Mic Idle Timeout:  \(config.micIdleTimeoutSec > 0 ? "\(ANSI.green)\(config.micIdleTimeoutSec)s (indicator turns off when idle)\(ANSI.reset)" : "\(ANSI.gray)Disabled (mic always on)\(ANSI.reset)")
         Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")
         Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
         Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
