@@ -105,6 +105,8 @@ struct Config {
     var restFallbackTimeout: Double = 4.0
     var preRollMs: Int = 400
     var postRollMs: Int = 100
+    var vadMode: String = "manual" // "manual" (PTT key defines speech bounds), "tuned", or "auto"
+    var vadSilenceMs: Int = 1500
     var restoreClipboard: Bool = true
     var logLevel: String = "verbose"
     
@@ -191,6 +193,8 @@ struct Config {
                         case "REST_FALLBACK_TIMEOUT": if let t = Double(value) { config.restFallbackTimeout = t }
                         case "PRE_ROLL_MS": if let ms = Int(value) { config.preRollMs = min(1000, max(0, ms)) }
                         case "POST_ROLL_MS": if let ms = Int(value) { config.postRollMs = min(500, max(0, ms)) }
+                        case "VAD_MODE": if ["manual", "tuned", "auto"].contains(value.lowercased()) { config.vadMode = value.lowercased() }
+                        case "VAD_SILENCE_MS": if let ms = Int(value) { config.vadSilenceMs = min(5000, max(200, ms)) }
                         case "LOG_LEVEL": config.logLevel = value.lowercased()
                         default: break
                         }
@@ -217,6 +221,8 @@ struct Config {
         if let timeout = env["REST_FALLBACK_TIMEOUT"], let t = Double(timeout) { config.restFallbackTimeout = t }
         if let preRoll = env["PRE_ROLL_MS"], let ms = Int(preRoll) { config.preRollMs = min(1000, max(0, ms)) }
         if let postRoll = env["POST_ROLL_MS"], let ms = Int(postRoll) { config.postRollMs = min(500, max(0, ms)) }
+        if let vad = env["VAD_MODE"], ["manual", "tuned", "auto"].contains(vad.lowercased()) { config.vadMode = vad.lowercased() }
+        if let vadSilence = env["VAD_SILENCE_MS"], let ms = Int(vadSilence) { config.vadSilenceMs = min(5000, max(200, ms)) }
         if let log = env["LOG_LEVEL"] { config.logLevel = log.lowercased() }
         
         if let raw = rawLanguages {
@@ -780,6 +786,15 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private let smartTranscription: Bool
     private let languageCodes: [String]
     private let customVocabulary: [String]
+    private let vadMode: String
+    private let vadSilenceMs: Int
+
+    // Conversational models always run with server VAD disabled (their setup hard-codes it);
+    // transcribe models do so when VAD_MODE=manual. Either way the client must bracket each
+    // turn with explicit activityStart/activityEnd signals.
+    private var usesManualActivity: Bool {
+        !model.contains("transcribe") || vadMode == "manual"
+    }
     
     // Event-driven settlement timers for transcribe-model turn completion (see commitTurn/attemptSettle).
     private static let settleMinPostCommitWait: Double = 0.35
@@ -802,13 +817,17 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         model: String = "gemini-3.5-transcribe-live",
         smartTranscription: Bool = true,
         languageCodes: [String] = ["en", "mr"],
-        customVocabulary: [String] = []
+        customVocabulary: [String] = [],
+        vadMode: String = "manual",
+        vadSilenceMs: Int = 1500
     ) {
         self.apiKey = apiKey
         self.model = model
         self.smartTranscription = smartTranscription
         self.languageCodes = languageCodes
         self.customVocabulary = customVocabulary
+        self.vadMode = vadMode
+        self.vadSilenceMs = vadSilenceMs
         super.init()
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
@@ -843,31 +862,54 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private func sendSetupMessage() {
         let setupPayload: [String: Any]
         if model.contains("transcribe") {
-            // Dedicated STT Live Streaming Model with Smart Transcription, Language Detection & Custom Vocabulary
-            var audioConfig: [String: Any] = [:]
-            if smartTranscription {
-                audioConfig["mode"] = "SMART"
-            }
+            // Dedicated STT Live Streaming Model. Documented setup shape (live-transcribe guide):
+            // transcription options live in top-level setup.inputAudioTranscription - NOT inside
+            // generationConfig - so mode/languages/vocabulary are actually honored by the server.
+            var transcriptionConfig: [String: Any] = [
+                "mode": smartTranscription ? "SMART" : "VERBATIM"
+            ]
             if !languageCodes.isEmpty {
-                audioConfig["languageCodes"] = languageCodes
+                transcriptionConfig["languageCodes"] = languageCodes
             }
             if !customVocabulary.isEmpty {
-                audioConfig["customVocabulary"] = customVocabulary
+                transcriptionConfig["customVocabulary"] = customVocabulary
             }
-            
-            var genConfig: [String: Any] = [
-                "responseModalities": ["TEXT"]
+
+            var setup: [String: Any] = [
+                "model": "models/\(model)",
+                "generationConfig": [
+                    "responseModalities": ["TEXT"]
+                ],
+                "inputAudioTranscription": transcriptionConfig
             ]
-            if !audioConfig.isEmpty {
-                genConfig["audioTranscriptionConfig"] = audioConfig
-            }
-            
-            setupPayload = [
-                "setup": [
-                    "model": "models/\(model)",
-                    "generationConfig": genConfig
+
+            // Push-to-talk owns the ground truth of when speech starts and ends (the key hold),
+            // so the default is manual activity signaling: server VAD otherwise declares
+            // end-of-speech at natural pauses and stops transcribing mid-hold.
+            switch vadMode {
+            case "manual":
+                setup["realtimeInputConfig"] = [
+                    "automaticActivityDetection": ["disabled": true]
                 ]
-            ]
+            case "tuned":
+                // Server VAD stays on but is made maximally pause-tolerant. These generic Live
+                // API fields are not documented for the transcribe model specifically; a setup
+                // rejection is surfaced by the server-error log line - fall back to VAD_MODE=auto.
+                setup["realtimeInputConfig"] = [
+                    "automaticActivityDetection": [
+                        "disabled": false,
+                        "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
+                        "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                        "silenceDurationMs": vadSilenceMs
+                    ],
+                    "turnCoverage": "TURN_INCLUDES_ALL_INPUT"
+                ]
+            default:
+                // "auto": stock server-side VAD, no realtimeInputConfig sent.
+                break
+            }
+
+            setupPayload = ["setup": setup]
         } else {
             // Multimodal Conversational Audio Model with manual activity detection
             var instruction = """
@@ -1236,8 +1278,9 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.turnCompletion = nil
         lock.unlock()
         
-        // Dispatch manual activityStart signal for conversational models
-        if !model.contains("transcribe") {
+        // Dispatch manual activityStart: the key press IS the start of speech whenever
+        // server VAD is disabled (conversational models always; transcribe in manual mode)
+        if usesManualActivity {
             let startPayload: [String: Any] = [
                 "realtimeInput": [
                     "activityStart": [:]
@@ -1289,8 +1332,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             webSocketTask?.send(.string(endAudioStr)) { _ in }
         }
         
-        // 2. Dispatch manual activityEnd signal for conversational models
-        if !model.contains("transcribe") {
+        // 2. Dispatch manual activityEnd: the key release IS the end of speech whenever
+        // server VAD is disabled (after audioStreamEnd so all buffered audio lands inside
+        // the activity window)
+        if usesManualActivity {
             let endPayload: [String: Any] = [
                 "realtimeInput": [
                     "activityEnd": [:]
@@ -2776,7 +2821,9 @@ final class JustSpeakApp {
                 model: config.geminiLiveModel,
                 smartTranscription: config.smartTranscription,
                 languageCodes: config.languageCodes,
-                customVocabulary: config.customVocabulary
+                customVocabulary: config.customVocabulary,
+                vadMode: config.vadMode,
+                vadSilenceMs: config.vadSilenceMs
             )
         }
         if config.showHUD {
@@ -3183,6 +3230,7 @@ final class JustSpeakApp {
         Configured Hotkey: \(ANSI.bold)\(config.hotkey)\(ANSI.reset) (\(config.hotkeyMode))
         Live WebSockets:   \(config.enableLiveWebSocket ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.yellow)Disabled (REST Only)\(ANSI.reset)")
         Smart Transcribe:  \(config.smartTranscription ? "\(ANSI.green)Enabled (ITN + Disfluency Removal)\(ANSI.reset)" : "\(ANSI.gray)Verbatim Only\(ANSI.reset)")
+        VAD Mode:          \(config.vadMode == "manual" ? "\(ANSI.green)Manual (push-to-talk defines speech bounds)\(ANSI.reset)" : config.vadMode == "tuned" ? "\(ANSI.yellow)Tuned Server VAD (\(config.vadSilenceMs)ms silence window)\(ANSI.reset)" : "\(ANSI.gray)Auto (stock server VAD)\(ANSI.reset)")
         Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")
         Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
         Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
