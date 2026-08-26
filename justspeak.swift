@@ -103,6 +103,7 @@ struct Config {
     var showHUD: Bool = true
     var enableLiveWebSocket: Bool = true
     var restFallbackTimeout: Double = 4.0
+    var preRollMs: Int = 400
     var postRollMs: Int = 100
     var restoreClipboard: Bool = true
     var logLevel: String = "verbose"
@@ -188,6 +189,7 @@ struct Config {
                         case "ENABLE_LIVE_WEBSOCKET": config.enableLiveWebSocket = (value.lowercased() == "true" || value == "1")
                         case "RESTORE_CLIPBOARD": config.restoreClipboard = (value.lowercased() == "true" || value == "1")
                         case "REST_FALLBACK_TIMEOUT": if let t = Double(value) { config.restFallbackTimeout = t }
+                        case "PRE_ROLL_MS": if let ms = Int(value) { config.preRollMs = min(1000, max(0, ms)) }
                         case "POST_ROLL_MS": if let ms = Int(value) { config.postRollMs = min(500, max(0, ms)) }
                         case "LOG_LEVEL": config.logLevel = value.lowercased()
                         default: break
@@ -213,6 +215,7 @@ struct Config {
         if let ws = env["ENABLE_LIVE_WEBSOCKET"] { config.enableLiveWebSocket = (ws.lowercased() == "true" || ws == "1") }
         if let r = env["RESTORE_CLIPBOARD"] { config.restoreClipboard = (r.lowercased() == "true" || r == "1") }
         if let timeout = env["REST_FALLBACK_TIMEOUT"], let t = Double(timeout) { config.restFallbackTimeout = t }
+        if let preRoll = env["PRE_ROLL_MS"], let ms = Int(preRoll) { config.preRollMs = min(1000, max(0, ms)) }
         if let postRoll = env["POST_ROLL_MS"], let ms = Int(postRoll) { config.postRollMs = min(500, max(0, ms)) }
         if let log = env["LOG_LEVEL"] { config.logLevel = log.lowercased() }
         
@@ -501,9 +504,9 @@ final class AudioCaptureEngine {
     private var recordingStartTime: CFAbsoluteTime = 0
     private var lastMeterUpdateTime: CFAbsoluteTime = 0
     
-    // Pre-roll rolling ring buffer (~250ms = 4000 samples @ 16kHz = 8000 bytes)
+    // Pre-roll rolling ring buffer (default 400ms = 6400 samples @ 16kHz = 12800 bytes)
     private var preRollRingBuffer = Data()
-    private let maxPreRollBytes = 8000
+    private let maxPreRollBytes: Int
     private var preRollBytesInTurn = 0
     
     // Streaming chunk accumulator (~150ms chunks = 4800 bytes)
@@ -513,7 +516,7 @@ final class AudioCaptureEngine {
     var onAudioChunk: ((Data) -> Void)?
     var onAudioLevel: ((Double) -> Void)?
     
-    init() {
+    init(preRollMs: Int = 400) {
         // Standard 16kHz 16-bit Mono Linear PCM for speech AI models
         self.targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -521,6 +524,8 @@ final class AudioCaptureEngine {
             channels: 1,
             interleaved: true
         )!
+        // 16,000 samples/sec * 2 bytes/sample = 32 bytes per ms
+        self.maxPreRollBytes = max(0, preRollMs * 32)
     }
     
     func setup() -> Bool {
@@ -669,10 +674,11 @@ final class AudioCaptureEngine {
 
         // Prepend rolling pre-roll buffer to prevent clipped first syllable
         preRollBytesInTurn = 0
+        var immediatePreRollChunk: Data? = nil
         if !preRollRingBuffer.isEmpty {
             preRollBytesInTurn = preRollRingBuffer.count
             recordedPCMData.append(preRollRingBuffer)
-            pendingChunkBuffer.append(preRollRingBuffer)
+            immediatePreRollChunk = preRollRingBuffer
             preRollRingBuffer.removeAll(keepingCapacity: true)
         }
         
@@ -681,6 +687,11 @@ final class AudioCaptureEngine {
         lastMeterUpdateTime = 0
         isRecording = true
         lock.unlock()
+
+        // Immediately dispatch pre-roll audio to WebSocket so speech model receives head-start audio
+        if let chunk = immediatePreRollChunk {
+            onAudioChunk?(chunk)
+        }
     }
     
     func stopRecording(gracePeriodMs: Int = 150) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int) {
@@ -2554,7 +2565,7 @@ final class FloatingHUD {
 
 final class JustSpeakApp {
     private let config: Config
-    private let audioCapture = AudioCaptureEngine()
+    private let audioCapture: AudioCaptureEngine
     private var liveClient: GeminiLiveClient?
     private var hotkeyManager: HotkeyManager?
     private var hud: FloatingHUD?
@@ -2580,6 +2591,7 @@ final class JustSpeakApp {
 
     init(config: Config) {
         self.config = config
+        self.audioCapture = AudioCaptureEngine(preRollMs: config.preRollMs)
         if config.enableLiveWebSocket && !config.geminiApiKey.isEmpty {
             self.liveClient = GeminiLiveClient(
                 apiKey: config.geminiApiKey,
