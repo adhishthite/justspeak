@@ -32,7 +32,7 @@ final class SoundManager {
     private static var commitSound: NSSound? = {
         for path in commitSoundPaths {
             if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
-                sound.volume = 0.65
+                sound.volume = 0.45
                 return sound
             }
         }
