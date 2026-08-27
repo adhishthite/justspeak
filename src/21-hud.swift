@@ -13,6 +13,10 @@ final class FloatingHUD {
     private let waveformView: AppleSiriWaveformView
 
     private var hideWorkItem: DispatchWorkItem?
+    // Single shared display tick for the aura and orb (they used to run two independent
+    // 60Hz timers). 30Hz - these elements are small and animate slowly; per-tick phase
+    // increments in the views were doubled to keep the on-screen tempo identical.
+    private var displayTimer: Timer?
     private var currentWidth: CGFloat = 330
     private let minPillWidth: CGFloat = 330
     private let maxPillWidth: CGFloat = 520
@@ -170,6 +174,27 @@ final class FloatingHUD {
         notchGlowView.needsDisplay = true
     }
 
+    // Reduced motion disables the continuous animation entirely (not just the entrance
+    // slide): the views draw one static frame and redraw only on state changes.
+    private func startDisplayTick() {
+        guard displayTimer == nil else { return }
+        notchGlowView.needsDisplay = true
+        orbIcon.needsDisplay = true
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.notchGlowView.advanceFrame()
+            self.orbIcon.advanceFrame()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        displayTimer = timer
+    }
+
+    private func stopDisplayTick() {
+        displayTimer?.invalidate()
+        displayTimer = nil
+    }
+
     private func updatePillWidth(targetWidth: CGFloat) {
         let clamped = max(minPillWidth, min(maxPillWidth, targetWidth))
         guard abs(clamped - currentWidth) > 8.0 else { return }
@@ -255,12 +280,11 @@ final class FloatingHUD {
         }
         notchGlowView.state = .listening
         notchGlowView.audioLevel = 0.0
-        notchGlowView.startAnimation()
 
         // Pill Layout & Content
         orbIcon.state = .listening
         orbIcon.audioLevel = 0.0
-        orbIcon.startAnimation()
+        startDisplayTick()
         setHeader("Listening", color: NSColor(white: 1.0, alpha: 0.55))
         // The pill appears on key-down, so the user is already holding: say what to do next.
         setTranscript("Speak, then release to paste", color: NSColor(white: 1.0, alpha: 0.45), caret: false)
@@ -334,6 +358,10 @@ final class FloatingHUD {
 
     func showSuccess(text: String) {
         hideWorkItem?.cancel()
+        // Success visuals are static (fixed tint, checkmark) - freeze the tick immediately
+        // instead of redrawing an unchanging frame at full rate for the display window; the
+        // views' state didSets request the one final redraw.
+        stopDisplayTick()
         notchGlowView.state = .success
         orbIcon.state = .success
 
@@ -352,6 +380,8 @@ final class FloatingHUD {
 
     func showError(message: String) {
         hideWorkItem?.cancel()
+        // Static frame, same reasoning as showSuccess.
+        stopDisplayTick()
         notchGlowView.state = .error
         orbIcon.state = .error
 
@@ -385,8 +415,7 @@ final class FloatingHUD {
                 if self.notchPanel.alphaValue == 0.0 {
                     self.notchPanel.orderOut(nil)
                     self.pillPanel.orderOut(nil)
-                    self.notchGlowView.stopAnimation()
-                    self.orbIcon.stopAnimation()
+                    self.stopDisplayTick()
                 }
             })
     }

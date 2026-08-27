@@ -1,6 +1,10 @@
 // MARK: - Apple Intelligence & macOS Human Interface Design Palette
 
 enum AppleDesign {
+    // Created once: CGColorSpace(name:) allocates on every call, and both HUD views need
+    // this per frame.
+    static let p3ColorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+
     // Apple Intelligence Display P3 Wide-Gamut Palette
     static let siriCyan = NSColor(displayP3Red: 0.00, green: 0.82, blue: 1.00, alpha: 1.0)  // #00D1FF
     static let siriIndigo = NSColor(displayP3Red: 0.44, green: 0.24, blue: 0.96, alpha: 1.0)  // #703DF5

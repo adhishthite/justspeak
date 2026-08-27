@@ -11,14 +11,19 @@ final class AppleNotchAuraView: NSView {
 
     var notchRect: NSRect = .zero
     var audioLevel: CGFloat = 0.0  // 0.0 ... 1.0
-    var state: GlowState = .idle
+    // didSet redraw so state changes land even when the shared display tick is stopped
+    // (static success/error frames, reduced motion).
+    var state: GlowState = .idle {
+        didSet {
+            needsDisplay = true
+        }
+    }
     // Displays without a hardware notch have no bezel to illuminate; the aura rings
     // the floating pill instead. pillSize tracks the pill's live width as it expands.
     var pillMode: Bool = false
     var pillSize: CGSize = .zero
 
     private var phase: CGFloat = 0.0
-    private var displayTimer: Timer?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -32,23 +37,15 @@ final class AppleNotchAuraView: NSView {
         self.layer?.masksToBounds = false
     }
 
-    func startAnimation() {
-        displayTimer?.invalidate()
-        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            // One full 5-color loop: ~14s while listening (each hue holds ~1.7s, fades ~1.1s);
-            // processing triples the tempo so the wait reads as activity.
-            let speed: CGFloat = (self.state == .processing) ? 0.0036 : 0.0012
-            self.phase = (self.phase + speed).truncatingRemainder(dividingBy: 1.0)
-            self.needsDisplay = true
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        self.displayTimer = timer
-    }
-
-    func stopAnimation() {
-        displayTimer?.invalidate()
-        displayTimer = nil
+    // Driven by FloatingHUD's single shared 30Hz display tick (the aura and orb used to run
+    // independent 60Hz timers). Per-tick increments are doubled from the old 60Hz values so
+    // the on-screen tempo is unchanged: one full 5-color loop stays ~14s while listening
+    // (each hue holds ~1.7s, fades ~1.1s); processing triples the tempo so the wait reads
+    // as activity.
+    func advanceFrame() {
+        let speed: CGFloat = (state == .processing) ? 0.0072 : 0.0024
+        phase = (phase + speed).truncatingRemainder(dividingBy: 1.0)
+        needsDisplay = true
     }
 
     // outset dilates the path beyond the hardware cutout: a stroke centered on the exact
@@ -117,7 +114,7 @@ final class AppleNotchAuraView: NSView {
         let halfSpan = notchRect.width / 2.0 + 46.0
         let centerAlpha: CGFloat = 0.26 + 0.30 * energy
 
-        let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        let colorSpace = AppleDesign.p3ColorSpace
         let poolColors =
             [
                 tint.withAlphaComponent(centerAlpha).cgColor,

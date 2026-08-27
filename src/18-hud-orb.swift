@@ -21,7 +21,6 @@ final class AppleIntelligenceOrbView: NSView {
     }
 
     private var phase: CGFloat = 0.0
-    private var displayTimer: Timer?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -33,21 +32,12 @@ final class AppleIntelligenceOrbView: NSView {
         self.wantsLayer = true
     }
 
-    func startAnimation() {
-        displayTimer?.invalidate()
-        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            let speed: CGFloat = (self.state == .processing) ? 0.030 : 0.010
-            self.phase = (self.phase + speed).truncatingRemainder(dividingBy: 1.0)
-            self.needsDisplay = true
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        self.displayTimer = timer
-    }
-
-    func stopAnimation() {
-        displayTimer?.invalidate()
-        displayTimer = nil
+    // Driven by FloatingHUD's single shared 30Hz display tick; increments doubled from the
+    // old per-view 60Hz timer so the on-screen tempo is unchanged.
+    func advanceFrame() {
+        let speed: CGFloat = (state == .processing) ? 0.060 : 0.020
+        phase = (phase + speed).truncatingRemainder(dividingBy: 1.0)
+        needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -73,7 +63,7 @@ final class AppleIntelligenceOrbView: NSView {
 
     private func drawLivingOrb(in context: CGContext, center: CGPoint, maxRadius: CGFloat) {
         let baseRadius = maxRadius * (0.75 + 0.35 * audioLevel)
-        let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        let colorSpace = AppleDesign.p3ColorSpace
 
         // 3 Overlapping pulsating chromatic lobes
         let lobes = 3
