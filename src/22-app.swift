@@ -46,6 +46,13 @@ final class JustSpeakApp {
     private var turnFrontmostName: String?
     private var turnFrontmostBundleId: String?
 
+    // sessionQueue-only, set once per turn: the clip's silence-gate evidence (from
+    // stopRecording's accumulators) and, for WS turns, which settlement rule fired -
+    // stamped onto this turn's history rows so the A/B knobs can be tuned from real data.
+    private var turnPeakDb: Double?
+    private var turnSpeechFrames: Int?
+    private var turnSettlePath: String?
+
     // Serial queue that owns all turn lifecycle state below. Both the WS commit completion and
     // the REST fallback timer used to race directly against a captured `var didFallback` bool
     // with no synchronization, so a slow-arriving WS result and a just-fired fallback timer could
@@ -356,6 +363,9 @@ final class JustSpeakApp {
         let pipelineStartTime = CFAbsoluteTimeGetCurrent()
         let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(
             gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
+        turnPeakDb = peakDb
+        turnSpeechFrames = speechFrames
+        turnSettlePath = nil
 
         // Discard accidental micro-clicks (< 150ms or < 2KB of real captured audio, ignoring
         // the fixed pre-roll/silence-flush padding that stopRecording always appends).
@@ -411,7 +421,9 @@ final class JustSpeakApp {
                     vadMode: config.vadMode,
                     error: nil,
                     appBundleId: turnFrontmostBundleId,
-                    appName: turnFrontmostName
+                    appName: turnFrontmostName,
+                    peakDb: peakDb,
+                    speechFrames: speechFrames
                 ))
             processingLock.lock()
             isProcessing = false
@@ -453,6 +465,7 @@ final class JustSpeakApp {
                     case .success(let payload):
                         let roundtripMs = (CFAbsoluteTimeGetCurrent() - commitStartTime) * 1000.0
                         let usage = self.liveClient?.lastTurnUsage
+                        self.turnSettlePath = self.liveClient?.lastSettlePath
                         self.settle(
                             turnId: turnId, route: "WS",
                             outcome: .success(
@@ -484,6 +497,7 @@ final class JustSpeakApp {
                         let nsError = error as NSError
                         if nsError.domain == "JustSpeak", nsError.code == -2, speechFrames < self.wsNoSpeechTrustFrames {
                             Logger.warn("WS", "No speech recognized (\(speechFrames) speech frames in clip); settling empty - REST fallback suppressed.")
+                            self.turnSettlePath = self.liveClient?.lastSettlePath
                             self.settle(turnId: turnId, route: "WS", outcome: .empty(audioDuration: duration))
                             return
                         }
@@ -691,7 +705,10 @@ final class JustSpeakApp {
                     vadMode: config.vadMode,
                     error: nil,
                     appBundleId: turnFrontmostBundleId,
-                    appName: turnFrontmostName
+                    appName: turnFrontmostName,
+                    peakDb: turnPeakDb,
+                    speechFrames: turnSpeechFrames,
+                    settlePath: turnSettlePath
                 ))
             processingLock.lock()
             isProcessing = false
@@ -730,7 +747,10 @@ final class JustSpeakApp {
                     vadMode: config.vadMode,
                     error: error.localizedDescription,
                     appBundleId: turnFrontmostBundleId,
-                    appName: turnFrontmostName
+                    appName: turnFrontmostName,
+                    peakDb: turnPeakDb,
+                    speechFrames: turnSpeechFrames,
+                    settlePath: turnSettlePath
                 ))
             processingLock.lock()
             isProcessing = false
@@ -790,7 +810,10 @@ final class JustSpeakApp {
                     vadMode: config.vadMode,
                     error: nil,
                     appBundleId: turnFrontmostBundleId,
-                    appName: turnFrontmostName
+                    appName: turnFrontmostName,
+                    peakDb: turnPeakDb,
+                    speechFrames: turnSpeechFrames,
+                    settlePath: turnSettlePath
                 ))
             processingLock.lock()
             isProcessing = false
@@ -939,7 +962,10 @@ final class JustSpeakApp {
                 vadMode: config.vadMode,
                 error: nil,
                 appBundleId: turnFrontmostBundleId,
-                appName: turnFrontmostName
+                appName: turnFrontmostName,
+                peakDb: turnPeakDb,
+                speechFrames: turnSpeechFrames,
+                settlePath: turnSettlePath
             ))
 
         print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")

@@ -35,6 +35,12 @@ final class TranscriptionHistoryStore {
         // App that was frontmost at key-down - where the dictation was aimed.
         var appBundleId: String?
         var appName: String?
+        // Silence-gate evidence for the clip (tunes TRAIL_SILENCE_DB / SILENCE_FLUSH_MS
+        // against real dictations) and which settlement rule ended a WS turn (the thing
+        // WS_ENDPOINT_ALIGNED changes). Defaulted so rows without the data store NULL.
+        var peakDb: Double? = nil
+        var speechFrames: Int? = nil
+        var settlePath: String? = nil
     }
 
     private let queue = DispatchQueue(label: "com.justspeak.history", qos: .utility)
@@ -44,11 +50,20 @@ final class TranscriptionHistoryStore {
     private let sessionId = UUID().uuidString
     private static let isoFormatter = ISO8601DateFormatter()
 
+    // A/B knob values, constant per process, stamped onto every row so experiment eras are
+    // separable by config rather than by timestamp archaeology.
+    private let endpointAligned: Bool
+    private let chunkMs: Int
+    private let silenceFlushMs: Int
+
     var path: String { dbPath }
 
     init(config: Config) {
         let rawPath = config.historyDbPath.isEmpty ? "~/.justspeak/history.db" : config.historyDbPath
         self.dbPath = (rawPath as NSString).expandingTildeInPath
+        self.endpointAligned = config.wsEndpointAligned
+        self.chunkMs = config.chunkMs
+        self.silenceFlushMs = config.silenceFlushMs
     }
 
     // Called on-queue from record(). No-ops once already open or once opening has failed.
@@ -112,7 +127,13 @@ final class TranscriptionHistoryStore {
               vad_mode TEXT,
               error TEXT,
               app_bundle_id TEXT,
-              app_name TEXT
+              app_name TEXT,
+              peak_db REAL,
+              speech_frames INTEGER,
+              settle_path TEXT,
+              endpoint_aligned INTEGER,
+              chunk_ms INTEGER,
+              silence_flush_ms INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_transcriptions_ts ON transcriptions(ts_epoch);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id);
@@ -130,6 +151,12 @@ final class TranscriptionHistoryStore {
         for migration in [
             "ALTER TABLE transcriptions ADD COLUMN app_bundle_id TEXT",
             "ALTER TABLE transcriptions ADD COLUMN app_name TEXT",
+            "ALTER TABLE transcriptions ADD COLUMN peak_db REAL",
+            "ALTER TABLE transcriptions ADD COLUMN speech_frames INTEGER",
+            "ALTER TABLE transcriptions ADD COLUMN settle_path TEXT",
+            "ALTER TABLE transcriptions ADD COLUMN endpoint_aligned INTEGER",
+            "ALTER TABLE transcriptions ADD COLUMN chunk_ms INTEGER",
+            "ALTER TABLE transcriptions ADD COLUMN silence_flush_ms INTEGER",
         ] {
             sqlite3_exec(opened, migration, nil, nil, nil)
         }
@@ -181,8 +208,9 @@ final class TranscriptionHistoryStore {
                   transport, model, is_live_route, fallback_reason, audio_seconds,
                   first_token_ms, roundtrip_ms, capture_finalize_ms, inject_ms, total_ms,
                   injected, input_tokens, output_tokens, tokens_metered, cost_usd,
-                  language_codes, smart_mode, vad_mode, error, app_bundle_id, app_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  language_codes, smart_mode, vad_mode, error, app_bundle_id, app_name,
+                  peak_db, speech_frames, settle_path, endpoint_aligned, chunk_ms, silence_flush_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
             var stmt: OpaquePointer?
@@ -222,6 +250,12 @@ final class TranscriptionHistoryStore {
             self.bindText(stmt, 26, r.error)
             self.bindText(stmt, 27, r.appBundleId)
             self.bindText(stmt, 28, r.appName)
+            self.bindDouble(stmt, 29, r.peakDb)
+            self.bindInt(stmt, 30, r.speechFrames)
+            self.bindText(stmt, 31, r.settlePath)
+            self.bindBool(stmt, 32, self.endpointAligned)
+            self.bindInt(stmt, 33, self.chunkMs)
+            self.bindInt(stmt, 34, self.silenceFlushMs)
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 self.failed = true

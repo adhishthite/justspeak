@@ -44,6 +44,15 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         guard dp > 0 || dr > 0 else { return nil }
         return (max(0, dp), max(0, dr))
     }
+    // Which settlement rule ended the last turn - the mechanism WS_ENDPOINT_ALIGNED changes,
+    // recorded per turn in history. Under `lock`; read via lastSettlePath after completion
+    // (same pattern as lastTurnUsage).
+    private var settlePathValue: String?
+    var lastSettlePath: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return settlePathValue
+    }
     private var isCommitting: Bool = false
     private var hasFiredTurnCompletion: Bool = false
     private var turnCompletion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?
@@ -417,6 +426,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             if (isTurnComplete || isGenComplete) && !currentTurnText.isEmpty && !hasFiredTurnCompletion {
                 hasFiredTurnCompletion = true
                 isCommitting = false
+                settlePathValue = "server_turn_complete"
                 settleWorkItem?.cancel()
                 settleWorkItem = nil
                 settleMaxWorkItem?.cancel()
@@ -537,19 +547,23 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         let postCommitFinalTime = lastPostCommitFinalTime
 
         var settleWithText = false
+        var firedRule = ""
         if let finalTime = postCommitFinalTime {
             // An authoritative final transcription landed: settle after only a short grace
             // (long enough for a trailing segment's final to displace this timer), with no
             // minimum-wait floor - waiting longer adds latency, not accuracy.
             settleWithText = !text.isEmpty && (now - finalTime) >= Self.settleFinalGrace
+            firedRule = "final_grace"
         } else if let postTime = postCommitTokenTime {
             // Only speculative interims so far. In manual-activity mode a final is expected,
             // so wait longer before pasting speculation; otherwise use the tight quiet window.
             let quietWindow = usesManualActivity ? Self.settleInterimQuietManual : Self.settleQuietWindow
             let quietSincePostToken = now - postTime
             settleWithText = elapsedCommit >= Self.settleMinPostCommitWait && !text.isEmpty && quietSincePostToken >= quietWindow
+            firedRule = "quiet_window"
         } else if !text.isEmpty && elapsedCommit >= Self.settleInitialWaitWithoutTokens {
             settleWithText = true
+            firedRule = "initial_wait"
         }
 
         let timedOut = !settleWithText && elapsedCommit >= Self.settleMaxWait
@@ -560,6 +574,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
 
         hasFiredTurnCompletion = true
         isCommitting = false
+        settlePathValue = timedOut ? "timeout" : firedRule
         settleWorkItem?.cancel()
         settleWorkItem = nil
         settleMaxWorkItem?.cancel()
@@ -592,6 +607,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.settleMaxWorkItem?.cancel()
         self.settleMaxWorkItem = nil
         self.isCommitting = false
+        self.settlePathValue = nil
         self.currentTurnText = ""
         self.committedTranscript = ""
         self.interimTranscript = ""
