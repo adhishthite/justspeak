@@ -6,10 +6,12 @@ final class SoundManager {
         "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_begin.caf",
     ]
 
+    // acknowledgment_sent (the soft "message sent" swoosh) leads: jbl_confirm reads loud and
+    // insistent next to the other cues even at low volume.
     private static let commitSoundPaths = [
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/acknowledgment_sent.caf",
         "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_confirm.caf",
         "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/end_record.caf",
-        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/acknowledgment_sent.caf",
     ]
 
     private static let errorSoundPaths = [
@@ -32,12 +34,12 @@ final class SoundManager {
     private static var commitSound: NSSound? = {
         for path in commitSoundPaths {
             if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
-                sound.volume = 0.35
+                sound.volume = 0.22
                 return sound
             }
         }
         let fallback = NSSound(named: "Hero")
-        fallback?.volume = 0.45
+        fallback?.volume = 0.3
         return fallback
     }()
 
