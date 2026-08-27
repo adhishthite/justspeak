@@ -44,14 +44,13 @@ final class AppleNotchAuraView: NSView {
         self.layer?.masksToBounds = false
     }
 
-    // Driven by FloatingHUD's single shared 30Hz display tick (the aura and orb used to run
-    // independent 60Hz timers). Per-tick increments are doubled from the old 60Hz values so
-    // the on-screen tempo is unchanged: one full 5-color loop stays ~14s while listening
+    // Driven per display frame by FloatingHUD's spring tick; speeds are per-second so any
+    // tick cadence renders the same tempo: one full 5-color loop stays ~14s while listening
     // (each hue holds ~1.7s, fades ~1.1s); processing triples the tempo so the wait reads
     // as activity.
-    func advanceFrame() {
-        let speed: CGFloat = (state == .processing) ? 0.0072 : 0.0024
-        phase = (phase + speed).truncatingRemainder(dividingBy: 1.0)
+    func advance(dt: CGFloat) {
+        let speed: CGFloat = (state == .processing) ? 0.216 : 0.072
+        phase = (phase + speed * dt).truncatingRemainder(dividingBy: 1.0)
         needsDisplay = true
         updateEmitter()
     }

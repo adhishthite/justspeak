@@ -32,11 +32,11 @@ final class AppleIntelligenceOrbView: NSView {
         self.wantsLayer = true
     }
 
-    // Driven by FloatingHUD's single shared 30Hz display tick; increments doubled from the
-    // old per-view 60Hz timer so the on-screen tempo is unchanged.
-    func advanceFrame() {
-        let speed: CGFloat = (state == .processing) ? 0.060 : 0.020
-        phase = (phase + speed).truncatingRemainder(dividingBy: 1.0)
+    // Driven per display frame by FloatingHUD's spring tick; speeds are per-second so any
+    // tick cadence renders the same tempo.
+    func advance(dt: CGFloat) {
+        let speed: CGFloat = (state == .processing) ? 1.8 : 0.60
+        phase = (phase + speed * dt).truncatingRemainder(dividingBy: 1.0)
         needsDisplay = true
     }
 
