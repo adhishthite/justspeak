@@ -19,7 +19,7 @@ struct Config {
     var customVocabularyFile: String = ""
     var replacementRules: [ReplacementRule] = []
     var hotkey: String = "right_option"
-    var hotkeyMode: String = "push_to_talk" // "push_to_talk" or "toggle"
+    var hotkeyMode: String = "push_to_talk"  // "push_to_talk" or "toggle"
     var soundFeedback: Bool = true
     var showHUD: Bool = true
     var enableLiveWebSocket: Bool = true
@@ -36,16 +36,16 @@ struct Config {
     // RMS dBFS below which the mic is considered quiet (speech typically -30 to -15, room
     // noise -50 to -60 on this meter).
     var trailSilenceDb: Double = -40.0
-    var vadMode: String = "manual" // "manual" (PTT key defines speech bounds), "tuned", or "auto"
+    var vadMode: String = "manual"  // "manual" (PTT key defines speech bounds), "tuned", or "auto"
     var vadSilenceMs: Int = 1500
     // Release the mic (status-bar indicator off) after this many seconds without a dictation;
     // the next key-down re-arms it. 0 = keep the mic always on (lowest latency, indicator lit).
     var micIdleTimeoutSec: Int = 300
     // Token pricing (USD per 1M tokens), used only for the per-dictation cost line in the
     // diagnostics. Defaults match Aug 2026 public-preview pricing for the two default models.
-    var liveInputPricePer1M: Double = 3.50   // gemini-3.5-transcribe-live audio input
-    var liveOutputPricePer1M: Double = 21.00 // gemini-3.5-transcribe-live text output
-    var restInputPricePer1M: Double = 0.30   // gemini-3.5-flash-lite input
+    var liveInputPricePer1M: Double = 3.50  // gemini-3.5-transcribe-live audio input
+    var liveOutputPricePer1M: Double = 21.00  // gemini-3.5-transcribe-live text output
+    var restInputPricePer1M: Double = 0.30  // gemini-3.5-flash-lite input
     var restOutputPricePer1M: Double = 2.50  // gemini-3.5-flash-lite output
     var restoreClipboard: Bool = true
     // Append one trailing space to the injected/copied payload so back-to-back dictations
@@ -55,23 +55,24 @@ struct Config {
     // Local dictation history (SQLite). Every turn - success, empty, or error - becomes one row
     // so usage/latency/cost can be analyzed later. Plaintext on disk; disable with HISTORY=false.
     var historyEnabled: Bool = true
-    var historyDbPath: String = ""   // empty = ~/.justspeak/history.db
+    var historyDbPath: String = ""  // empty = ~/.justspeak/history.db
 
     static func parseVocabulary(from text: String) -> [String] {
         var items: [String] = []
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
             if let data = trimmed.data(using: .utf8),
-               let arr = try? JSONSerialization.jsonObject(with: data) as? [String] {
+                let arr = try? JSONSerialization.jsonObject(with: data) as? [String]
+            {
                 return arr.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
             }
         }
-        
+
         let lines = text.components(separatedBy: .newlines)
         for line in lines {
             let cleanLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if cleanLine.isEmpty || cleanLine.hasPrefix("#") { continue }
-            
+
             if cleanLine.contains(",") {
                 let parts = cleanLine.components(separatedBy: ",")
                 for part in parts {
@@ -130,27 +131,27 @@ struct Config {
         }
         return []
     }
-    
+
     static func load() -> Config {
         var config = Config()
         var inlineVocabRaw = ""
         var vocabFile = ""
         var rawLanguages: String? = nil
-        
+
         let currentDir = FileManager.default.currentDirectoryPath
         let execDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
         let envPaths = [
             "\(currentDir)/.env",
-            "\(execDir)/.env"
+            "\(execDir)/.env",
         ]
-        
+
         for envPath in envPaths {
             if let content = try? String(contentsOfFile: envPath, encoding: .utf8) {
                 let lines = content.components(separatedBy: .newlines)
                 for line in lines {
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                     if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
-                    
+
                     let parts = trimmed.split(separator: "=", maxSplits: 1).map(String.init)
                     if parts.count == 2 {
                         let key = parts[0].trimmingCharacters(in: .whitespaces)
@@ -158,7 +159,7 @@ struct Config {
                         if (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
                             value = String(value.dropFirst().dropLast())
                         }
-                        
+
                         switch key {
                         case "GEMINI_API_KEY": config.geminiApiKey = value
                         case "GEMINI_MODEL": config.geminiModel = value
@@ -196,7 +197,7 @@ struct Config {
                 break
             }
         }
-        
+
         let env = ProcessInfo.processInfo.environment
         if let key = env["GEMINI_API_KEY"], !key.isEmpty { config.geminiApiKey = key }
         if let model = env["GEMINI_MODEL"], !model.isEmpty { config.geminiModel = model }
@@ -227,7 +228,7 @@ struct Config {
         if let p = env["REST_INPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.restInputPricePer1M = v }
         if let p = env["REST_OUTPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.restOutputPricePer1M = v }
         if let log = env["LOG_LEVEL"] { config.logLevel = log.lowercased() }
-        
+
         if let raw = rawLanguages {
             let parsedLangs = raw.components(separatedBy: ",")
                 .map { normalizeLanguageCode($0) }
@@ -238,14 +239,14 @@ struct Config {
                 config.languageCodes = parsedLangs
             }
         }
-        
+
         config.customVocabularyFile = vocabFile
-        
+
         var combinedVocab: [String] = []
         if !inlineVocabRaw.isEmpty {
             combinedVocab.append(contentsOf: parseVocabulary(from: inlineVocabRaw))
         }
-        
+
         // Check specified vocabulary file or default candidate locations
         var candidateFiles: [String] = []
         if !vocabFile.isEmpty {
@@ -260,7 +261,7 @@ struct Config {
             candidateFiles.append("\(execDir)/vocabulary.txt")
             candidateFiles.append("\(execDir)/.vocabulary.txt")
         }
-        
+
         for candidate in candidateFiles {
             let items = loadVocabularyFile(path: candidate)
             if !items.isEmpty {
@@ -271,7 +272,7 @@ struct Config {
                 break
             }
         }
-        
+
         // Pull "wrong => right" replacement rules out of the raw items; the right-hand side
         // still boosts recognition - never the wrong form, which would just teach the
         // recognizer to keep mishearing it the same way.
@@ -290,9 +291,8 @@ struct Config {
             }
         }
         config.customVocabulary = deduped
-        
+
         Logger.isVerbose = (config.logLevel == "verbose")
         return config
     }
 }
-

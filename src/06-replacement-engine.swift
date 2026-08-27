@@ -33,12 +33,13 @@ enum ReplacementEngine {
     // WRONG side does ("NPM"->"npm" is a deliberate lowercase rule; ALL-CAPS propagation
     // would silently undo it) - or when wrong/right are the same word modulo case.
     static func propagateCase(from original: String, to replacement: String, wrong: String = "") -> String {
-        let hasExplicitCasing = replacement.dropFirst().contains(where: { $0.isUppercase })
+        let hasExplicitCasing =
+            replacement.dropFirst().contains(where: { $0.isUppercase })
             || replacement.first?.isUppercase == true
             || wrong.contains(where: { $0.isUppercase })
             || (!wrong.isEmpty && wrong.lowercased() == replacement.lowercased())
         if hasExplicitCasing {
-            return replacement // dictionary term carries its own casing (gRPC, iPhone)
+            return replacement  // dictionary term carries its own casing (gRPC, iPhone)
         }
         if original == original.uppercased(), original.count > 1 {
             return replacement.uppercased()
@@ -49,4 +50,3 @@ enum ReplacementEngine {
         return replacement
     }
 }
-

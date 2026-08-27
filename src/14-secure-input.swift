@@ -14,9 +14,11 @@ enum SecureInputMonitor {
         guard root != 0 else { return nil }
         defer { IOObjectRelease(root) }
 
-        guard let sessions = IORegistryEntryCreateCFProperty(
-            root, "IOConsoleUsers" as CFString, kCFAllocatorDefault, 0
-        )?.takeRetainedValue() as? [[String: Any]] else { return nil }
+        guard
+            let sessions = IORegistryEntryCreateCFProperty(
+                root, "IOConsoleUsers" as CFString, kCFAllocatorDefault, 0
+            )?.takeRetainedValue() as? [[String: Any]]
+        else { return nil }
 
         for session in sessions {
             guard let pid = session["kCGSSessionSecureInputPID"] as? Int32, pid != 0 else { continue }
@@ -25,4 +27,3 @@ enum SecureInputMonitor {
         return nil
     }
 }
-

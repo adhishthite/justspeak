@@ -100,10 +100,10 @@ final class JustSpeakApp {
         }
         self.history = config.historyEnabled ? TranscriptionHistoryStore(config: config) : nil
     }
-    
+
     func start() {
         printBanner()
-        
+
         // Handle SIGINT (Ctrl+C) and SIGTERM cleanly. C signal handlers must not call
         // async-signal-unsafe functions like print(), so ignore the raw signal and do the
         // actual work in a GCD dispatch source on the main queue instead.
@@ -126,7 +126,7 @@ final class JustSpeakApp {
         }
         sigterm.resume()
         self.sigtermSource = sigterm
-        
+
         // 0. Single-instance guard: two JustSpeak processes would double-paste every dictation.
         // flock is released by the kernel on ANY exit (crash included); the fd stays open for
         // the process lifetime on purpose - the lock lives on it.
@@ -149,19 +149,19 @@ final class JustSpeakApp {
                 Logger.error("PERM", "Missing Accessibility permission. Run 'make check-permissions' for help.")
             }
         }
-        
+
         // 2. Validate API Key
         if config.geminiApiKey.isEmpty {
             Logger.warn("CONFIG", "GEMINI_API_KEY is not set. Add your key to .env or export GEMINI_API_KEY.")
             Logger.warn("CONFIG", "Get your API key at: https://aistudio.google.com/")
         }
-        
+
         // 3. Initialize Audio Capture Engine
         guard audioCapture.setup() else {
             Logger.error("MAIN", "Failed to start Audio Capture Engine.")
             exit(1)
         }
-        
+
         // The mic idle countdown starts at launch: no dictation for the configured window
         // releases the mic until the next key-down.
         scheduleMicIdleRelease()
@@ -170,14 +170,14 @@ final class JustSpeakApp {
         audioCapture.onAudioChunk = { [weak self] chunk in
             self?.liveClient?.sendAudioChunk(chunk)
         }
-        
+
         // Wire audio level (dB) to Floating HUD
         audioCapture.onAudioLevel = { [weak self] db in
             DispatchQueue.main.async {
                 self?.hud?.updateAudioLevel(db: db)
             }
         }
-        
+
         // 4. Pre-warm Gemini Live WebSocket & wire streaming text to HUD
         if config.enableLiveWebSocket {
             liveClient?.onLiveTextUpdate = { [weak self] text in
@@ -208,15 +208,15 @@ final class JustSpeakApp {
         // 5. Setup Hotkey Listener
         let binding = HotkeyManager.KeyBinding.from(string: config.hotkey)
         let hotkey = HotkeyManager(binding: binding, mode: config.hotkeyMode)
-        
+
         hotkey.onKeyDown = { [weak self] in
             self?.handleKeyDown()
         }
-        
+
         hotkey.onKeyUp = { [weak self] in
             self?.handleKeyUp()
         }
-        
+
         // Sleep/wake hygiene: release the mic before sleep (suspendEngine refuses mid-dictation),
         // and force a fresh WS connection on wake - the socket often survives sleep in a
         // half-dead state where sends succeed but no server responses ever arrive.
@@ -243,16 +243,16 @@ final class JustSpeakApp {
             exit(1)
         }
         self.hotkeyManager = hotkey
-        
+
         Logger.success("READY", "JustSpeak active! Hold \(ANSI.bold)\(binding.name)\(ANSI.reset) to speak, release to paste.")
         print("\(ANSI.gray)Press Ctrl+C to quit at any time.\(ANSI.reset)\n")
-        
+
         // Run AppKit RunLoop with Accessory activation policy (no Dock icon, full window support)
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         app.run()
     }
-    
+
     private func handleKeyDown() {
         processingLock.lock()
         // Protect re-entrancy / double-tap race
@@ -380,7 +380,7 @@ final class JustSpeakApp {
         guard pcmData.count > guardBytes else { return 0 }
         let scanCount = pcmData.count - guardBytes
         let base = pcmData.startIndex
-        let frameBytes = 640 // 20ms of 16-bit mono @ 16kHz
+        let frameBytes = 640  // 20ms of 16-bit mono @ 16kHz
         var frames = 0
         var offset = 0
         while offset + frameBytes <= scanCount {
@@ -435,33 +435,34 @@ final class JustSpeakApp {
                 self?.hud?.showError(message: "No speech detected")
                 self?.scheduleMicIdleRelease()
             }
-            history?.record(TranscriptionHistoryStore.TurnRecord(
-                outcome: "empty",
-                text: nil,
-                charCount: 0,
-                wordCount: 0,
-                transport: nil,
-                model: nil,
-                isLiveRoute: nil,
-                fallbackReason: nil,
-                audioSeconds: duration,
-                firstTokenMs: nil,
-                roundtripMs: nil,
-                captureFinalizeMs: nil,
-                injectMs: nil,
-                totalMs: nil,
-                injected: nil,
-                inputTokens: nil,
-                outputTokens: nil,
-                tokensMetered: nil,
-                costUSD: nil,
-                languageCodes: config.languageCodes.joined(separator: ","),
-                smartMode: config.smartTranscription,
-                vadMode: config.vadMode,
-                error: nil,
-                appBundleId: turnFrontmostBundleId,
-                appName: turnFrontmostName
-            ))
+            history?.record(
+                TranscriptionHistoryStore.TurnRecord(
+                    outcome: "empty",
+                    text: nil,
+                    charCount: 0,
+                    wordCount: 0,
+                    transport: nil,
+                    model: nil,
+                    isLiveRoute: nil,
+                    fallbackReason: nil,
+                    audioSeconds: duration,
+                    firstTokenMs: nil,
+                    roundtripMs: nil,
+                    captureFinalizeMs: nil,
+                    injectMs: nil,
+                    totalMs: nil,
+                    injected: nil,
+                    inputTokens: nil,
+                    outputTokens: nil,
+                    tokensMetered: nil,
+                    costUSD: nil,
+                    languageCodes: config.languageCodes.joined(separator: ","),
+                    smartMode: config.smartTranscription,
+                    vadMode: config.vadMode,
+                    error: nil,
+                    appBundleId: turnFrontmostBundleId,
+                    appName: turnFrontmostName
+                ))
             processingLock.lock()
             isProcessing = false
             processingLock.unlock()
@@ -502,19 +503,21 @@ final class JustSpeakApp {
                     case .success(let payload):
                         let roundtripMs = (CFAbsoluteTimeGetCurrent() - commitStartTime) * 1000.0
                         let usage = self.liveClient?.lastTurnUsage
-                        self.settle(turnId: turnId, route: "WS", outcome: .success(
-                            text: payload.text,
-                            transport: "Live WebSocket (\(self.config.geminiLiveModel))",
-                            firstTokenMs: payload.firstTokenMs,
-                            roundtripMs: roundtripMs,
-                            audioDuration: duration,
-                            keyUpTime: keyUpTime,
-                            captureFinalizeMs: captureFinalizeMs,
-                            fallbackReason: nil,
-                            isLiveRoute: true,
-                            inputTokens: usage?.inputTokens,
-                            outputTokens: usage?.outputTokens
-                        ))
+                        self.settle(
+                            turnId: turnId, route: "WS",
+                            outcome: .success(
+                                text: payload.text,
+                                transport: "Live WebSocket (\(self.config.geminiLiveModel))",
+                                firstTokenMs: payload.firstTokenMs,
+                                roundtripMs: roundtripMs,
+                                audioDuration: duration,
+                                keyUpTime: keyUpTime,
+                                captureFinalizeMs: captureFinalizeMs,
+                                fallbackReason: nil,
+                                isLiveRoute: true,
+                                inputTokens: usage?.inputTokens,
+                                outputTokens: usage?.outputTokens
+                            ))
 
                     case .failure(let error):
                         guard self.currentTurnId == turnId, !self.turnSettled else { return }
@@ -554,7 +557,9 @@ final class JustSpeakApp {
     /// Result of a settled turn, handed to settle(). Success carries every field the latency
     /// diagnostic printout needs; failure is the REST-fallback-failed error path.
     private enum TurnOutcome {
-        case success(text: String, transport: String, firstTokenMs: Double, roundtripMs: Double, audioDuration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, fallbackReason: String?, isLiveRoute: Bool, inputTokens: Int?, outputTokens: Int?)
+        case success(
+            text: String, transport: String, firstTokenMs: Double, roundtripMs: Double, audioDuration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, fallbackReason: String?,
+            isLiveRoute: Bool, inputTokens: Int?, outputTokens: Int?)
         // The live STT model heard nothing and the clip's energy profile agrees: a real
         // no-speech turn, not an error - nothing is pasted and no fallback is attempted.
         case empty(audioDuration: Double)
@@ -608,19 +613,21 @@ final class JustSpeakApp {
                         return
                     }
                     let roundtripMs = (CFAbsoluteTimeGetCurrent() - restStartTime) * 1000.0
-                    self.settle(turnId: turnId, route: "REST", outcome: .success(
-                        text: payload.text,
-                        transport: "REST API (\(self.config.geminiModel))",
-                        firstTokenMs: 0,
-                        roundtripMs: roundtripMs,
-                        audioDuration: duration,
-                        keyUpTime: keyUpTime,
-                        captureFinalizeMs: captureFinalizeMs,
-                        fallbackReason: reason,
-                        isLiveRoute: false,
-                        inputTokens: payload.inputTokens,
-                        outputTokens: payload.outputTokens
-                    ))
+                    self.settle(
+                        turnId: turnId, route: "REST",
+                        outcome: .success(
+                            text: payload.text,
+                            transport: "REST API (\(self.config.geminiModel))",
+                            firstTokenMs: 0,
+                            roundtripMs: roundtripMs,
+                            audioDuration: duration,
+                            keyUpTime: keyUpTime,
+                            captureFinalizeMs: captureFinalizeMs,
+                            fallbackReason: reason,
+                            isLiveRoute: false,
+                            inputTokens: payload.inputTokens,
+                            outputTokens: payload.outputTokens
+                        ))
 
                 case .failure(let error):
                     self.settle(turnId: turnId, route: "REST", outcome: .failure(error))
@@ -686,7 +693,8 @@ final class JustSpeakApp {
         pendingFallbackTimer = nil
 
         switch outcome {
-        case .success(let text, let transport, let firstTokenMs, let roundtripMs, let audioDuration, let keyUpTime, let captureFinalizeMs, let fallbackReason, let isLiveRoute, let inputTokens, let outputTokens):
+        case .success(
+            let text, let transport, let firstTokenMs, let roundtripMs, let audioDuration, let keyUpTime, let captureFinalizeMs, let fallbackReason, let isLiveRoute, let inputTokens, let outputTokens):
             consecutiveNoSpeechTurns = 0
             handleTranscribedText(
                 text,
@@ -707,33 +715,34 @@ final class JustSpeakApp {
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: "No speech detected")
             }
-            history?.record(TranscriptionHistoryStore.TurnRecord(
-                outcome: "empty",
-                text: nil,
-                charCount: 0,
-                wordCount: 0,
-                transport: route,
-                model: nil,
-                isLiveRoute: nil,
-                fallbackReason: nil,
-                audioSeconds: audioDuration,
-                firstTokenMs: nil,
-                roundtripMs: nil,
-                captureFinalizeMs: nil,
-                injectMs: nil,
-                totalMs: nil,
-                injected: nil,
-                inputTokens: nil,
-                outputTokens: nil,
-                tokensMetered: nil,
-                costUSD: nil,
-                languageCodes: config.languageCodes.joined(separator: ","),
-                smartMode: config.smartTranscription,
-                vadMode: config.vadMode,
-                error: nil,
-                appBundleId: turnFrontmostBundleId,
-                appName: turnFrontmostName
-            ))
+            history?.record(
+                TranscriptionHistoryStore.TurnRecord(
+                    outcome: "empty",
+                    text: nil,
+                    charCount: 0,
+                    wordCount: 0,
+                    transport: route,
+                    model: nil,
+                    isLiveRoute: nil,
+                    fallbackReason: nil,
+                    audioSeconds: audioDuration,
+                    firstTokenMs: nil,
+                    roundtripMs: nil,
+                    captureFinalizeMs: nil,
+                    injectMs: nil,
+                    totalMs: nil,
+                    injected: nil,
+                    inputTokens: nil,
+                    outputTokens: nil,
+                    tokensMetered: nil,
+                    costUSD: nil,
+                    languageCodes: config.languageCodes.joined(separator: ","),
+                    smartMode: config.smartTranscription,
+                    vadMode: config.vadMode,
+                    error: nil,
+                    appBundleId: turnFrontmostBundleId,
+                    appName: turnFrontmostName
+                ))
             processingLock.lock()
             isProcessing = false
             processingLock.unlock()
@@ -745,33 +754,34 @@ final class JustSpeakApp {
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: hudMessage)
             }
-            history?.record(TranscriptionHistoryStore.TurnRecord(
-                outcome: "error",
-                text: nil,
-                charCount: 0,
-                wordCount: 0,
-                transport: route,
-                model: nil,
-                isLiveRoute: nil,
-                fallbackReason: nil,
-                audioSeconds: nil,
-                firstTokenMs: nil,
-                roundtripMs: nil,
-                captureFinalizeMs: nil,
-                injectMs: nil,
-                totalMs: nil,
-                injected: nil,
-                inputTokens: nil,
-                outputTokens: nil,
-                tokensMetered: nil,
-                costUSD: nil,
-                languageCodes: config.languageCodes.joined(separator: ","),
-                smartMode: config.smartTranscription,
-                vadMode: config.vadMode,
-                error: error.localizedDescription,
-                appBundleId: turnFrontmostBundleId,
-                appName: turnFrontmostName
-            ))
+            history?.record(
+                TranscriptionHistoryStore.TurnRecord(
+                    outcome: "error",
+                    text: nil,
+                    charCount: 0,
+                    wordCount: 0,
+                    transport: route,
+                    model: nil,
+                    isLiveRoute: nil,
+                    fallbackReason: nil,
+                    audioSeconds: nil,
+                    firstTokenMs: nil,
+                    roundtripMs: nil,
+                    captureFinalizeMs: nil,
+                    injectMs: nil,
+                    totalMs: nil,
+                    injected: nil,
+                    inputTokens: nil,
+                    outputTokens: nil,
+                    tokensMetered: nil,
+                    costUSD: nil,
+                    languageCodes: config.languageCodes.joined(separator: ","),
+                    smartMode: config.smartTranscription,
+                    vadMode: config.vadMode,
+                    error: error.localizedDescription,
+                    appBundleId: turnFrontmostBundleId,
+                    appName: turnFrontmostName
+                ))
             processingLock.lock()
             isProcessing = false
             processingLock.unlock()
@@ -804,33 +814,34 @@ final class JustSpeakApp {
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: "No speech detected")
             }
-            history?.record(TranscriptionHistoryStore.TurnRecord(
-                outcome: "empty",
-                text: nil,
-                charCount: 0,
-                wordCount: 0,
-                transport: transport,
-                model: isLiveRoute ? config.geminiLiveModel : config.geminiModel,
-                isLiveRoute: isLiveRoute,
-                fallbackReason: fallbackReason,
-                audioSeconds: audioDuration,
-                firstTokenMs: firstTokenMs > 0 ? firstTokenMs : nil,
-                roundtripMs: roundtripMs,
-                captureFinalizeMs: captureFinalizeMs,
-                injectMs: nil,
-                totalMs: nil,
-                injected: nil,
-                inputTokens: nil,
-                outputTokens: nil,
-                tokensMetered: nil,
-                costUSD: nil,
-                languageCodes: config.languageCodes.joined(separator: ","),
-                smartMode: config.smartTranscription,
-                vadMode: config.vadMode,
-                error: nil,
-                appBundleId: turnFrontmostBundleId,
-                appName: turnFrontmostName
-            ))
+            history?.record(
+                TranscriptionHistoryStore.TurnRecord(
+                    outcome: "empty",
+                    text: nil,
+                    charCount: 0,
+                    wordCount: 0,
+                    transport: transport,
+                    model: isLiveRoute ? config.geminiLiveModel : config.geminiModel,
+                    isLiveRoute: isLiveRoute,
+                    fallbackReason: fallbackReason,
+                    audioSeconds: audioDuration,
+                    firstTokenMs: firstTokenMs > 0 ? firstTokenMs : nil,
+                    roundtripMs: roundtripMs,
+                    captureFinalizeMs: captureFinalizeMs,
+                    injectMs: nil,
+                    totalMs: nil,
+                    injected: nil,
+                    inputTokens: nil,
+                    outputTokens: nil,
+                    tokensMetered: nil,
+                    costUSD: nil,
+                    languageCodes: config.languageCodes.joined(separator: ","),
+                    smartMode: config.smartTranscription,
+                    vadMode: config.vadMode,
+                    error: nil,
+                    appBundleId: turnFrontmostBundleId,
+                    appName: turnFrontmostName
+                ))
             processingLock.lock()
             isProcessing = false
             processingLock.unlock()
@@ -938,9 +949,12 @@ final class JustSpeakApp {
         let effectiveOutputTokens = outputTokens ?? max(1, text.count / 4)
         let inputPrice = isLiveRoute ? config.liveInputPricePer1M : config.restInputPricePer1M
         let outputPrice = isLiveRoute ? config.liveOutputPricePer1M : config.restOutputPricePer1M
-        let turnCostUSD = Double(effectiveInputTokens) / 1_000_000.0 * inputPrice
-                        + Double(effectiveOutputTokens) / 1_000_000.0 * outputPrice
-        print("  • Tokens & Cost:       \(effectiveInputTokens) in / \(effectiveOutputTokens) out ≈ \(ANSI.bold)$\(String(format: "%.5f", turnCostUSD))\(ANSI.reset) \(ANSI.gray)(\(usageMetered ? "API metered" : "estimated"))\(ANSI.reset)")
+        let turnCostUSD =
+            Double(effectiveInputTokens) / 1_000_000.0 * inputPrice
+            + Double(effectiveOutputTokens) / 1_000_000.0 * outputPrice
+        print(
+            "  • Tokens & Cost:       \(effectiveInputTokens) in / \(effectiveOutputTokens) out ≈ \(ANSI.bold)$\(String(format: "%.5f", turnCostUSD))\(ANSI.reset) \(ANSI.gray)(\(usageMetered ? "API metered" : "estimated"))\(ANSI.reset)"
+        )
 
         statsLock.lock()
         sessionTurns += 1
@@ -949,33 +963,34 @@ final class JustSpeakApp {
         sessionCostUSD += turnCostUSD
         statsLock.unlock()
 
-        history?.record(TranscriptionHistoryStore.TurnRecord(
-            outcome: "success",
-            text: text,
-            charCount: text.count,
-            wordCount: text.split { $0.isWhitespace }.count,
-            transport: transport,
-            model: isLiveRoute ? config.geminiLiveModel : config.geminiModel,
-            isLiveRoute: isLiveRoute,
-            fallbackReason: fallbackReason,
-            audioSeconds: audioDuration,
-            firstTokenMs: firstTokenMs > 0 ? firstTokenMs : nil,
-            roundtripMs: roundtripMs,
-            captureFinalizeMs: captureFinalizeMs,
-            injectMs: injectMs,
-            totalMs: totalElapsedMs,
-            injected: injected,
-            inputTokens: inputTokens,
-            outputTokens: outputTokens,
-            tokensMetered: usageMetered,
-            costUSD: turnCostUSD,
-            languageCodes: config.languageCodes.joined(separator: ","),
-            smartMode: config.smartTranscription,
-            vadMode: config.vadMode,
-            error: nil,
-            appBundleId: turnFrontmostBundleId,
-            appName: turnFrontmostName
-        ))
+        history?.record(
+            TranscriptionHistoryStore.TurnRecord(
+                outcome: "success",
+                text: text,
+                charCount: text.count,
+                wordCount: text.split { $0.isWhitespace }.count,
+                transport: transport,
+                model: isLiveRoute ? config.geminiLiveModel : config.geminiModel,
+                isLiveRoute: isLiveRoute,
+                fallbackReason: fallbackReason,
+                audioSeconds: audioDuration,
+                firstTokenMs: firstTokenMs > 0 ? firstTokenMs : nil,
+                roundtripMs: roundtripMs,
+                captureFinalizeMs: captureFinalizeMs,
+                injectMs: injectMs,
+                totalMs: totalElapsedMs,
+                injected: injected,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens,
+                tokensMetered: usageMetered,
+                costUSD: turnCostUSD,
+                languageCodes: config.languageCodes.joined(separator: ","),
+                smartMode: config.smartTranscription,
+                vadMode: config.vadMode,
+                error: nil,
+                appBundleId: turnFrontmostBundleId,
+                appName: turnFrontmostName
+            ))
 
         print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")
 
@@ -983,33 +998,35 @@ final class JustSpeakApp {
         isProcessing = false
         processingLock.unlock()
     }
-    
+
     private func printBanner() {
-        let langDisplay = config.languageCodes.isEmpty ? "\(ANSI.green)Auto (All 80+ Languages)\(ANSI.reset)" : "\(ANSI.green)\(config.languageCodes.joined(separator: ", "))\(ANSI.reset) \(ANSI.gray)(Prioritized)\(ANSI.reset)"
-        print("""
-        \(ANSI.bold)\(ANSI.cyan)
-             _           _   ____                   _    
-            | |_   _ ___| |_/ ___| _ __   ___  __ _| | __
-         _  | | | | / __| __\\___ \\| '_ \\ / _ \\/ _` | |/ /
-        | |_| | |_| \\__ \\ |_ ___) | |_) |  __/ (_| |   < 
-         \\___/ \\__,_|___/\\__|____/| .__/ \\___|\\__,_|_|\\_\\
-                                  |_|                    
-        \(ANSI.reset)\(ANSI.bold)Ultra-Low-Latency Push-to-Talk macOS Voice Dictation\(ANSI.reset)
-        \(ANSI.gray)Native Swift • CoreAudio Queue • Gemini Live WebSockets (TEXT Modality)\(ANSI.reset)
-        
-        Live WS Model:     \(ANSI.bold)\(config.geminiLiveModel)\(ANSI.reset)
-        REST Fallback:     \(ANSI.bold)\(config.geminiModel)\(ANSI.reset)
-        Language Support:  \(langDisplay)
-        Configured Hotkey: \(ANSI.bold)\(config.hotkey)\(ANSI.reset) (\(config.hotkeyMode))
-        Live WebSockets:   \(config.enableLiveWebSocket ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.yellow)Disabled (REST Only)\(ANSI.reset)")
-        Smart Transcribe:  \(config.smartTranscription ? "\(ANSI.green)Enabled (ITN + Disfluency Removal)\(ANSI.reset)" : "\(ANSI.gray)Verbatim Only\(ANSI.reset)")
-        VAD Mode:          \(config.vadMode == "manual" ? "\(ANSI.green)Manual (push-to-talk defines speech bounds)\(ANSI.reset)" : config.vadMode == "tuned" ? "\(ANSI.yellow)Tuned Server VAD (\(config.vadSilenceMs)ms silence window)\(ANSI.reset)" : "\(ANSI.gray)Auto (stock server VAD)\(ANSI.reset)")
-        Mic Idle Timeout:  \(config.micIdleTimeoutSec > 0 ? "\(ANSI.green)\(config.micIdleTimeoutSec)s (indicator turns off when idle)\(ANSI.reset)" : "\(ANSI.gray)Disabled (mic always on)\(ANSI.reset)")
-        History DB:        \(config.historyEnabled ? "\(ANSI.green)\(history?.path ?? "Disabled")\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
-        Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")\(config.replacementRules.isEmpty ? "" : " \(ANSI.gray)(+ \(config.replacementRules.count) replacement rules)\(ANSI.reset)")
-        Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
-        Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
-        """)
+        let langDisplay =
+            config.languageCodes.isEmpty
+            ? "\(ANSI.green)Auto (All 80+ Languages)\(ANSI.reset)" : "\(ANSI.green)\(config.languageCodes.joined(separator: ", "))\(ANSI.reset) \(ANSI.gray)(Prioritized)\(ANSI.reset)"
+        print(
+            """
+            \(ANSI.bold)\(ANSI.cyan)
+                 _           _   ____                   _    
+                | |_   _ ___| |_/ ___| _ __   ___  __ _| | __
+             _  | | | | / __| __\\___ \\| '_ \\ / _ \\/ _` | |/ /
+            | |_| | |_| \\__ \\ |_ ___) | |_) |  __/ (_| |   < 
+             \\___/ \\__,_|___/\\__|____/| .__/ \\___|\\__,_|_|\\_\\
+                                      |_|                    
+            \(ANSI.reset)\(ANSI.bold)Ultra-Low-Latency Push-to-Talk macOS Voice Dictation\(ANSI.reset)
+            \(ANSI.gray)Native Swift • CoreAudio Queue • Gemini Live WebSockets (TEXT Modality)\(ANSI.reset)
+
+            Live WS Model:     \(ANSI.bold)\(config.geminiLiveModel)\(ANSI.reset)
+            REST Fallback:     \(ANSI.bold)\(config.geminiModel)\(ANSI.reset)
+            Language Support:  \(langDisplay)
+            Configured Hotkey: \(ANSI.bold)\(config.hotkey)\(ANSI.reset) (\(config.hotkeyMode))
+            Live WebSockets:   \(config.enableLiveWebSocket ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.yellow)Disabled (REST Only)\(ANSI.reset)")
+            Smart Transcribe:  \(config.smartTranscription ? "\(ANSI.green)Enabled (ITN + Disfluency Removal)\(ANSI.reset)" : "\(ANSI.gray)Verbatim Only\(ANSI.reset)")
+            VAD Mode:          \(config.vadMode == "manual" ? "\(ANSI.green)Manual (push-to-talk defines speech bounds)\(ANSI.reset)" : config.vadMode == "tuned" ? "\(ANSI.yellow)Tuned Server VAD (\(config.vadSilenceMs)ms silence window)\(ANSI.reset)" : "\(ANSI.gray)Auto (stock server VAD)\(ANSI.reset)")
+            Mic Idle Timeout:  \(config.micIdleTimeoutSec > 0 ? "\(ANSI.green)\(config.micIdleTimeoutSec)s (indicator turns off when idle)\(ANSI.reset)" : "\(ANSI.gray)Disabled (mic always on)\(ANSI.reset)")
+            History DB:        \(config.historyEnabled ? "\(ANSI.green)\(history?.path ?? "Disabled")\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+            Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")\(config.replacementRules.isEmpty ? "" : " \(ANSI.gray)(+ \(config.replacementRules.count) replacement rules)\(ANSI.reset)")
+            Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+            Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+            """)
     }
 }
-

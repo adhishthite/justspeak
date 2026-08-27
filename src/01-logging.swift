@@ -17,7 +17,7 @@ enum ANSI {
 
 struct Logger {
     static var isVerbose: Bool = true
-    
+
     // POSIX microsecond timestamp formatter (zero heap allocations)
     static func timestamp() -> String {
         var tv = timeval()
@@ -29,41 +29,40 @@ struct Logger {
         let ms = Int(tv.tv_usec) / 1000
         return String(cString: buf) + String(format: ".%03d", ms)
     }
-    
+
     static func info(_ tag: String, _ message: String) {
         print("\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(ANSI.bold)\(ANSI.cyan)[\(tag)]\(ANSI.reset) \(message)")
         fflush(stdout)
     }
-    
+
     static func success(_ tag: String, _ message: String) {
         print("\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(ANSI.bold)\(ANSI.green)[\(tag)]\(ANSI.reset) \(message)")
         fflush(stdout)
     }
-    
+
     static func warn(_ tag: String, _ message: String) {
         print("\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(ANSI.bold)\(ANSI.yellow)[\(tag)]\(ANSI.reset) \(message)")
         fflush(stdout)
     }
-    
+
     static func error(_ tag: String, _ message: String) {
         print("\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(ANSI.bold)\(ANSI.red)[\(tag)]\(ANSI.reset) \(message)")
         fflush(stdout)
     }
-    
+
     static func debug(_ tag: String, _ message: String) {
         guard isVerbose else { return }
         print("\(ANSI.gray)[\(timestamp())] [\(tag)] \(message)\(ANSI.reset)")
         fflush(stdout)
     }
-    
+
     static func meter(_ message: String) {
         print("\(ANSI.clearLine)\(ANSI.gray)[\(timestamp())]\(ANSI.reset) \(message)", terminator: "")
         fflush(stdout)
     }
-    
+
     static func endMeter() {
         print("")
         fflush(stdout)
     }
 }
-

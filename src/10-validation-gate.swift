@@ -32,7 +32,8 @@ enum RestValidationGate {
     // ("Here's the transcription", "The audio says"), transcription refusals, and AI
     // self-identification. Bare "language model" / "as an AI engineer" style dictations pass.
     private static let answerPattern = try! NSRegularExpression(
-        pattern: #"^(here('s| is) (the |your )?(transcript|transcription)\b|the (audio|recording|speaker) (says|said|contains)\b|this (audio|recording) (contains|is)\b|i can('|no)t (transcribe|process) (this|the|that)\b|i('m| am) (sorry, but i can('|no)t|unable to) (transcribe|process)\b)"#,
+        pattern:
+            #"^(here('s| is) (the |your )?(transcript|transcription)\b|the (audio|recording|speaker) (says|said|contains)\b|this (audio|recording) (contains|is)\b|i can('|no)t (transcribe|process) (this|the|that)\b|i('m| am) (sorry, but i can('|no)t|unable to) (transcribe|process)\b)"#,
         options: [.caseInsensitive]
     )
     private static let selfReferencePattern = try! NSRegularExpression(
@@ -53,4 +54,3 @@ enum RestValidationGate {
         return nil
     }
 }
-

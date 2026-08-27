@@ -5,11 +5,11 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private let model: String
     private var webSocketTask: URLSessionWebSocketTask?
     private var urlSession: URLSession!
-    
+
     private let lock = NSLock()
     private(set) var isConnected: Bool = false
     private(set) var isReady: Bool = false
-    
+
     private var currentTurnText: String = ""
     // Multi-segment transcript accumulator. The server's VAD closes a speech segment at every
     // pause: the finished segment arrives as a finalized transcription, then the NEXT segment's
@@ -60,7 +60,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private var usesManualActivity: Bool {
         !model.contains("transcribe") || vadMode == "manual"
     }
-    
+
     // Event-driven settlement timers for transcribe-model turn completion (see commitTurn/attemptSettle).
     private static let settleMinPostCommitWait: Double = 0.35
     private static let settleQuietWindow: Double = 0.25
@@ -79,11 +79,11 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     // retry, so every deadline gets a small cushion to guarantee the rule holds at fire time.
     private static let settleTimerCushion: Double = 0.01
     private let settleQueue = DispatchQueue(label: "com.justspeak.settle")
-    private var settleWorkItem: DispatchWorkItem?       // reschedulable: initial-wait-without-tokens, then quiet-window checks
-    private var settleMaxWorkItem: DispatchWorkItem?    // fixed hard ceiling check
+    private var settleWorkItem: DispatchWorkItem?  // reschedulable: initial-wait-without-tokens, then quiet-window checks
+    private var settleMaxWorkItem: DispatchWorkItem?  // fixed hard ceiling check
     private var reconnectWorkItem: DispatchWorkItem?
     private var reconnectAttempts: Int = 0
-    
+
     init(
         apiKey: String,
         model: String = "gemini-3.5-transcribe-live",
@@ -106,12 +106,12 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         config.timeoutIntervalForRequest = 10.0
         self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
-    
+
     func connect() {
         guard !apiKey.isEmpty else { return }
-        
+
         reconnectWorkItem?.cancel()
-        
+
         let wsUrlString = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         guard let url = URL(string: wsUrlString) else {
             Logger.error("WS", "Invalid WebSocket URL.")
@@ -121,16 +121,16 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         var request = URLRequest(url: url)
         request.timeoutInterval = 10.0
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
-        
+
         let task = urlSession.webSocketTask(with: request)
         self.webSocketTask = task
         task.resume()
-        
+
         Logger.info("WS", "Connecting to Gemini Live WebSockets (\(model))...")
         sendSetupMessage()
         listenForMessages()
     }
-    
+
     private func sendSetupMessage() {
         let setupPayload: [String: Any]
         if model.contains("transcribe") {
@@ -152,7 +152,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 "generationConfig": [
                     "responseModalities": ["TEXT"]
                 ],
-                "inputAudioTranscription": transcriptionConfig
+                "inputAudioTranscription": transcriptionConfig,
             ]
 
             // Push-to-talk owns the ground truth of when speech starts and ends (the key hold),
@@ -172,9 +172,9 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                         "disabled": false,
                         "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
                         "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
-                        "silenceDurationMs": vadSilenceMs
+                        "silenceDurationMs": vadSilenceMs,
                     ],
-                    "turnCoverage": "TURN_INCLUDES_ALL_INPUT"
+                    "turnCoverage": "TURN_INCLUDES_ALL_INPUT",
                 ]
             default:
                 // "auto": stock server-side VAD, no realtimeInputConfig sent.
@@ -185,22 +185,22 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         } else {
             // Multimodal Conversational Audio Model with manual activity detection
             var instruction = """
-            You are an ultra-fast, high-precision voice dictation engine.
-            Transcribe the user's spoken words verbatim and polish into clean written prose.
-            Rules:
-            1. Output ONLY the exact transcribed words with proper grammar, punctuation, and capitalization.
-            2. Remove speech disfluencies (um, uh, like, you know, stuttering, repeated words).
-            3. Never converse, reply to questions, add commentary, or say things like "I understand", "Sure", or "Here is...".
-            4. Never wrap text in quotation marks or code fences unless explicitly dictating code.
-            5. If the audio is silent or unintelligible, output nothing.
-            """
+                You are an ultra-fast, high-precision voice dictation engine.
+                Transcribe the user's spoken words verbatim and polish into clean written prose.
+                Rules:
+                1. Output ONLY the exact transcribed words with proper grammar, punctuation, and capitalization.
+                2. Remove speech disfluencies (um, uh, like, you know, stuttering, repeated words).
+                3. Never converse, reply to questions, add commentary, or say things like "I understand", "Sure", or "Here is...".
+                4. Never wrap text in quotation marks or code fences unless explicitly dictating code.
+                5. If the audio is silent or unintelligible, output nothing.
+                """
             if !languageCodes.isEmpty {
                 instruction += "\nTarget language(s): \(languageCodes.joined(separator: ", "))"
             }
             if !customVocabulary.isEmpty {
                 instruction += "\n\nCustom vocabulary and technical terms to recognize accurately: \(customVocabulary.joined(separator: ", "))"
             }
-            
+
             setupPayload = [
                 "setup": [
                     "model": "models/\(model)",
@@ -208,7 +208,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                         "responseModalities": ["AUDIO"],
                         "thinkingConfig": [
                             "thinkingLevel": "minimal"
-                        ]
+                        ],
                     ],
                     "realtimeInputConfig": [
                         "automaticActivityDetection": [
@@ -223,17 +223,18 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                                 "text": instruction
                             ]
                         ]
-                    ]
+                    ],
                 ]
             ]
         }
-        
+
         guard let jsonData = try? JSONSerialization.data(withJSONObject: setupPayload),
-              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            let jsonString = String(data: jsonData, encoding: .utf8)
+        else {
             Logger.error("WS", "Failed to serialize setup message.")
             return
         }
-        
+
         webSocketTask?.send(.string(jsonString)) { [weak self] error in
             if let error = error {
                 Logger.error("WS", "Setup message send failed: \(error.localizedDescription)")
@@ -243,16 +244,16 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
         }
     }
-    
+
     private func listenForMessages() {
         webSocketTask?.receive { [weak self] result in
             guard let self = self else { return }
-            
+
             switch result {
             case .success(let message):
                 self.handleIncomingMessage(message)
-                self.listenForMessages() // Continue listening
-                
+                self.listenForMessages()  // Continue listening
+
             case .failure(let error):
                 self.lock.lock()
                 self.isConnected = false
@@ -260,14 +261,14 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 let pendingCompletion = self.hasFiredTurnCompletion ? nil : self.turnCompletion
                 self.turnCompletion = nil
                 self.lock.unlock()
-                
+
                 Logger.warn("WS", "WebSocket disconnected: \(error.localizedDescription)")
                 pendingCompletion?(.failure(error))
                 self.scheduleReconnect()
             }
         }
     }
-    
+
     private func handleIncomingMessage(_ message: URLSessionWebSocketTask.Message) {
         var rawData: Data?
         switch message {
@@ -278,9 +279,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         @unknown default:
             break
         }
-        
+
         guard let data = rawData,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
             return
         }
 
@@ -335,7 +337,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             // PRIORITY 1: Finalized inputTranscription (e.g. gemini-3.5-transcribe-live) -
             // closes the current speech segment; earlier segments must be preserved.
             if let inputTrans = serverContent["inputTranscription"] as? [String: Any],
-               let text = inputTrans["text"] as? String, !text.isEmpty {
+                let text = inputTrans["text"] as? String, !text.isEmpty
+            {
                 applyFinalTranscription(text)
                 updatedText = mergedTranscript()
                 isUserSpeech = true
@@ -343,14 +346,16 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
             // PRIORITY 2: Progressive Interim Transcription - rewrites only the live segment.
             else if let interim = serverContent["interimInputTranscription"] as? [String: Any],
-                    let text = interim["text"] as? String, !text.isEmpty {
+                let text = interim["text"] as? String, !text.isEmpty
+            {
                 applyInterimTranscription(text)
                 updatedText = mergedTranscript()
                 isUserSpeech = true
             }
             // PRIORITY 3: Alternative inputAudioTranscription (finalized form)
             else if let inputAudio = serverContent["inputAudioTranscription"] as? [String: Any],
-                    let text = inputAudio["text"] as? String, !text.isEmpty {
+                let text = inputAudio["text"] as? String, !text.isEmpty
+            {
                 applyFinalTranscription(text)
                 updatedText = mergedTranscript()
                 isUserSpeech = true
@@ -358,7 +363,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
             // PRIORITY 4: Multimodal text delta from modelTurn (raw append, no segmentation)
             else if let modelTurn = serverContent["modelTurn"] as? [String: Any],
-                    let parts = modelTurn["parts"] as? [[String: Any]] {
+                let parts = modelTurn["parts"] as? [[String: Any]]
+            {
                 var delta = ""
                 for part in parts {
                     if let text = part["text"] as? String {
@@ -370,7 +376,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                     updatedText = mergedTranscript()
                 }
             } else if let outputTranscription = serverContent["outputTranscription"] as? [String: Any],
-                      let text = outputTranscription["text"] as? String, !text.isEmpty {
+                let text = outputTranscription["text"] as? String, !text.isEmpty
+            {
                 committedTranscript += text
                 updatedText = mergedTranscript()
             }
@@ -441,7 +448,9 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             self.scheduleReconnect()
         }
         if let update = liveTextUpdate {
-            Logger.meter("\(ANSI.bold)\(ANSI.cyan)\(update.label)\(ANSI.reset) [\(String(format: "%.0f", update.elapsedMs))ms]: \(ANSI.bold)\(update.fullText.replacingOccurrences(of: "\n", with: " "))\(ANSI.reset)")
+            Logger.meter(
+                "\(ANSI.bold)\(ANSI.cyan)\(update.label)\(ANSI.reset) [\(String(format: "%.0f", update.elapsedMs))ms]: \(ANSI.bold)\(update.fullText.replacingOccurrences(of: "\n", with: " "))\(ANSI.reset)"
+            )
             onLiveTextUpdate?(update.textCopy)
         }
         if let fire = turnCompletionFire {
@@ -570,7 +579,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
         }
     }
-    
+
     func startNewTurn() {
         lock.lock()
         self.settleWorkItem?.cancel()
@@ -591,7 +600,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.turnBaselinePromptTokens = self.lastSeenPromptTokens
         self.turnBaselineResponseTokens = self.lastSeenResponseTokens
         lock.unlock()
-        
+
         // Dispatch manual activityStart: the key press IS the start of speech whenever
         // server VAD is disabled (conversational models always; transcribe in manual mode)
         if usesManualActivity {
@@ -601,12 +610,13 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 ]
             ]
             if let startJson = try? JSONSerialization.data(withJSONObject: startPayload),
-               let startStr = String(data: startJson, encoding: .utf8) {
+                let startStr = String(data: startJson, encoding: .utf8)
+            {
                 webSocketTask?.send(.string(startStr)) { _ in }
             }
         }
     }
-    
+
     // Base64's alphabet (A-Za-z0-9+/=) needs no JSON escaping, so the fixed-shape
     // envelope is built once and the payload is spliced in directly, skipping
     // JSONSerialization on the hot per-chunk (~150ms) path.
@@ -625,7 +635,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
         }
     }
-    
+
     func commitTurn(completion: @escaping (Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void) {
         lock.lock()
         self.turnCommitTime = CFAbsoluteTimeGetCurrent()
@@ -635,7 +645,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.turnCompletion = completion
         self.hasFiredTurnCompletion = false
         lock.unlock()
-        
+
         // 1. Dispatch audioStreamEnd signal to flush audio encoder pipeline
         let endAudioPayload: [String: Any] = [
             "realtimeInput": [
@@ -643,10 +653,11 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             ]
         ]
         if let endAudioJson = try? JSONSerialization.data(withJSONObject: endAudioPayload),
-           let endAudioStr = String(data: endAudioJson, encoding: .utf8) {
+            let endAudioStr = String(data: endAudioJson, encoding: .utf8)
+        {
             webSocketTask?.send(.string(endAudioStr)) { _ in }
         }
-        
+
         // 2. Dispatch manual activityEnd: the key release IS the end of speech whenever
         // server VAD is disabled (after audioStreamEnd so all buffered audio lands inside
         // the activity window)
@@ -657,30 +668,32 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 ]
             ]
             if let endJson = try? JSONSerialization.data(withJSONObject: endPayload),
-               let endStr = String(data: endJson, encoding: .utf8) {
+                let endStr = String(data: endJson, encoding: .utf8)
+            {
                 webSocketTask?.send(.string(endStr)) { _ in }
             }
         }
-        
+
         // 3. Dispatch turnComplete signal to finalize transcript
         let commitPayload: [String: Any] = [
             "clientContent": [
                 "turnComplete": true
             ]
         ]
-        
+
         guard let jsonData = try? JSONSerialization.data(withJSONObject: commitPayload),
-              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            let jsonString = String(data: jsonData, encoding: .utf8)
+        else {
             completion(.failure(NSError(domain: "JustSpeak", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize commit payload."])))
             return
         }
-        
+
         webSocketTask?.send(.string(jsonString)) { error in
             if let error = error {
                 Logger.debug("WS", "Commit turn send error: \(error.localizedDescription)")
             }
         }
-        
+
         // 4. For dedicated STT Transcribe models: schedule event-driven settlement checks
         // instead of polling. Two one-shot items cover the four settle rules:
         //   - settleWorkItem: fires at initialWaitWithoutTokens (rule: pre-commit text, no
@@ -705,13 +718,13 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             settleQueue.asyncAfter(deadline: .now() + Self.settleMaxWait + Self.settleTimerCushion, execute: maxItem)
         }
     }
-    
+
     var hasReceivedTokens: Bool {
         lock.lock()
         defer { lock.unlock() }
         return !currentTurnText.isEmpty || firstTokenLatencyMs > 0
     }
-    
+
     private func scheduleReconnect() {
         lock.lock()
         guard reconnectWorkItem == nil else {
@@ -721,7 +734,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         reconnectAttempts += 1
         let delay = min(10.0, pow(2.0, Double(min(reconnectAttempts, 4))))
         Logger.info("WS", "Scheduling WebSocket reconnection in \(String(format: "%.1f", delay))s (Attempt #\(reconnectAttempts))...")
-        
+
         let item = DispatchWorkItem { [weak self] in
             self?.lock.lock()
             self?.reconnectWorkItem = nil
@@ -730,10 +743,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         }
         self.reconnectWorkItem = item
         lock.unlock()
-        
+
         DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: item)
     }
-    
+
     func disconnect() {
         lock.lock()
         settleWorkItem?.cancel()
@@ -748,4 +761,3 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         isReady = false
     }
 }
-

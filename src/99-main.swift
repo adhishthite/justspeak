@@ -28,22 +28,23 @@ if args.contains("--analyze") {
 }
 
 if args.contains("--help") || args.contains("-h") {
-    print("""
-    JustSpeak - Ultra-Low-Latency Voice Dictation & Text Polishing
-    
-    Usage:
-      ./justspeak [options]
-      make run
-    
-    Options:
-      --check-permissions, -p   Run diagnostic permissions checker
-      --test-audio              Test 3-second mic capture and AI transcription
-      --test-api                Test Gemini API connection and latency
-      --analyze [--days N]      Mine dictation history for vocabulary suggestions (default 30 days)
-      --help, -h                Show this help message
-    
-    Configuration is managed via .env or environment variables.
-    """)
+    print(
+        """
+        JustSpeak - Ultra-Low-Latency Voice Dictation & Text Polishing
+
+        Usage:
+          ./justspeak [options]
+          make run
+
+        Options:
+          --check-permissions, -p   Run diagnostic permissions checker
+          --test-audio              Test 3-second mic capture and AI transcription
+          --test-api                Test Gemini API connection and latency
+          --analyze [--days N]      Mine dictation history for vocabulary suggestions (default 30 days)
+          --help, -h                Show this help message
+
+        Configuration is managed via .env or environment variables.
+        """)
     exit(0)
 }
 

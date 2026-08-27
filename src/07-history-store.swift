@@ -83,40 +83,40 @@ final class TranscriptionHistoryStore {
         }
 
         let schema = """
-        CREATE TABLE IF NOT EXISTS transcriptions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts_utc TEXT NOT NULL,
-          ts_epoch REAL NOT NULL,
-          session_id TEXT NOT NULL,
-          outcome TEXT NOT NULL,
-          text TEXT,
-          char_count INTEGER NOT NULL DEFAULT 0,
-          word_count INTEGER NOT NULL DEFAULT 0,
-          transport TEXT,
-          model TEXT,
-          is_live_route INTEGER,
-          fallback_reason TEXT,
-          audio_seconds REAL,
-          first_token_ms REAL,
-          roundtrip_ms REAL,
-          capture_finalize_ms REAL,
-          inject_ms REAL,
-          total_ms REAL,
-          injected INTEGER,
-          input_tokens INTEGER,
-          output_tokens INTEGER,
-          tokens_metered INTEGER,
-          cost_usd REAL,
-          language_codes TEXT,
-          smart_mode INTEGER,
-          vad_mode TEXT,
-          error TEXT,
-          app_bundle_id TEXT,
-          app_name TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_transcriptions_ts ON transcriptions(ts_epoch);
-        CREATE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id);
-        """
+            CREATE TABLE IF NOT EXISTS transcriptions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts_utc TEXT NOT NULL,
+              ts_epoch REAL NOT NULL,
+              session_id TEXT NOT NULL,
+              outcome TEXT NOT NULL,
+              text TEXT,
+              char_count INTEGER NOT NULL DEFAULT 0,
+              word_count INTEGER NOT NULL DEFAULT 0,
+              transport TEXT,
+              model TEXT,
+              is_live_route INTEGER,
+              fallback_reason TEXT,
+              audio_seconds REAL,
+              first_token_ms REAL,
+              roundtrip_ms REAL,
+              capture_finalize_ms REAL,
+              inject_ms REAL,
+              total_ms REAL,
+              injected INTEGER,
+              input_tokens INTEGER,
+              output_tokens INTEGER,
+              tokens_metered INTEGER,
+              cost_usd REAL,
+              language_codes TEXT,
+              smart_mode INTEGER,
+              vad_mode TEXT,
+              error TEXT,
+              app_bundle_id TEXT,
+              app_name TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_ts ON transcriptions(ts_epoch);
+            CREATE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id);
+            """
         if sqlite3_exec(opened, schema, nil, nil, nil) != SQLITE_OK {
             failed = true
             Logger.warn("HISTORY", "Failed to create history schema: \(String(cString: sqlite3_errmsg(opened)))")
@@ -129,7 +129,7 @@ final class TranscriptionHistoryStore {
         // failure on an already-migrated DB is expected and deliberately ignored.
         for migration in [
             "ALTER TABLE transcriptions ADD COLUMN app_bundle_id TEXT",
-            "ALTER TABLE transcriptions ADD COLUMN app_name TEXT"
+            "ALTER TABLE transcriptions ADD COLUMN app_name TEXT",
         ] {
             sqlite3_exec(opened, migration, nil, nil, nil)
         }
@@ -176,14 +176,14 @@ final class TranscriptionHistoryStore {
             guard !self.failed, let db = self.db else { return }
 
             let sql = """
-            INSERT INTO transcriptions (
-              ts_utc, ts_epoch, session_id, outcome, text, char_count, word_count,
-              transport, model, is_live_route, fallback_reason, audio_seconds,
-              first_token_ms, roundtrip_ms, capture_finalize_ms, inject_ms, total_ms,
-              injected, input_tokens, output_tokens, tokens_metered, cost_usd,
-              language_codes, smart_mode, vad_mode, error, app_bundle_id, app_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
+                INSERT INTO transcriptions (
+                  ts_utc, ts_epoch, session_id, outcome, text, char_count, word_count,
+                  transport, model, is_live_route, fallback_reason, audio_seconds,
+                  first_token_ms, roundtrip_ms, capture_finalize_ms, inject_ms, total_ms,
+                  injected, input_tokens, output_tokens, tokens_metered, cost_usd,
+                  language_codes, smart_mode, vad_mode, error, app_bundle_id, app_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
 
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -240,4 +240,3 @@ final class TranscriptionHistoryStore {
         }
     }
 }
-

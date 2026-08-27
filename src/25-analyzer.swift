@@ -7,7 +7,7 @@
 // the same Gemini API, same key.
 struct VocabularyAnalyzer {
     private struct Suggestion {
-        let line: String    // vocabulary-file syntax: "Term" or "wrong => right"
+        let line: String  // vocabulary-file syntax: "Term" or "wrong => right"
         let reason: String
     }
 
@@ -78,10 +78,10 @@ struct VocabularyAnalyzer {
         sqlite3_exec(db, "PRAGMA busy_timeout=2000;", nil, nil, nil)
 
         let sql = """
-        SELECT text FROM transcriptions
-        WHERE outcome = 'success' AND text IS NOT NULL AND length(trim(text)) > 0 AND ts_epoch >= ?
-        ORDER BY ts_epoch DESC LIMIT 500
-        """
+            SELECT text FROM transcriptions
+            WHERE outcome = 'success' AND text IS NOT NULL AND length(trim(text)) > 0 AND ts_epoch >= ?
+            ORDER BY ts_epoch DESC LIMIT 500
+            """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             Logger.error("ANALYZE", "Failed to query history: \(String(cString: sqlite3_errmsg(db)))")
@@ -115,29 +115,29 @@ struct VocabularyAnalyzer {
         let transcriptBlock = transcripts.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
 
         return """
-        You are analyzing a user's voice-dictation history to improve their speech-to-text setup.
-        Below are their recent transcriptions (newest first) and their EXISTING custom vocabulary.
+            You are analyzing a user's voice-dictation history to improve their speech-to-text setup.
+            Below are their recent transcriptions (newest first) and their EXISTING custom vocabulary.
 
-        Find two things, judging by repetition across MANY transcripts, not one-offs:
-        1. "vocabulary": domain terms the user says repeatedly that a recognizer is likely to mangle - product names, people/company names, acronyms, technical jargon, non-English words. These become recognition-boost hints.
-        2. "replacements": recurring misrecognitions - the same intended word showing up in garbled or inconsistent forms. Infer the intended spelling from context. These become deterministic "wrong => right" fix-up rules, so only suggest one when the wrong form is consistent and the right form is unambiguous.
+            Find two things, judging by repetition across MANY transcripts, not one-offs:
+            1. "vocabulary": domain terms the user says repeatedly that a recognizer is likely to mangle - product names, people/company names, acronyms, technical jargon, non-English words. These become recognition-boost hints.
+            2. "replacements": recurring misrecognitions - the same intended word showing up in garbled or inconsistent forms. Infer the intended spelling from context. These become deterministic "wrong => right" fix-up rules, so only suggest one when the wrong form is consistent and the right form is unambiguous.
 
-        Hard rules:
-        - Never suggest anything already covered by the existing vocabulary below.
-        - Only suggest terms actually present in the transcripts.
-        - At most 15 vocabulary terms and 10 replacements; fewer is better than padded.
-        - Each reason is at most 12 words and cites the evidence (e.g. "appears 9 times across 7 transcripts").
-        - If there is nothing worth suggesting, return empty arrays.
+            Hard rules:
+            - Never suggest anything already covered by the existing vocabulary below.
+            - Only suggest terms actually present in the transcripts.
+            - At most 15 vocabulary terms and 10 replacements; fewer is better than padded.
+            - Each reason is at most 12 words and cites the evidence (e.g. "appears 9 times across 7 transcripts").
+            - If there is nothing worth suggesting, return empty arrays.
 
-        Respond with strict JSON only, exactly this shape:
-        {"vocabulary": [{"term": "", "reason": ""}], "replacements": [{"wrong": "", "right": "", "reason": ""}]}
+            Respond with strict JSON only, exactly this shape:
+            {"vocabulary": [{"term": "", "reason": ""}], "replacements": [{"wrong": "", "right": "", "reason": ""}]}
 
-        EXISTING VOCABULARY:
-        \(existingBlock)
+            EXISTING VOCABULARY:
+            \(existingBlock)
 
-        TRANSCRIPTIONS:
-        \(transcriptBlock)
-        """
+            TRANSCRIPTIONS:
+            \(transcriptBlock)
+            """
     }
 
     private static func requestAnalysis(prompt: String, config: Config) -> [String: Any]? {
@@ -156,8 +156,8 @@ struct VocabularyAnalyzer {
             "contents": [["parts": [["text": prompt]]]],
             "generationConfig": [
                 "temperature": 0.2,
-                "responseMimeType": "application/json"
-            ]
+                "responseMimeType": "application/json",
+            ],
         ]
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
             Logger.error("ANALYZE", "Failed to serialize analysis request.")
@@ -183,19 +183,22 @@ struct VocabularyAnalyzer {
                 return
             }
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let candidates = json["candidates"] as? [[String: Any]],
-                  let content = candidates.first?["content"] as? [String: Any],
-                  let parts = content["parts"] as? [[String: Any]],
-                  let text = parts.first?["text"] as? String,
-                  let textData = text.data(using: .utf8),
-                  let result = try? JSONSerialization.jsonObject(with: textData) as? [String: Any] else {
+                let candidates = json["candidates"] as? [[String: Any]],
+                let content = candidates.first?["content"] as? [String: Any],
+                let parts = content["parts"] as? [[String: Any]],
+                let text = parts.first?["text"] as? String,
+                let textData = text.data(using: .utf8),
+                let result = try? JSONSerialization.jsonObject(with: textData) as? [String: Any]
+            else {
                 Logger.error("ANALYZE", "Could not parse an analysis JSON out of the model response.")
                 return
             }
             if let usage = json["usageMetadata"] as? [String: Any],
-               let inTok = usage["promptTokenCount"] as? Int,
-               let outTok = usage["candidatesTokenCount"] as? Int {
-                let cost = Double(inTok) / 1_000_000.0 * config.restInputPricePer1M
+                let inTok = usage["promptTokenCount"] as? Int,
+                let outTok = usage["candidatesTokenCount"] as? Int
+            {
+                let cost =
+                    Double(inTok) / 1_000_000.0 * config.restInputPricePer1M
                     + Double(outTok) / 1_000_000.0 * config.restOutputPricePer1M
                 Logger.info("ANALYZE", "Tokens: \(inTok) in / \(outTok) out (~$\(String(format: "%.4f", cost)))")
             }
@@ -213,7 +216,8 @@ struct VocabularyAnalyzer {
         if let vocab = raw["vocabulary"] as? [[String: Any]] {
             for entry in vocab.prefix(15) {
                 guard let term = (entry["term"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !term.isEmpty, term.count <= 60 else { continue }
+                    !term.isEmpty, term.count <= 60
+                else { continue }
                 let key = term.lowercased()
                 if known.contains(key) || seen.contains(key) { continue }
                 seen.insert(key)
@@ -224,10 +228,11 @@ struct VocabularyAnalyzer {
         if let rules = raw["replacements"] as? [[String: Any]] {
             for entry in rules.prefix(10) {
                 guard let wrong = (entry["wrong"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      let right = (entry["right"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !wrong.isEmpty, !right.isEmpty, wrong.lowercased() != right.lowercased(),
-                      wrong.count <= 80, right.count <= 80,
-                      !wrong.contains("=>"), !right.contains("=>") else { continue }
+                    let right = (entry["right"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                    !wrong.isEmpty, !right.isEmpty, wrong.lowercased() != right.lowercased(),
+                    wrong.count <= 80, right.count <= 80,
+                    !wrong.contains("=>"), !right.contains("=>")
+                else { continue }
                 let key = wrong.lowercased()
                 if known.contains(key) || seen.contains(key) { continue }
                 seen.insert(key)
@@ -241,7 +246,8 @@ struct VocabularyAnalyzer {
     private static func offerAppend(suggestions: [Suggestion], config: Config) {
         // Prefer the vocabulary file the config actually loaded; otherwise create the
         // default candidate the loader looks for first.
-        var target = config.customVocabularyFile.isEmpty
+        var target =
+            config.customVocabularyFile.isEmpty
             ? FileManager.default.currentDirectoryPath + "/vocabulary.txt"
             : (config.customVocabularyFile as NSString).expandingTildeInPath
         if !target.hasPrefix("/") {
@@ -250,7 +256,8 @@ struct VocabularyAnalyzer {
 
         print("\nAppend all \(suggestions.count) suggestion(s) to \(ANSI.bold)\(target)\(ANSI.reset)? (y/N) ", terminator: "")
         guard let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              answer == "y" || answer == "yes" else {
+            answer == "y" || answer == "yes"
+        else {
             print("Nothing written. Copy any line above into your vocabulary file manually.")
             return
         }

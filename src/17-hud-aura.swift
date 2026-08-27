@@ -8,30 +8,30 @@ final class AppleNotchAuraView: NSView {
         case success
         case error
     }
-    
+
     var notchRect: NSRect = .zero
-    var audioLevel: CGFloat = 0.0 // 0.0 ... 1.0
+    var audioLevel: CGFloat = 0.0  // 0.0 ... 1.0
     var state: GlowState = .idle
     // Displays without a hardware notch have no bezel to illuminate; the aura rings
     // the floating pill instead. pillSize tracks the pill's live width as it expands.
     var pillMode: Bool = false
     var pillSize: CGSize = .zero
-    
+
     private var phase: CGFloat = 0.0
     private var displayTimer: Timer?
-    
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         self.wantsLayer = true
         self.layer?.masksToBounds = false
     }
-    
+
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         self.wantsLayer = true
         self.layer?.masksToBounds = false
     }
-    
+
     func startAnimation() {
         displayTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -45,12 +45,12 @@ final class AppleNotchAuraView: NSView {
         RunLoop.main.add(timer, forMode: .common)
         self.displayTimer = timer
     }
-    
+
     func stopAnimation() {
         displayTimer?.invalidate()
         displayTimer = nil
     }
-    
+
     // outset dilates the path beyond the hardware cutout: a stroke centered on the exact
     // notch outline loses its inner half inside the cutout (those pixels don't exist),
     // which reads as a thin hard line with clipped corners. Pushed outward, the full
@@ -65,23 +65,27 @@ final class AppleNotchAuraView: NSView {
         let bottomY = bounds.height - notchRect.height - outset
         let leftX = (bounds.width - notchRect.width) / 2.0 - outset
         let rightX = leftX + notchRect.width + 2.0 * outset
-        
+
         path.move(to: CGPoint(x: leftX - outerCornerRadius, y: topY))
-        path.addQuadCurve(to: CGPoint(x: leftX, y: topY - outerCornerRadius),
-                          control: CGPoint(x: leftX, y: topY))
+        path.addQuadCurve(
+            to: CGPoint(x: leftX, y: topY - outerCornerRadius),
+            control: CGPoint(x: leftX, y: topY))
         path.addLine(to: CGPoint(x: leftX, y: bottomY + cornerRadius))
-        path.addQuadCurve(to: CGPoint(x: leftX + cornerRadius, y: bottomY),
-                          control: CGPoint(x: leftX, y: bottomY))
+        path.addQuadCurve(
+            to: CGPoint(x: leftX + cornerRadius, y: bottomY),
+            control: CGPoint(x: leftX, y: bottomY))
         path.addLine(to: CGPoint(x: rightX - cornerRadius, y: bottomY))
-        path.addQuadCurve(to: CGPoint(x: rightX, y: bottomY + cornerRadius),
-                          control: CGPoint(x: rightX, y: bottomY))
+        path.addQuadCurve(
+            to: CGPoint(x: rightX, y: bottomY + cornerRadius),
+            control: CGPoint(x: rightX, y: bottomY))
         path.addLine(to: CGPoint(x: rightX, y: topY - outerCornerRadius))
-        path.addQuadCurve(to: CGPoint(x: rightX + outerCornerRadius, y: topY),
-                          control: CGPoint(x: rightX, y: topY))
-        
+        path.addQuadCurve(
+            to: CGPoint(x: rightX + outerCornerRadius, y: topY),
+            control: CGPoint(x: rightX, y: topY))
+
         return path
     }
-    
+
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         if state == .idle { return }
@@ -90,8 +94,8 @@ final class AppleNotchAuraView: NSView {
         let tint: NSColor
         switch state {
         case .success: tint = AppleDesign.googleGreen
-        case .error:   tint = AppleDesign.googleRed
-        default:       tint = AppleDesign.googleSpectrum(at: phase)
+        case .error: tint = AppleDesign.googleRed
+        default: tint = AppleDesign.googleSpectrum(at: phase)
         }
 
         // Voice gives the light its breath: a quiet floor so the glow never dies,
@@ -114,11 +118,12 @@ final class AppleNotchAuraView: NSView {
         let centerAlpha: CGFloat = 0.26 + 0.30 * energy
 
         let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
-        let poolColors = [
-            tint.withAlphaComponent(centerAlpha).cgColor,
-            tint.withAlphaComponent(centerAlpha * 0.35).cgColor,
-            tint.withAlphaComponent(0.0).cgColor
-        ] as CFArray
+        let poolColors =
+            [
+                tint.withAlphaComponent(centerAlpha).cgColor,
+                tint.withAlphaComponent(centerAlpha * 0.35).cgColor,
+                tint.withAlphaComponent(0.0).cgColor,
+            ] as CFArray
         let poolLocations: [CGFloat] = [0.0, 0.45, 1.0]
         if let pool = CGGradient(colorsSpace: colorSpace, colors: poolColors, locations: poolLocations) {
             context.saveGState()
@@ -152,7 +157,7 @@ final class AppleNotchAuraView: NSView {
 
         let passes: [(blur: CGFloat, alpha: CGFloat)] = [
             (blur, 0.40 + 0.25 * energy),
-            (blur * 0.5, 0.50 + 0.25 * energy)
+            (blur * 0.5, 0.50 + 0.25 * energy),
         ]
         for pass in passes {
             context.saveGState()
@@ -203,4 +208,3 @@ final class AppleNotchAuraView: NSView {
         context.restoreGState()
     }
 }
-

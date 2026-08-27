@@ -2,22 +2,22 @@
 
 enum AppleDesign {
     // Apple Intelligence Display P3 Wide-Gamut Palette
-    static let siriCyan    = NSColor(displayP3Red: 0.00, green: 0.82, blue: 1.00, alpha: 1.0) // #00D1FF
-    static let siriIndigo  = NSColor(displayP3Red: 0.44, green: 0.24, blue: 0.96, alpha: 1.0) // #703DF5
-    static let siriMagenta = NSColor(displayP3Red: 1.00, green: 0.20, blue: 0.60, alpha: 1.0) // #FF3399
-    static let siriAmber   = NSColor(displayP3Red: 1.00, green: 0.65, blue: 0.12, alpha: 1.0) // #FFA61F
-    static let appleGreen  = NSColor(displayP3Red: 0.19, green: 0.82, blue: 0.35, alpha: 1.0) // #30D158 (Apple systemGreen)
-    static let appleCoral  = NSColor(displayP3Red: 1.00, green: 0.27, blue: 0.23, alpha: 1.0) // #FF453A
-    static let appleGold   = NSColor(displayP3Red: 1.00, green: 0.80, blue: 0.00, alpha: 1.0) // #FFCC00
+    static let siriCyan = NSColor(displayP3Red: 0.00, green: 0.82, blue: 1.00, alpha: 1.0)  // #00D1FF
+    static let siriIndigo = NSColor(displayP3Red: 0.44, green: 0.24, blue: 0.96, alpha: 1.0)  // #703DF5
+    static let siriMagenta = NSColor(displayP3Red: 1.00, green: 0.20, blue: 0.60, alpha: 1.0)  // #FF3399
+    static let siriAmber = NSColor(displayP3Red: 1.00, green: 0.65, blue: 0.12, alpha: 1.0)  // #FFA61F
+    static let appleGreen = NSColor(displayP3Red: 0.19, green: 0.82, blue: 0.35, alpha: 1.0)  // #30D158 (Apple systemGreen)
+    static let appleCoral = NSColor(displayP3Red: 1.00, green: 0.27, blue: 0.23, alpha: 1.0)  // #FF453A
+    static let appleGold = NSColor(displayP3Red: 1.00, green: 0.80, blue: 0.00, alpha: 1.0)  // #FFCC00
 
     // Google brand palette (notch glow). White must be EXACTLY achromatic (equal
     // components -> OKLab chroma 0) so googleSpectrum's fades through it are pure
     // desaturation with no hue discontinuity at the segment boundaries.
-    static let googleBlue   = NSColor(displayP3Red: 0.259, green: 0.522, blue: 0.957, alpha: 1.0) // #4285F4
-    static let googleRed    = NSColor(displayP3Red: 0.918, green: 0.263, blue: 0.208, alpha: 1.0) // #EA4335
-    static let googleYellow = NSColor(displayP3Red: 0.984, green: 0.737, blue: 0.016, alpha: 1.0) // #FBBC04
-    static let googleGreen  = NSColor(displayP3Red: 0.204, green: 0.659, blue: 0.325, alpha: 1.0) // #34A853
-    static let googleWhite  = NSColor(displayP3Red: 0.970, green: 0.970, blue: 0.970, alpha: 1.0)
+    static let googleBlue = NSColor(displayP3Red: 0.259, green: 0.522, blue: 0.957, alpha: 1.0)  // #4285F4
+    static let googleRed = NSColor(displayP3Red: 0.918, green: 0.263, blue: 0.208, alpha: 1.0)  // #EA4335
+    static let googleYellow = NSColor(displayP3Red: 0.984, green: 0.737, blue: 0.016, alpha: 1.0)  // #FBBC04
+    static let googleGreen = NSColor(displayP3Red: 0.204, green: 0.659, blue: 0.325, alpha: 1.0)  // #34A853
+    static let googleWhite = NSColor(displayP3Red: 0.970, green: 0.970, blue: 0.970, alpha: 1.0)
 
     // MARK: OKLCH interpolation (Ottosson's OKLab, pure math - no dependencies)
     //
@@ -29,7 +29,7 @@ enum AppleDesign {
     struct OKLCh {
         let L: CGFloat
         let C: CGFloat
-        let h: CGFloat // radians
+        let h: CGFloat  // radians
     }
 
     private static func srgbToLinear(_ c: CGFloat) -> CGFloat {
@@ -75,7 +75,7 @@ enum AppleDesign {
         let m = pow(lch.L - 0.1055613458 * a - 0.0638541728 * bb, 3)
         let s = pow(lch.L - 0.0894841775 * a - 1.2914855480 * bb, 3)
 
-        let r = linearToSrgb( 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s)
+        let r = linearToSrgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s)
         let g = linearToSrgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s)
         let b = linearToSrgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
 
@@ -103,7 +103,7 @@ enum AppleDesign {
             frac = 0
         } else {
             let f = (frac - dwell) / (1.0 - dwell)
-            frac = f * f * (3 - 2 * f) // smoothstep: no visible seam at either end of the fade
+            frac = f * f * (3 - 2 * f)  // smoothstep: no visible seam at either end of the fade
         }
 
         let c1 = googleAnchors[seg]
@@ -119,11 +119,12 @@ enum AppleDesign {
         if dh > .pi { dh -= 2 * .pi }
         if dh < -.pi { dh += 2 * .pi }
 
-        return fromOKLCh(OKLCh(
-            L: c1.L + (c2.L - c1.L) * frac,
-            C: c1.C + (c2.C - c1.C) * frac,
-            h: h1 + dh * frac
-        ))
+        return fromOKLCh(
+            OKLCh(
+                L: c1.L + (c2.L - c1.L) * frac,
+                C: c1.C + (c2.C - c1.C) * frac,
+                h: h1 + dh * frac
+            ))
     }
 
     // Continuous Apple Intelligence 4-phase chromatic loop: Cyan -> Indigo -> Magenta -> Amber -> Cyan
@@ -142,11 +143,11 @@ enum AppleDesign {
         if dh > .pi { dh -= 2 * .pi }
         if dh < -.pi { dh += 2 * .pi }
 
-        return fromOKLCh(OKLCh(
-            L: c1.L + (c2.L - c1.L) * frac,
-            C: c1.C + (c2.C - c1.C) * frac,
-            h: c1.h + dh * frac
-        ))
+        return fromOKLCh(
+            OKLCh(
+                L: c1.L + (c2.L - c1.L) * frac,
+                C: c1.C + (c2.C - c1.C) * frac,
+                h: c1.h + dh * frac
+            ))
     }
 }
-

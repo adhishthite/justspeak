@@ -4,13 +4,13 @@ final class AudioCaptureEngine {
     private let audioEngine = AVAudioEngine()
     private var audioConverter: AVAudioConverter?
     private let targetFormat: AVAudioFormat
-    
+
     // Dedicated background audio processing queue (keeps CoreAudio render thread non-blocking)
     private let audioProcessingQueue = DispatchQueue(label: "com.justspeak.audioProcessing", qos: .userInteractive)
-    
+
     private let lock = NSLock()
     private(set) var isRecording: Bool = false
-    private(set) var isEngineRunning: Bool = false // main-thread-only (setup/suspend/resume)
+    private(set) var isEngineRunning: Bool = false  // main-thread-only (setup/suspend/resume)
     private var recordedPCMData = Data()
     private var chunkCount: Int = 0
     private var recordingStartTime: CFAbsoluteTime = 0
@@ -25,14 +25,14 @@ final class AudioCaptureEngine {
     private var preRollRingBuffer = Data()
     private let maxPreRollBytes: Int
     private var preRollBytesInTurn = 0
-    
+
     // Streaming chunk accumulator (~150ms chunks = 4800 bytes)
     private var pendingChunkBuffer = Data()
     private let streamingChunkTargetBytes = 4800
-    
+
     var onAudioChunk: ((Data) -> Void)?
     var onAudioLevel: ((Double) -> Void)?
-    
+
     init(preRollMs: Int = 400) {
         // Standard 16kHz 16-bit Mono Linear PCM for speech AI models
         self.targetFormat = AVAudioFormat(
@@ -44,20 +44,20 @@ final class AudioCaptureEngine {
         // 16,000 samples/sec * 2 bytes/sample = 32 bytes per ms
         self.maxPreRollBytes = max(0, preRollMs * 32)
     }
-    
+
     func setup() -> Bool {
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
-        
+
         Logger.info("MIC", "Hardware format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch, \(inputFormat.formatDescription)")
         Logger.info("MIC", "Target format: 16000 Hz, 1 ch, 16-bit Linear PCM")
-        
+
         guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
             Logger.error("MIC", "Failed to construct AVAudioConverter from \(inputFormat) to \(targetFormat)")
             return false
         }
         self.audioConverter = converter
-        
+
         installTap(on: inputNode, format: inputFormat)
 
         // Device changes (AirPods connect/disconnect, default-input switch) invalidate both
@@ -174,17 +174,17 @@ final class AudioCaptureEngine {
             return false
         }
     }
-    
+
     private func processIncomingBufferOnQueue(_ inputBuffer: AVAudioPCMBuffer) {
         guard let converter = audioConverter else { return }
-        
+
         let ratio = 16000.0 / inputBuffer.format.sampleRate
         let outCapacity = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio + 64)
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return }
-        
+
         var error: NSError?
         var consumed = false
-        
+
         let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
             if !consumed {
                 consumed = true
@@ -195,7 +195,7 @@ final class AudioCaptureEngine {
                 return nil
             }
         }
-        
+
         if status == .haveData, outputBuffer.frameLength > 0, let int16Pointer = outputBuffer.int16ChannelData?[0] {
             let byteCount = Int(outputBuffer.frameLength) * 2
             let chunkData = Data(bytes: int16Pointer, count: byteCount)
@@ -261,7 +261,9 @@ final class AudioCaptureEngine {
 
             if shouldUpdateMeter {
                 let meterBars = renderVolumeMeter(db: db)
-                Logger.meter("\(ANSI.bold)\(ANSI.yellow)🎙️  RECORDING\(ANSI.reset) [\(meterBars)] \(String(format: "%5.1f", db)) dB | \(String(format: "%.2fs", elapsed)) | \(String(format: "%.1f", kbStreamed)) KB streamed (#\(chunkCountSnapshot))")
+                Logger.meter(
+                    "\(ANSI.bold)\(ANSI.yellow)🎙️  RECORDING\(ANSI.reset) [\(meterBars)] \(String(format: "%5.1f", db)) dB | \(String(format: "%.2fs", elapsed)) | \(String(format: "%.1f", kbStreamed)) KB streamed (#\(chunkCountSnapshot))"
+                )
                 onAudioLevel?(db)
             }
 
@@ -270,18 +272,18 @@ final class AudioCaptureEngine {
             }
         }
     }
-    
+
     private func renderVolumeMeter(db: Double) -> String {
         let normalized = max(0.0, min(1.0, (db + 50.0) / 50.0))
         let totalBlocks = 12
         let filledBlocks = Int(round(normalized * Double(totalBlocks)))
         let emptyBlocks = totalBlocks - filledBlocks
-        
+
         let filledStr = String(repeating: "█", count: filledBlocks)
         let emptyStr = String(repeating: "░", count: emptyBlocks)
         return "\(ANSI.green)\(filledStr)\(ANSI.gray)\(emptyStr)\(ANSI.reset)"
     }
-    
+
     func startRecording() {
         lock.lock()
         recordedPCMData.removeAll(keepingCapacity: true)
@@ -296,7 +298,7 @@ final class AudioCaptureEngine {
             immediatePreRollChunk = preRollRingBuffer
             preRollRingBuffer.removeAll(keepingCapacity: true)
         }
-        
+
         chunkCount = 0
         recordingStartTime = CFAbsoluteTimeGetCurrent()
         lastMeterUpdateTime = 0
@@ -308,7 +310,7 @@ final class AudioCaptureEngine {
             onAudioChunk?(chunk)
         }
     }
-    
+
     func stopRecording(gracePeriodMs: Int, maxTrailMs: Int, silenceThresholdDb: Double) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int) {
         // True hold duration is measured at entry, BEFORE the post-roll wait - otherwise the
         // grace period pads every tap past the caller's micro-click duration threshold.
@@ -357,7 +359,7 @@ final class AudioCaptureEngine {
         }
 
         // 2. Synchronously drain all in-flight audio processing tasks on the serial queue
-        audioProcessingQueue.sync { }
+        audioProcessingQueue.sync {}
 
         lock.lock()
         isRecording = false
@@ -393,10 +395,9 @@ final class AudioCaptureEngine {
         Logger.endMeter()
         return (data, duration, chunks, capturedBytes)
     }
-    
+
     func stopEngine() {
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
     }
 }
-

@@ -11,7 +11,7 @@ final class HotkeyManager {
         case fn
         case fKey(CGKeyCode)
         case custom(CGKeyCode)
-        
+
         static func from(string: String) -> KeyBinding {
             switch string.lowercased() {
             case "right_option", "right_alt", "roption": return .rightOption
@@ -36,7 +36,7 @@ final class HotkeyManager {
                 return .rightOption
             }
         }
-        
+
         var name: String {
             switch self {
             case .rightOption: return "Right Option (⌥ Right)"
@@ -51,67 +51,67 @@ final class HotkeyManager {
             }
         }
     }
-    
+
     private let binding: KeyBinding
     private let mode: String
     private var isKeyDown: Bool = false
     private var lastStateChangeTime: CFAbsoluteTime = 0
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    
+
     var onKeyDown: (() -> Void)?
     var onKeyUp: (() -> Void)?
-    
+
     init(binding: KeyBinding, mode: String) {
         self.binding = binding
         self.mode = mode
     }
-    
+
     func start() -> Bool {
-        let eventMask = (1 << CGEventType.flagsChanged.rawValue) |
-                        (1 << CGEventType.keyDown.rawValue) |
-                        (1 << CGEventType.keyUp.rawValue)
-        
+        let eventMask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+
         let selfPointer = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .listenOnly,
-            eventsOfInterest: CGEventMask(eventMask),
-            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
-                guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
-                let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
-                
-                // Auto-recover tap if disabled by macOS timeout
-                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                    if let t = manager.eventTap {
-                        CGEvent.tapEnable(tap: t, enable: true)
+
+        guard
+            let tap = CGEvent.tapCreate(
+                tap: .cgSessionEventTap,
+                place: .headInsertEventTap,
+                options: .listenOnly,
+                eventsOfInterest: CGEventMask(eventMask),
+                callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                    guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
+                    let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
+
+                    // Auto-recover tap if disabled by macOS timeout
+                    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                        if let t = manager.eventTap {
+                            CGEvent.tapEnable(tap: t, enable: true)
+                        }
+                        return Unmanaged.passUnretained(event)
                     }
+
+                    manager.handleCGEvent(type: type, event: event)
                     return Unmanaged.passUnretained(event)
-                }
-                
-                manager.handleCGEvent(type: type, event: event)
-                return Unmanaged.passUnretained(event)
-            },
-            userInfo: selfPointer
-        ) else {
+                },
+                userInfo: selfPointer
+            )
+        else {
             return false
         }
-        
+
         self.eventTap = tap
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         self.runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        
+
         return true
     }
-    
+
     private func handleCGEvent(type: CGEventType, event: CGEvent) {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
-        
+
         switch binding {
         case .rightOption:
             if type == .flagsChanged && keyCode == 61 {
@@ -158,13 +158,13 @@ final class HotkeyManager {
             }
         }
     }
-    
+
     private func updateKeyState(pressed: Bool) {
         let now = CFAbsoluteTimeGetCurrent()
 
         if mode == "toggle" {
             // Both toggle transitions fire on a press edge, so the 80ms debounce applies to both.
-            guard (now - lastStateChangeTime) > 0.08 else { return } // 80ms debounce
+            guard (now - lastStateChangeTime) > 0.08 else { return }  // 80ms debounce
             if pressed && !isKeyDown {
                 isKeyDown = true
                 lastStateChangeTime = now
@@ -179,7 +179,7 @@ final class HotkeyManager {
             // swallowed - dropping it would leave isKeyDown stuck true (mic stuck recording)
             // after a press+release faster than the debounce window.
             if pressed && !isKeyDown {
-                guard (now - lastStateChangeTime) > 0.08 else { return } // 80ms debounce
+                guard (now - lastStateChangeTime) > 0.08 else { return }  // 80ms debounce
                 isKeyDown = true
                 lastStateChangeTime = now
                 onKeyDown?()
@@ -190,7 +190,7 @@ final class HotkeyManager {
             }
         }
     }
-    
+
     func stop() {
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -200,4 +200,3 @@ final class HotkeyManager {
         }
     }
 }
-

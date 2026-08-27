@@ -15,10 +15,10 @@ struct GeminiRestClient {
             completion(.failure(NSError(domain: "JustSpeak", code: -1, userInfo: [NSLocalizedDescriptionKey: "GEMINI_API_KEY is empty."])))
             return
         }
-        
+
         let wavData = createWavData(from: pcmData, sampleRate: 16000, channels: 1)
         let base64Wav = wavData.base64EncodedString()
-        
+
         let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
         guard let url = URL(string: urlString) else {
             completion(.failure(NSError(domain: "JustSpeak", code: -2, userInfo: [NSLocalizedDescriptionKey: "Invalid REST URL."])))
@@ -30,7 +30,7 @@ struct GeminiRestClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         request.timeoutInterval = 10.0
-        
+
         let payload: [String: Any]
         if model.contains("transcribe") {
             // Dedicated STT Foundation Model (Pure Audio, zero developer instruction requirement)
@@ -41,7 +41,7 @@ struct GeminiRestClient {
                             [
                                 "inlineData": [
                                     "mimeType": "audio/wav",
-                                    "data": base64Wav
+                                    "data": base64Wav,
                                 ]
                             ]
                         ]
@@ -50,21 +50,22 @@ struct GeminiRestClient {
             ]
         } else {
             // General Multimodal LLM (Prompt & System Instruction guided)
-            var promptText = "Transcribe this audio precisely. Fix punctuation, capitalization, and grammar. Remove filler words (um, uh, you know). Preserve technical terms, acronyms, code snippets, numbers, and formatting. Output ONLY the polished transcription without commentary, explanations, or quotes."
+            var promptText =
+                "Transcribe this audio precisely. Fix punctuation, capitalization, and grammar. Remove filler words (um, uh, you know). Preserve technical terms, acronyms, code snippets, numbers, and formatting. Output ONLY the polished transcription without commentary, explanations, or quotes."
             var systemText = "You are a professional voice dictation engine. Transcribe and polish the spoken audio into clean text. Output ONLY the final text."
-            
+
             if !languageCodes.isEmpty {
                 let langList = languageCodes.joined(separator: ", ")
                 promptText += "\nTarget language(s): \(langList)"
                 systemText += "\nTarget language(s): \(langList)"
             }
-            
+
             if !customVocabulary.isEmpty {
                 let vocabList = customVocabulary.joined(separator: ", ")
                 promptText += "\nCustom vocabulary & technical terms to recognize accurately: \(vocabList)"
                 systemText += "\nCustom vocabulary: \(vocabList)"
             }
-            
+
             payload = [
                 "contents": [
                     [
@@ -72,12 +73,12 @@ struct GeminiRestClient {
                             [
                                 "inlineData": [
                                     "mimeType": "audio/wav",
-                                    "data": base64Wav
+                                    "data": base64Wav,
                                 ]
                             ],
                             [
                                 "text": promptText
-                            ]
+                            ],
                         ]
                     ]
                 ],
@@ -90,16 +91,16 @@ struct GeminiRestClient {
                             "text": systemText
                         ]
                     ]
-                ]
+                ],
             ]
         }
-        
+
         guard let requestBody = try? JSONSerialization.data(withJSONObject: payload) else {
             completion(.failure(NSError(domain: "JustSpeak", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize REST JSON."])))
             return
         }
         request.httpBody = requestBody
-        
+
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
             let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
 
@@ -130,7 +131,14 @@ struct GeminiRestClient {
                     }
                     return
                 }
-                completion(.failure(NSError(domain: "GeminiAPI", code: 429, userInfo: [NSLocalizedDescriptionKey: "Rate limited (429) on \(model); retry delay \(String(format: "%.1f", delay))s \(isRetry ? "after one retry" : "exceeds budget") - not retrying."])))
+                completion(
+                    .failure(
+                        NSError(
+                            domain: "GeminiAPI", code: 429,
+                            userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "Rate limited (429) on \(model); retry delay \(String(format: "%.1f", delay))s \(isRetry ? "after one retry" : "exceeds budget") - not retrying."
+                            ])))
                 return
             }
 
@@ -141,8 +149,9 @@ struct GeminiRestClient {
             if let status = (response as? HTTPURLResponse)?.statusCode, !(200...299).contains(status) {
                 var apiReason = ""
                 if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let apiError = json["error"] as? [String: Any],
-                   let msg = apiError["message"] as? String {
+                    let apiError = json["error"] as? [String: Any],
+                    let msg = apiError["message"] as? String
+                {
                     apiReason = " (\(msg.prefix(140)))"
                 }
                 let message: String
@@ -167,7 +176,8 @@ struct GeminiRestClient {
             }
 
             if let errorObj = json["error"] as? [String: Any],
-               let message = errorObj["message"] as? String {
+                let message = errorObj["message"] as? String
+            {
                 completion(.failure(NSError(domain: "GeminiAPI", code: (errorObj["code"] as? Int) ?? -1, userInfo: [NSLocalizedDescriptionKey: message])))
                 return
             }
@@ -181,11 +191,13 @@ struct GeminiRestClient {
             }
 
             if let candidates = json["candidates"] as? [[String: Any]],
-               let firstCandidate = candidates.first {
+                let firstCandidate = candidates.first
+            {
                 if let content = firstCandidate["content"] as? [String: Any],
-                   let parts = content["parts"] as? [[String: Any]],
-                   let firstPart = parts.first,
-                   let text = firstPart["text"] as? String {
+                    let parts = content["parts"] as? [[String: Any]],
+                    let firstPart = parts.first,
+                    let text = firstPart["text"] as? String
+                {
                     // The REST path prompts a general-purpose model to transcribe; its documented
                     // failure mode is answering instead of transcribing. Gate before this text
                     // ever reaches insertion (Feature: RestValidationGate).
@@ -205,7 +217,7 @@ struct GeminiRestClient {
                 completion(.failure(NSError(domain: "JustSpeak", code: -6, userInfo: [NSLocalizedDescriptionKey: "Could not extract candidate text from response."])))
             }
         }
-        
+
         task.resume()
     }
 
@@ -224,4 +236,3 @@ struct GeminiRestClient {
         return nil
     }
 }
-

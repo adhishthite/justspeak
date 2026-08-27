@@ -21,7 +21,7 @@ struct TextInjector {
         }
         return copiedItems
     }
-    
+
     private static func restoreClipboard(_ savedItems: [NSPasteboardItem]) {
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -29,7 +29,7 @@ struct TextInjector {
             pb.writeObjects(savedItems)
         }
     }
-    
+
     static func inject(text: String, restorePreviousClipboard: Bool = true, completionSound: Bool = true, appendSpace: Bool = false) -> (success: Bool, latencyMs: Double) {
         let startTime = CFAbsoluteTimeGetCurrent()
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -40,10 +40,10 @@ struct TextInjector {
         // Appended after the trim, or the trim would eat it: one trailing space so the next
         // dictation doesn't fuse onto this one.
         let payload = appendSpace ? trimmed + " " : trimmed
-        
+
         // 1. Snapshot previous clipboard to preserve user data
         let previousClipboard = restorePreviousClipboard ? snapshotClipboard() : []
-        
+
         // 2. Put text onto pasteboard for active app injection. Written as an NSPasteboardItem
         // with transient/auto-generated marker types so clipboard managers skip archiving it.
         let pasteboard = NSPasteboard.general
@@ -61,22 +61,23 @@ struct TextInjector {
 
         // 3. Synthesize Cmd+V via CGEvent (posted exclusively to cghidEventTap)
         let source = CGEventSource(stateID: .hidSystemState)
-        let vKeyCode: CGKeyCode = 0x09 // Virtual keycode for 'v'
-        
+        let vKeyCode: CGKeyCode = 0x09  // Virtual keycode for 'v'
+
         var eventSuccess = false
         if let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true),
-           let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false) {
-            
+            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
+        {
+
             keyDown.flags = .maskCommand
             keyUp.flags = .maskCommand
-            
+
             keyDown.post(tap: .cghidEventTap)
-            usleep(10_000) // 10ms key press hold - sufficient for a synthesized Cmd+V to register
+            usleep(10_000)  // 10ms key press hold - sufficient for a synthesized Cmd+V to register
             keyUp.post(tap: .cghidEventTap)
-            
+
             eventSuccess = true
         }
-        
+
         // 4. Fallback to AppleScript only if CGEvent dispatch failed
         if !eventSuccess {
             Logger.warn("INJECT", "CGEvent posting failed; executing AppleScript System Events fallback...")
@@ -89,7 +90,7 @@ struct TextInjector {
                 eventSuccess = true
             }
         }
-        
+
         // 5. Asynchronously restore user's previous clipboard after ~1s (giving slow/Electron
         // apps like Slack/VSCode time to consume it), but only if nothing else has touched the
         // pasteboard since our write - otherwise a user copy (or another app) would get clobbered.
@@ -124,4 +125,3 @@ struct TextInjector {
         return pasteboard.writeObjects([item])
     }
 }
-

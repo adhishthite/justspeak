@@ -3,7 +3,7 @@
 final class FloatingHUD {
     private let notchPanel: NSPanel
     private let notchGlowView: AppleNotchAuraView
-    
+
     private let pillPanel: NSPanel
     private let pillContentView: NSView
     private let backplateView: AppleIslandBackplateView
@@ -11,7 +11,7 @@ final class FloatingHUD {
     private let headerLabel: NSTextField
     private let transcriptLabel: NSTextField
     private let waveformView: AppleSiriWaveformView
-    
+
     private var hideWorkItem: DispatchWorkItem?
     private var currentWidth: CGFloat = 330
     private let minPillWidth: CGFloat = 330
@@ -27,14 +27,14 @@ final class FloatingHUD {
         let screen = NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
         self.screenFrame = screen.frame
         self.notchInfo = NotchGeometry.detect(screen: screen)
-        
+
         // 1. Setup Hardware Notch Glow Overlay Panel
         let padding: CGFloat = 50.0
         let glowWidth = notchInfo.rect.width + padding * 2
         let glowHeight = notchInfo.rect.height + padding + 44.0
         let glowX = notchInfo.rect.minX - padding
         let glowY = screen.frame.height - glowHeight
-        
+
         self.notchPanel = NSPanel(
             contentRect: NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -48,16 +48,16 @@ final class FloatingHUD {
         notchPanel.hasShadow = false
         notchPanel.ignoresMouseEvents = true
         notchPanel.alphaValue = 0.0
-        
+
         self.notchGlowView = AppleNotchAuraView(frame: NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight))
         notchGlowView.notchRect = notchInfo.rect
         notchPanel.contentView = notchGlowView
-        
+
         // 2. Setup Floating Dynamic Island Panel
         let initialWidth = minPillWidth
         let pillX = screen.frame.midX - initialWidth / 2.0
         let pillY = screen.frame.height - notchInfo.rect.height - pillHeight - pillGap
-        
+
         self.pillPanel = NSPanel(
             contentRect: NSRect(x: pillX, y: pillY, width: initialWidth, height: pillHeight),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -71,7 +71,7 @@ final class FloatingHUD {
         pillPanel.hasShadow = true
         pillPanel.ignoresMouseEvents = true
         pillPanel.alphaValue = 0.0
-        
+
         // Hardware-black container. The pill reads as a piece of the notch itself - opaque
         // near-black like the bezel glass, not a translucent overlay - so no blur material.
         // (The old NSVisualEffectView blur was painted over by the 0.9-alpha backplate anyway,
@@ -84,24 +84,24 @@ final class FloatingHUD {
             pillContentView.layer?.cornerCurve = .continuous
         }
         pillContentView.layer?.masksToBounds = true
-        
+
         self.backplateView = AppleIslandBackplateView(frame: NSRect(x: 0, y: 0, width: initialWidth, height: pillHeight))
         pillContentView.addSubview(backplateView)
-        
+
         // Apple Intelligence Living Orb (Top-Left)
         self.orbIcon = AppleIntelligenceOrbView(frame: NSRect(x: 16, y: 27, width: 18, height: 18))
         pillContentView.addSubview(orbIcon)
-        
+
         // Eyebrow state label (Top-Center-Left): a single state word in the NOW PLAYING idiom.
         // State leads; the tool's name is not information the user needs at a glance.
         self.headerLabel = NSTextField(labelWithString: "")
         headerLabel.frame = NSRect(x: 38, y: 27, width: 230, height: 16)
         pillContentView.addSubview(headerLabel)
-        
+
         // Apple Siri Equalizer (Top-Right)
         self.waveformView = AppleSiriWaveformView(frame: NSRect(x: initialWidth - 48, y: 26, width: 32, height: 16))
         pillContentView.addSubview(waveformView)
-        
+
         // Live Transcript / Preview Text (Bottom-Row)
         self.transcriptLabel = NSTextField(labelWithString: "")
         transcriptLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .regular)
@@ -174,11 +174,11 @@ final class FloatingHUD {
         let clamped = max(minPillWidth, min(maxPillWidth, targetWidth))
         guard abs(clamped - currentWidth) > 8.0 else { return }
         currentWidth = clamped
-        
+
         let newX = screenFrame.midX - currentWidth / 2.0
         let newY = screenFrame.height - notchInfo.rect.height - pillHeight - pillGap
         let newRect = NSRect(x: newX, y: newY, width: currentWidth, height: pillHeight)
-        
+
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.20
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
@@ -192,7 +192,7 @@ final class FloatingHUD {
             notchGlowView.pillSize = CGSize(width: clamped, height: pillHeight)
         }
     }
-    
+
     // MARK: State typography
 
     // Eyebrow state word: uppercase micro-type with wide tracking (the NOW PLAYING idiom).
@@ -202,7 +202,7 @@ final class FloatingHUD {
             attributes: [
                 .font: NSFont.systemFont(ofSize: 9.0, weight: .semibold),
                 .foregroundColor: color,
-                .kern: 1.1
+                .kern: 1.1,
             ]
         )
     }
@@ -220,18 +220,19 @@ final class FloatingHUD {
             attributes: [
                 .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
                 .foregroundColor: color,
-                .paragraphStyle: paragraph
+                .paragraphStyle: paragraph,
             ]
         )
         if caret {
-            body.append(NSAttributedString(
-                string: " ▏",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
-                    .foregroundColor: AppleDesign.siriCyan,
-                    .paragraphStyle: paragraph
-                ]
-            ))
+            body.append(
+                NSAttributedString(
+                    string: " ▏",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
+                        .foregroundColor: AppleDesign.siriCyan,
+                        .paragraphStyle: paragraph,
+                    ]
+                ))
         }
         transcriptLabel.attributedStringValue = body
     }
@@ -291,14 +292,14 @@ final class FloatingHUD {
             pillPanel.animator().setFrame(finalRect, display: true)
         }
     }
-    
+
     func updateAudioLevel(db: Double) {
         let norm = max(0.0, min(1.0, CGFloat((db + 55.0) / 45.0)))
         notchGlowView.audioLevel = norm
         orbIcon.audioLevel = norm
         waveformView.updateLevel(db: db)
     }
-    
+
     func updateLiveText(_ text: String) {
         let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         guard !clean.isEmpty else { return }
@@ -370,22 +371,23 @@ final class FloatingHUD {
         // Retract back beneath the notch, mirroring the entrance.
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let retractRect = pillPanel.frame.offsetBy(dx: 0, dy: 10)
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            self.notchPanel.animator().alphaValue = 0.0
-            self.pillPanel.animator().alphaValue = 0.0
-            if !reduceMotion {
-                self.pillPanel.animator().setFrame(retractRect, display: true)
-            }
-        }, completionHandler: {
-            if self.notchPanel.alphaValue == 0.0 {
-                self.notchPanel.orderOut(nil)
-                self.pillPanel.orderOut(nil)
-                self.notchGlowView.stopAnimation()
-                self.orbIcon.stopAnimation()
-            }
-        })
+        NSAnimationContext.runAnimationGroup(
+            { context in
+                context.duration = 0.18
+                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                self.notchPanel.animator().alphaValue = 0.0
+                self.pillPanel.animator().alphaValue = 0.0
+                if !reduceMotion {
+                    self.pillPanel.animator().setFrame(retractRect, display: true)
+                }
+            },
+            completionHandler: {
+                if self.notchPanel.alphaValue == 0.0 {
+                    self.notchPanel.orderOut(nil)
+                    self.pillPanel.orderOut(nil)
+                    self.notchGlowView.stopAnimation()
+                    self.orbIcon.stopAnimation()
+                }
+            })
     }
 }
-
