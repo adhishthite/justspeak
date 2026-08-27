@@ -23,16 +23,16 @@ Hold [⌥ Right] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemin
 ## ✨ Key Features
 
 - **Sub-500ms End-to-End Latency**: Audio chunks are streamed over persistent WebSockets while you speak, so Gemini receives and transcribes speech before you even release the hotkey.
-- **Zero Trailing Cutoff**: Engineered with a 150ms hardware post-roll grace period, synchronous queue drain, 700ms acoustic lookahead silence, and post-commit token settlement.
+- **Zero Clipping at Either End**: A 400ms always-on pre-roll ring buffer captures the syllable spoken *before* key-down, and an adaptive post-roll keeps streaming after release while speech energy persists (250ms continuous-quiet window, 1.5s hard cap) — releasing the key mid-syllable never clips the last word.
 - **Apple HIG & Dynamic Island UI**:
-  - **Notch Bezel Aura**: 3-layer Gaussian glow embracing your MacBook display notch.
+  - **Notch Light Spill**: a soft pool of light beneath the notch that breathes with your voice — one Google color at a time, slowly cycling blue → red → yellow → green → white; success settles on green, errors on red.
   - **Siri Orb & Living Equalizer**: Pulsing Apple Intelligence gradient orb with 4-bar dynamic audio visualizer.
-  - **Obsidian Dynamic Island Capsule**: Glassmorphic floating HUD rendered with Display P3 colors.
+  - **Dynamic Island Capsule**: Hardware-black floating HUD that reads as the notch extruding, rendered with Display P3 colors.
 - **Apple System Earcons**: Pre-cached native macOS audio feedback on key-down and text commit (`begin_record.caf`, `jbl_confirm.caf`, `jbl_cancel.caf`).
 - **Custom Vocabulary**: Domain terms, acronyms, team names, and tech stack jargon loaded from [`vocabulary.txt`](vocabulary.txt) or `.env`.
-- **Bilingual & Code-Switching Support**: Built-in support for English (`en`), Marathi (`mr`), Hindi (`hi`), and 70+ languages with automatic acoustic language detection.
+- **Bilingual & Code-Switching Support**: Built-in support for English (`en-IN`), Marathi (`mr-IN`), Hindi (`hi-IN`), and 80+ languages with automatic acoustic language detection.
 - **Zero Unsigned Binaries (gMac Enterprise Compliant)**: Pure Swift script executed directly through Apple's signed `/usr/bin/swift` interpreter with zero third-party binary dependencies.
-- **Resilient Fallback Routing**: Automatic, transparent failover to Gemini REST API (`gemini-3.5-flash-lite` / `gemini-3.5-transcribe`) on WebSocket disconnection or timeouts. Because the fallback *prompts* a general-purpose model to transcribe rather than calling a dedicated transcription model, its results pass through a validation gate first — an LLM asked to transcribe audio can answer or chat about it instead, and a rejected result is discarded rather than pasted. Silent clips are peak-detected locally and never reach the API at all, empty transcripts on real audio get one re-send (model nondeterminism), and 429 responses honor the server's `retryDelay`/`Retry-After` hint for a single retry before failing.
+- **Resilient Fallback Routing**: Automatic, transparent failover to Gemini REST API (`gemini-3.5-flash-lite` / `gemini-3.5-transcribe`) on WebSocket disconnection or timeouts. Because the fallback *prompts* a general-purpose model to transcribe rather than calling a dedicated transcription model, its results pass through a validation gate first — an LLM asked to transcribe audio can answer or chat about it instead, and a rejected result is discarded rather than pasted. Silent clips never reach any API: a local frame-RMS scan counts 20ms speech-energy frames (immune to the hotkey's own click transient, which defeats simple peak detection), and when the Live model itself reports no speech in a low-energy clip, that verdict is trusted and the turn settles as empty instead of handing silence to the REST model to hallucinate over. Empty transcripts on real audio get one re-send (model nondeterminism), and 429 responses honor the server's `retryDelay`/`Retry-After` hint for a single retry before failing.
 
 ---
 
@@ -69,13 +69,13 @@ sequenceDiagram
         GeminiWS-->>HUD: Progressive Live Text Stream
     end
     User->>Hotkey: Key Up (Release)
-    Hotkey->>Mic: Post-roll Drain (150ms) + Silence Flush (700ms)
+    Hotkey->>Mic: Adaptive Post-roll (250ms quiet window, 1.5s cap)
     Hotkey->>HUD: Show Processing Spinner
-    Hotkey->>GeminiWS: Commit Turn (clientContent.turnComplete: true)
+    Hotkey->>GeminiWS: Commit Turn (audioStreamEnd + activityEnd)
     
     alt WebSocket Streaming Success (<450ms)
         GeminiWS-->>Hotkey: Return Final Polished Transcript
-    else WebSocket Timeout / Disconnection (>4s)
+    else WebSocket Timeout / Disconnection
         Hotkey->>GeminiREST: Transcribe Audio Buffer (audio/wav)
         GeminiREST-->>Hotkey: Return Transcribed Text
     end
@@ -145,12 +145,13 @@ All settings can be configured in `.env` or set as environment variables:
 | `LANGUAGE_CODES` | `en-IN,mr-IN` | Region-qualified BCP-47 codes from the live-transcribe language table (e.g. `en-IN,mr-IN`, `en-US`, or `auto` for unrestricted) |
 | `CUSTOM_VOCABULARY` | *(empty)* | Comma-separated list of words/phrases to boost |
 | `CUSTOM_VOCABULARY_FILE` | `vocabulary.txt` | File containing one word/phrase per line (`#` comments allowed) |
-| `HOTKEY` | `right_option` | Trigger key (`right_option`, `left_option`, `right_control`, `left_control`, `right_cmd`, `left_cmd`, `fn`, `f18`, `f19`, `f13`) |
+| `HOTKEY` | `right_option` | Trigger key (`right_option`, `left_option`, `right_control`, `left_control`, `right_cmd`, `left_cmd`, `fn`, `f13`–`f20`, or a raw numeric keyCode) |
 | `HOTKEY_MODE` | `push_to_talk` | `push_to_talk` (hold to speak) or `toggle` (press to start, press to stop) |
 | `SOUND_FEEDBACK` | `true` | Subtle Apple system earcons on start / commit |
-| `SHOW_HUD` | `true` | Native floating Dynamic Island capsule + Apple Notch Bezel Aura |
+| `SHOW_HUD` | `true` | Native floating Dynamic Island capsule + notch light spill |
 | `ENABLE_LIVE_WEBSOCKET` | `true` | Stream audio chunks via Live WebSockets (`true`) or REST only (`false`) |
-| `REST_FALLBACK_TIMEOUT` | `4.0` | Maximum seconds to wait for WebSocket response before falling back to REST |
+| `REST_FALLBACK_TIMEOUT` | `4.0` | Maximum seconds to wait for WebSocket response before falling back to REST (`.env.example` ships `2.5`) |
+| `PRE_ROLL_MS` | `400` | Always-on rolling ring buffer (ms) dispatched instantly at key-down so the first syllable is never clipped (0-1000) |
 | `POST_ROLL_MS` | `250` | Adaptive trailing capture: continuous-quiet window (ms) after key release before the turn commits; audio keeps streaming while speech energy persists (0-500) |
 | `POST_ROLL_MAX_MS` | `1500` | Hard cap (ms) on the adaptive trailing capture above; set equal to `POST_ROLL_MS` (or `0`) to disable adaptation (0-5000) |
 | `TRAIL_SILENCE_DB` | `-40.0` | RMS dBFS below which the mic is considered quiet for the adaptive trailing capture above (-80.0 to -10.0) |
@@ -226,7 +227,7 @@ cooper netties => Kubernetes
 
 ## 🌐 Multilingual & Bilingual Support
 
-JustSpeak supports over 70 languages with native code-switching support:
+JustSpeak supports over 80 languages with native code-switching support:
 
 - **Configured Languages**: Priority language codes can be set in `.env`:
   ```ini
@@ -236,7 +237,7 @@ JustSpeak supports over 70 languages with native code-switching support:
   # English, Hindi, and Marathi
   LANGUAGE_CODES=en-IN,hi-IN,mr-IN
   
-  # Unrestricted Automatic Language Detection (All 70+ languages)
+  # Unrestricted Automatic Language Detection (All 80+ languages)
   LANGUAGE_CODES=auto
   ```
 - **Code-Switching**: Speak natural bilingual sentences (e.g. Marathi with English technical terms like *"मी LangGraph वापरून नवीन pipeline बनवली आहे"*).
@@ -254,9 +255,11 @@ JustSpeak supports over 70 languages with native code-switching support:
 | `right_cmd` | Right Command (⌘ Right) | `54` |
 | `left_cmd` | Left Command (⌘ Left) | `55` |
 | `fn` | Function / Globe Key (🌐) | `63` |
-| `f18` | F18 Key | `0x4F` |
-| `f19` | F19 Key | `0x50` |
-| `f13` | F13 Key | `0x69` |
+| `f13` … `f20` | F13–F20 Keys | `0x69`, `0x6B`, `0x71`, `0x6A`, `0x40`, `0x4F`, `0x50`, `0x5A` |
+| *(any number)* | Raw macOS keyCode | *(as given)* |
+
+> [!TIP]
+> **Using `fn`**: macOS also acts on the Globe key itself, so set **System Settings → Keyboard → "Press 🌐 key to" → Do Nothing**, and disable Apple Dictation's Fn shortcut (**Keyboard → Dictation**) to avoid triggering Apple's own dictation. Some external keyboards handle Fn in firmware and never send keyCode 63 — use an F-key there instead.
 
 ---
 
