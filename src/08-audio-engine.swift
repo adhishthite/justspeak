@@ -240,6 +240,13 @@ final class AudioCaptureEngine {
             }
             lock.unlock()
 
+            // Audio delivery leads everything else on this queue: stdout is unbuffered and the
+            // meter write below is a synchronous flush, so a slow or blocked terminal must
+            // never sit between a finished chunk and its trip to the WebSocket.
+            if let toStream = toStream {
+                onAudioChunk?(toStream)
+            }
+
             // RMS math runs for every buffer while recording (not just the meter's 10Hz
             // throttle) so stopRecording's adaptive trailing-capture poll always sees a fresh
             // level. int16Pointer is still valid here - it points into outputBuffer, a local
@@ -259,16 +266,14 @@ final class AudioCaptureEngine {
             lastLevelTime = CFAbsoluteTimeGetCurrent()
             lock.unlock()
 
+            // HUD level first, terminal meter last - the print is the only call here that can
+            // block on an external consumer.
             if shouldUpdateMeter {
+                onAudioLevel?(db)
                 let meterBars = renderVolumeMeter(db: db)
                 Logger.meter(
                     "\(ANSI.bold)\(ANSI.yellow)🎙️  RECORDING\(ANSI.reset) [\(meterBars)] \(String(format: "%5.1f", db)) dB | \(String(format: "%.2fs", elapsed)) | \(String(format: "%.1f", kbStreamed)) KB streamed (#\(chunkCountSnapshot))"
                 )
-                onAudioLevel?(db)
-            }
-
-            if let toStream = toStream {
-                onAudioChunk?(toStream)
             }
         }
     }

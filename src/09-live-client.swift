@@ -447,17 +447,19 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             Logger.warn("WS", "Server sent goAway signal. Preemptively scheduling reconnect...")
             self.scheduleReconnect()
         }
+        // Callbacks fire before any terminal write: stdout is unbuffered and a slow consumer
+        // must never delay the HUD update or the turn's completion. The completion is invoked
+        // directly - its only consumer immediately hops onto the app's sessionQueue, so the
+        // old DispatchQueue.global() bounce added a scheduling hop for nothing.
         if let update = liveTextUpdate {
+            onLiveTextUpdate?(update.textCopy)
             Logger.meter(
                 "\(ANSI.bold)\(ANSI.cyan)\(update.label)\(ANSI.reset) [\(String(format: "%.0f", update.elapsedMs))ms]: \(ANSI.bold)\(update.fullText.replacingOccurrences(of: "\n", with: " "))\(ANSI.reset)"
             )
-            onLiveTextUpdate?(update.textCopy)
         }
         if let fire = turnCompletionFire {
+            fire.completion?(.success((text: fire.text, firstTokenMs: fire.firstTokenMs, totalMs: fire.totalMs)))
             Logger.endMeter()
-            DispatchQueue.global().async {
-                fire.completion?(.success((text: fire.text, firstTokenMs: fire.firstTokenMs, totalMs: fire.totalMs)))
-            }
         }
         // A post-commit token arrived: (re)schedule the quiet-window settle check, never
         // earlier than minPostCommitWait after commit. Scheduling happens off-lock; the
@@ -570,14 +572,14 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         turnCompletion = nil
         lock.unlock()
 
-        Logger.endMeter()
-        DispatchQueue.global().async {
-            if !text.isEmpty {
-                cb?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
-            } else {
-                cb?(.failure(NSError(domain: "JustSpeak", code: -2, userInfo: [NSLocalizedDescriptionKey: "No speech recognized before timeout."])))
-            }
+        // Completion before the terminal write, and directly on settleQueue - the consumer
+        // re-dispatches onto sessionQueue itself, so the extra global-queue hop bought nothing.
+        if !text.isEmpty {
+            cb?(.success((text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)))
+        } else {
+            cb?(.failure(NSError(domain: "JustSpeak", code: -2, userInfo: [NSLocalizedDescriptionKey: "No speech recognized before timeout."])))
         }
+        Logger.endMeter()
     }
 
     func startNewTurn() {
