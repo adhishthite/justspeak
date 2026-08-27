@@ -42,14 +42,17 @@ private enum HUDMetrics {
     // A deliberate air gap beneath the notch: the aura's light spill needs visible
     // wallpaper between the bezel and the pill to land on.
     static let pillGap: CGFloat = 14.0
-    // Host-panel margins: side room for the layer shadow, top room for the slide-in
-    // travel, bottom room for shadow spread plus unfurl's height overshoot.
+    // Host-panel margins: side room for the layer shadow, bottom room for shadow spread
+    // plus unfurl's height overshoot.
     static let hostMarginX: CGFloat = 40.0
-    static let hostMarginTop: CGFloat = 16.0
     static let hostMarginBottom: CGFloat = 44.0
 
-    static var hostSize: CGSize {
-        CGSize(width: maxPillWidth + hostMarginX * 2.0, height: pillHeight + hostMarginTop + hostMarginBottom)
+    // The host spans from the screen's TOP edge (the morph membrane must start hidden
+    // inside the notch cutout) down past the pill's resting place.
+    static func hostSize(notchHeight: CGFloat) -> CGSize {
+        CGSize(
+            width: maxPillWidth + hostMarginX * 2.0,
+            height: notchHeight + pillGap + pillHeight + hostMarginBottom)
     }
 }
 
@@ -139,13 +142,12 @@ final class FloatingHUD: NSObject {
         notchGlowView.alphaValue = 0.0
         notchPanel.contentView = notchGlowView
 
-        // 2. Static host panel for the pill, at maximum footprint.
-        let host = HUDMetrics.hostSize
-        let pillTopScreen = screenFrame.height - notchInfo.rect.height - HUDMetrics.pillGap
+        // 2. Static host panel for the pill, at maximum footprint, top edge at screen top.
+        let host = HUDMetrics.hostSize(notchHeight: notchInfo.rect.height)
         let hostPanel = NSPanel(
             contentRect: NSRect(
                 x: screenFrame.midX - host.width / 2.0,
-                y: pillTopScreen + HUDMetrics.hostMarginTop - host.height,
+                y: screenFrame.height - host.height,
                 width: host.width, height: host.height),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -168,7 +170,7 @@ final class FloatingHUD: NSObject {
         let pillWrapper = NSView(
             frame: NSRect(
                 x: (host.width - HUDMetrics.minPillWidth) / 2.0,
-                y: host.height - HUDMetrics.hostMarginTop - HUDMetrics.pillHeight,
+                y: host.height - notchInfo.rect.height - HUDMetrics.pillGap - HUDMetrics.pillHeight,
                 width: HUDMetrics.minPillWidth, height: HUDMetrics.pillHeight))
         pillWrapper.wantsLayer = true
         pillWrapper.layer?.masksToBounds = false
@@ -258,12 +260,12 @@ final class FloatingHUD: NSObject {
         self.screenFrame = screen.frame
         self.notchInfo = NotchGeometry.detect(screen: screen)
 
-        let host = HUDMetrics.hostSize
+        let host = HUDMetrics.hostSize(notchHeight: notchInfo.rect.height)
         let pillTopScreen = screenFrame.height - notchInfo.rect.height - HUDMetrics.pillGap
         hostPanel.setFrame(
             NSRect(
                 x: screenFrame.midX - host.width / 2.0,
-                y: pillTopScreen + HUDMetrics.hostMarginTop - host.height,
+                y: screenFrame.height - host.height,
                 width: host.width, height: host.height),
             display: true)
         hostView.frame = NSRect(x: 0, y: 0, width: host.width, height: host.height)
@@ -364,51 +366,98 @@ final class FloatingHUD: NSObject {
     // after any instant reduced-motion or screen-change update); AppKit skips repaints for
     // frames set to their existing values, so settled ticks cost nothing.
     private func applyFrame() {
-        let p = presence.value
+        let p = max(0.0, presence.value)
         let w = min(max(widthSpring.value, HUDMetrics.minPillWidth), HUDMetrics.maxPillWidth)
         let hostBounds = hostView.bounds
-        let pillTop = hostBounds.height - HUDMetrics.hostMarginTop
+        let pillTop = hostBounds.height - notchInfo.rect.height - HUDMetrics.pillGap
 
         // Each reveal style is a pure mapping from presence to geometry, so the SAME spring
-        // handles entrance, exit and mid-flight redirection; unfurl's settle-back bounce is
-        // the spring's own overshoot (damping ratio per style), not a second animation stage.
-        var pw = w
-        var ph = HUDMetrics.pillHeight
-        var lift: CGFloat = 0.0
+        // handles entrance, exit and mid-flight redirection; overshoot bounces are the
+        // spring's own physics (damping ratio per style), never a second animation stage.
+        var rect: NSRect
+        var radius: CGFloat
+        // Morph fades CONTENT late instead of the surface: the membrane pretends to be the
+        // notch, and a translucent notch breaks the illusion. Other styles fade the whole
+        // surface and keep content at full alpha.
+        var contentAlpha: CGFloat = 1.0
+        var surfaceAlpha = max(0.0, min(1.0, p / 0.65))
+
         switch revealStyle {
-        case "drift":
-            lift = 4.0 * (1.0 - p)
-        case "bloom":
-            let s = 0.88 + 0.12 * p
-            pw = w * s
-            ph = HUDMetrics.pillHeight * s
-        case "unfurl":
-            ph = HUDMetrics.pillHeight * (0.70 + 0.30 * p)
+        case "morph" where notchInfo.hasPhysicalNotch:
+            // Membrane: phase A stays glued to the screen top (starting entirely inside the
+            // notch cutout, i.e. invisible) while the bottom edge and width stretch to the
+            // pill's; phase B detaches - the top edge peels off the notch and travels down
+            // to the pill's resting top, opening the aura gap. Spring overshoot past p=1
+            // squashes the just-detached droplet by a few percent before it settles.
+            // Mapping continuity at the split and radius validity are Python-verified.
+            let hostTop = hostBounds.height
+            let notchBottom = hostTop - notchInfo.rect.height
+            let pillBottom = pillTop - HUDMetrics.pillHeight
+            let split: CGFloat = 0.55
+            if p < split {
+                let t = p / split
+                let bottom = notchBottom + (pillBottom - notchBottom) * t
+                let pw = notchInfo.rect.width + (w - notchInfo.rect.width) * t
+                rect = NSRect(x: (hostBounds.width - pw) / 2.0, y: bottom, width: pw, height: hostTop - bottom)
+                radius = 14.0 + (HUDMetrics.pillHeight / 2.0 - 14.0) * t
+            } else {
+                let t = (p - split) / (1.0 - split)
+                let top = hostTop + (pillTop - hostTop) * t
+                rect = NSRect(x: (hostBounds.width - w) / 2.0, y: pillBottom, width: w, height: top - pillBottom)
+                radius = HUDMetrics.pillHeight / 2.0
+            }
+            radius = min(radius, rect.height / 2.0)
+            contentAlpha = max(0.0, min(1.0, (p - 0.7) / 0.3))
+            surfaceAlpha = min(1.0, p / 0.12)
+
         default:
-            lift = 10.0 * (1.0 - p)
+            var pw = w
+            var ph = HUDMetrics.pillHeight
+            var lift: CGFloat = 0.0
+            switch revealStyle {
+            case "drift":
+                lift = 4.0 * (1.0 - p)
+            case "bloom":
+                let s = 0.88 + 0.12 * p
+                pw = w * s
+                ph = HUDMetrics.pillHeight * s
+            case "unfurl":
+                ph = HUDMetrics.pillHeight * (0.70 + 0.30 * p)
+            default:
+                // "slide" - also the fallback for unknown styles and for morph on displays
+                // with no physical notch to emerge from.
+                lift = 10.0 * (1.0 - p)
+            }
+            // Top edge pinned: overshoot expressed as height/size with the top fixed can
+            // never open a gap between the pill and the notch above it.
+            rect = NSRect(x: (hostBounds.width - pw) / 2.0, y: pillTop - ph + lift, width: pw, height: ph)
+            radius = ph / 2.0
         }
 
-        // Top edge pinned: overshoot expressed as height/size with the top fixed can never
-        // open a gap between the pill and the notch above it.
-        pillWrapper.frame = NSRect(x: (hostBounds.width - pw) / 2.0, y: pillTop - ph + lift, width: pw, height: ph)
+        let pw = rect.width
+        let ph = rect.height
+        pillWrapper.frame = rect
         pillClip.frame = pillWrapper.bounds
-        pillClip.layer?.cornerRadius = ph / 2.0
+        pillClip.layer?.cornerRadius = radius
         backplateView.frame = pillClip.bounds
-        // Content is top-anchored so unfurl reveals it with the unrolling edge.
+        // Content is top-anchored so unfurl and morph reveal it with the moving top edge.
         orbIcon.frame = NSRect(x: 16, y: ph - 25, width: 18, height: 18)
         headerLabel.frame = NSRect(x: 38, y: ph - 25, width: 230, height: 16)
         waveformView.frame = NSRect(x: pw - 48, y: ph - 26, width: 32, height: 16)
         transcriptLabel.frame = NSRect(x: 16, y: ph - 45, width: pw - 32, height: 20)
+        orbIcon.alphaValue = contentAlpha
+        headerLabel.alphaValue = contentAlpha
+        waveformView.alphaValue = contentAlpha
+        transcriptLabel.alphaValue = contentAlpha
 
         pillWrapper.layer?.shadowPath = CGPath(
-            roundedRect: pillWrapper.bounds, cornerWidth: ph / 2.0, cornerHeight: ph / 2.0, transform: nil)
+            roundedRect: pillWrapper.bounds, cornerWidth: radius, cornerHeight: radius, transform: nil)
 
-        // Fade completes in the first 65% of travel, so arrival reads as motion, not opacity.
-        let alpha = max(0.0, min(1.0, p / 0.65))
-        pillWrapper.layer?.shadowOpacity = Float(0.55 * alpha)
+        // Fade completes early in the travel, so arrival reads as motion, not opacity.
+        pillWrapper.layer?.shadowOpacity = Float(0.55 * surfaceAlpha)
         if !reduceMotion {
-            hostView.alphaValue = alpha
-            notchGlowView.alphaValue = alpha
+            hostView.alphaValue = surfaceAlpha
+            notchGlowView.alphaValue = surfaceAlpha
         }
         if !notchInfo.hasPhysicalNotch {
             notchGlowView.pillSize = CGSize(width: pw, height: ph)
@@ -528,10 +577,12 @@ final class FloatingHUD: NSObject {
         startTick()
     }
 
-    // Slide and drift settle cleanly; bloom takes a soft overshoot; unfurl is the bounciest.
+    // Slide and drift settle cleanly; bloom takes a soft overshoot; morph gets a subtle
+    // droplet squash on detach; unfurl is the bounciest.
     private static func entranceDamping(for style: String) -> CGFloat {
         switch style {
         case "bloom": return 0.80
+        case "morph": return 0.75
         case "unfurl": return 0.55
         default: return 1.0
         }

@@ -28,7 +28,8 @@ struct Config {
     // (there can be seconds of silence before the commit earcon on a slow REST fallback).
     var releaseSound: Bool = true
     var showHUD: Bool = true
-    // HUD pill entrance animation: "slide" (shipped default), "bloom", "drift", "unfurl".
+    // HUD pill entrance animation: "slide" (shipped default), "bloom", "drift", "unfurl",
+    // "morph" (Dynamic Island membrane; needs a physical notch, else falls back to slide).
     var hudRevealStyle: String = "slide"
     // Ambient particle motes under the notch while listening (CAEmitterLayer, GPU-composited;
     // skipped under Reduce Motion).
@@ -214,7 +215,7 @@ struct Config {
                         case "SOUND_FEEDBACK": config.soundFeedback = (value.lowercased() == "true" || value == "1")
                         case "RELEASE_SOUND": config.releaseSound = (value.lowercased() == "true" || value == "1")
                         case "SHOW_HUD": config.showHUD = (value.lowercased() == "true" || value == "1")
-                        case "HUD_REVEAL": if ["slide", "bloom", "drift", "unfurl"].contains(value.lowercased()) { config.hudRevealStyle = value.lowercased() }
+                        case "HUD_REVEAL": if ["slide", "bloom", "drift", "unfurl", "morph"].contains(value.lowercased()) { config.hudRevealStyle = value.lowercased() }
                         case "HUD_PARTICLES": config.hudParticles = (value.lowercased() == "true" || value == "1")
                         case "PRIVACY_MODE": config.privacyMode = (value.lowercased() == "true" || value == "1")
                         case "DUCK_AUDIO": config.duckAudio = (value.lowercased() == "true" || value == "1")
@@ -261,7 +262,7 @@ struct Config {
         if let sound = env["SOUND_FEEDBACK"] { config.soundFeedback = (sound.lowercased() == "true" || sound == "1") }
         if let rel = env["RELEASE_SOUND"] { config.releaseSound = (rel.lowercased() == "true" || rel == "1") }
         if let hud = env["SHOW_HUD"] { config.showHUD = (hud.lowercased() == "true" || hud == "1") }
-        if let reveal = env["HUD_REVEAL"], ["slide", "bloom", "drift", "unfurl"].contains(reveal.lowercased()) { config.hudRevealStyle = reveal.lowercased() }
+        if let reveal = env["HUD_REVEAL"], ["slide", "bloom", "drift", "unfurl", "morph"].contains(reveal.lowercased()) { config.hudRevealStyle = reveal.lowercased() }
         if let motes = env["HUD_PARTICLES"] { config.hudParticles = (motes.lowercased() == "true" || motes == "1") }
         if let priv = env["PRIVACY_MODE"] { config.privacyMode = (priv.lowercased() == "true" || priv == "1") }
         if let duck = env["DUCK_AUDIO"] { config.duckAudio = (duck.lowercased() == "true" || duck == "1") }
