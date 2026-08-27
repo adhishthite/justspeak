@@ -171,6 +171,8 @@ All settings can be configured in `.env` or set as environment variables:
 | `MIC_IDLE_TIMEOUT` | `300` | Seconds without a dictation before the mic is released (status-bar indicator off); next key-down re-arms it. `0` = always on |
 | `HISTORY` | `true` | Record every dictation (success, empty, or error) as one row in a local SQLite DB for later analysis |
 | `HISTORY_DB` | *(empty)* | Path to the history SQLite DB. Empty = `~/.justspeak/history.db` |
+| `ANALYZE_MODEL` | `gemini-3.7-flash` | Model used by `make analyze` to mine the history (runs rarely and offline, so a stronger model is affordable). Empty = use `GEMINI_MODEL` |
+| `ANALYZE_CONTEXT` | *(empty)* | One line describing who is dictating, injected into the `make analyze` prompt so it can judge what a garbled phrase meant. Also settable as a `# context:` line in the vocabulary file (the env knob wins) |
 | `LIVE_INPUT_PRICE_PER_1M` | `3.50` | USD per 1M audio input tokens for the live model (cost diagnostics only) |
 | `LIVE_OUTPUT_PRICE_PER_1M` | `21.00` | USD per 1M text output tokens for the live model (cost diagnostics only) |
 | `REST_INPUT_PRICE_PER_1M` | `0.30` | USD per 1M input tokens for the REST fallback model (cost diagnostics only) |
@@ -243,7 +245,7 @@ make analyze                      # last 30 days
 ./justspeak --analyze --days 7    # custom window
 ```
 
-The analyzer pulls your successful dictations from the local history DB (newest first, capped at 500 turns), sends them **once** to the REST model (`GEMINI_MODEL`, flash-lite by default) and asks it for two things: domain terms you say repeatedly that a recognizer is likely to mangle (→ boost terms), and the same intended word showing up in recurring garbled forms (→ `wrong => right` rules). Suggestions already covered by your vocabulary are filtered out, each comes with its evidence, and the reported token cost is printed. Nothing is written unless you answer `y` to the final prompt, which appends the suggestions to your vocabulary file under a dated `# Added by --analyze` comment — they take effect on the next launch.
+The analyzer pulls your successful dictations from the local history DB (newest first, capped at 500 turns) — each with its timestamp and the app it was dictated into — and sends them **once** to `ANALYZE_MODEL` (`gemini-3.7-flash` by default). It asks for two things: domain terms you say repeatedly that a recognizer is likely to mangle (→ boost terms), and misrecognitions of what you actually meant (→ `wrong => right` rules). Your existing vocabulary is the primary hunting list for the latter — "cloud code" is caught *because* "Claude Code" is in your vocabulary — and near-identical dictations seconds apart are pre-detected as re-dictation pairs, whose differing words are direct correction evidence. A `# context:` line in your vocabulary file (or `ANALYZE_CONTEXT`) describing who you are sharpens the guesses. Duplicate suggestions are filtered, rules are capped at 4 words per side and never proposed for grammar/punctuation/capitalization-only differences, and each suggestion comes with its evidence. Nothing is written unless you answer `y` to the final prompt, which appends the suggestions to your vocabulary file under a dated `# Added by --analyze` comment — they take effect on the next launch.
 
 This is strictly on-demand: the dictation pipeline never runs it, and your transcripts go exactly where they already went to be transcribed — the same Gemini API, same key.
 

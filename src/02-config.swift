@@ -91,6 +91,13 @@ struct Config {
     // so usage/latency/cost can be analyzed later. Plaintext on disk; disable with HISTORY=false.
     var historyEnabled: Bool = true
     var historyDbPath: String = ""  // empty = ~/.justspeak/history.db
+    // Analyzer-only knobs (--analyze / make analyze). Analysis is rare and offline, so it
+    // can afford a stronger model than the REST fallback; empty falls back to GEMINI_MODEL.
+    var analyzeModel: String = "gemini-3.7-flash"
+    // Free-text persona for the analysis prompt ("solutions architect at ...; daily terms:
+    // GCP services, AI products") so the model can judge what a garbled phrase plausibly
+    // meant. Also settable as "# context: ..." lines in the vocabulary file; the knob wins.
+    var analyzeContext: String = ""
 
     static func parseVocabulary(from text: String) -> [String] {
         var items: [String] = []
@@ -121,6 +128,22 @@ struct Config {
             }
         }
         return items
+    }
+
+    // "# context: ..." lines in the vocabulary file describe the dictating user for the
+    // analyzer prompt. parseVocabulary already skips them as comments, so the directive
+    // rides in the same file without affecting recognition. Multiple lines join with a space.
+    static func parseContextDirective(from text: String) -> String {
+        var parts: [String] = []
+        for line in text.components(separatedBy: .newlines) {
+            let cleaned = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = cleaned.lowercased()
+            guard lower.hasPrefix("# context:") || lower.hasPrefix("#context:") else { continue }
+            guard let colon = cleaned.firstIndex(of: ":") else { continue }
+            let value = String(cleaned[cleaned.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            if !value.isEmpty { parts.append(value) }
+        }
+        return parts.joined(separator: " ")
     }
 
     // Splits raw vocabulary items into plain boost terms and "wrong => right" replacement
@@ -157,14 +180,6 @@ struct Config {
             if s.count == 4 { return s.prefix(1).uppercased() + s.dropFirst().lowercased() }
             return s.uppercased()
         }.joined(separator: "-")
-    }
-
-    static func loadVocabularyFile(path: String) -> [String] {
-        let expanded = NSString(string: path).expandingTildeInPath
-        if let content = try? String(contentsOfFile: expanded, encoding: .utf8) {
-            return parseVocabulary(from: content)
-        }
-        return []
     }
 
     static func load() -> Config {
@@ -237,6 +252,8 @@ struct Config {
                         case "MIC_IDLE_TIMEOUT": if let sec = Int(value) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
                         case "HISTORY": config.historyEnabled = (value.lowercased() == "true" || value == "1")
                         case "HISTORY_DB": config.historyDbPath = value
+                        case "ANALYZE_MODEL": config.analyzeModel = value
+                        case "ANALYZE_CONTEXT": config.analyzeContext = value
                         case "LIVE_INPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.liveInputPricePer1M = p }
                         case "LIVE_OUTPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.liveOutputPricePer1M = p }
                         case "REST_INPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.restInputPricePer1M = p }
@@ -284,6 +301,8 @@ struct Config {
         if let micIdle = env["MIC_IDLE_TIMEOUT"], let sec = Int(micIdle) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
         if let hist = env["HISTORY"], !hist.isEmpty { config.historyEnabled = (hist.lowercased() == "true" || hist == "1") }
         if let histDb = env["HISTORY_DB"], !histDb.isEmpty { config.historyDbPath = histDb }
+        if let am = env["ANALYZE_MODEL"], !am.isEmpty { config.analyzeModel = am }
+        if let ac = env["ANALYZE_CONTEXT"], !ac.isEmpty { config.analyzeContext = ac }
         if let p = env["LIVE_INPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.liveInputPricePer1M = v }
         if let p = env["LIVE_OUTPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.liveOutputPricePer1M = v }
         if let p = env["REST_INPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.restInputPricePer1M = v }
@@ -324,11 +343,17 @@ struct Config {
         }
 
         for candidate in candidateFiles {
-            let items = loadVocabularyFile(path: candidate)
+            let expanded = NSString(string: candidate).expandingTildeInPath
+            guard let content = try? String(contentsOfFile: expanded, encoding: .utf8) else { continue }
+            let items = parseVocabulary(from: content)
             if !items.isEmpty {
                 combinedVocab.append(contentsOf: items)
                 if config.customVocabularyFile.isEmpty {
                     config.customVocabularyFile = candidate
+                }
+                // The env knobs win; the file directive only fills an unset context.
+                if config.analyzeContext.isEmpty {
+                    config.analyzeContext = parseContextDirective(from: content)
                 }
                 break
             }
