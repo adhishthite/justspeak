@@ -17,6 +17,19 @@ final class JustSpeakApp {
     // speech - below this peak no speech exists in the clip, so don't bill an API call for it.
     private let silentClipPeakDb: Double = -55.0
 
+    // Peak alone can't catch silence: the physical hotkey click sits inside every capture's
+    // pre-roll and spikes the peak above silentClipPeakDb. A click is a 1-2 frame transient,
+    // while even the shortest word sustains 100ms+ of energy, so a clip with at most this many
+    // 20ms frames above TRAIL_SILENCE_DB is also gated as silent.
+    private let silentClipMaxSpeechFrames = 2
+
+    // When the live STT model reports "no speech recognized" AND the clip has fewer speech-energy
+    // frames than this, that verdict is trusted as an authoritative empty turn - the REST fallback
+    // is suppressed (flash-lite hallucinates plausible greetings when handed room tone). With
+    // this many frames or more, the fallback still runs: a stalled-but-connected WS must not be
+    // able to drop a real dictation.
+    private let wsNoSpeechTrustFrames = 5
+
     // Frontmost app snapshotted at key-down (main thread); compared again right before paste
     // so a focus change mid-turn downgrades to clipboard-only instead of pasting into the wrong app.
     private var turnFrontmostPID: pid_t?
@@ -290,6 +303,35 @@ final class JustSpeakApp {
         return 20 * log10(max(Double(maxAbs), 1.0) / 32768.0)
     }
 
+    /// Count of 20ms frames (320 samples @ 16kHz mono) whose RMS exceeds thresholdDb, scanning
+    /// the same region peakDbFS does (everything except the trailing silence-flush guard).
+    /// This is the speech-evidence metric: room tone yields 0 frames, a hotkey click 1-2, and
+    /// any real utterance well above that. Byte-pair assembly for the same alignment reason.
+    private static func speechFrameCount(of pcmData: Data, thresholdDb: Double, guardBytes: Int = 22400) -> Int {
+        guard pcmData.count > guardBytes else { return 0 }
+        let scanCount = pcmData.count - guardBytes
+        let base = pcmData.startIndex
+        let frameBytes = 640 // 20ms of 16-bit mono @ 16kHz
+        var frames = 0
+        var offset = 0
+        while offset + frameBytes <= scanCount {
+            var sumSquares = 0.0
+            var i = 0
+            while i + 1 < frameBytes {
+                let lo = pcmData[base + offset + i]
+                let hi = pcmData[base + offset + i + 1]
+                let sample = Int16(bitPattern: UInt16(lo) | (UInt16(hi) << 8))
+                let s = Double(sample) / 32768.0
+                sumSquares += s * s
+                i += 2
+            }
+            let rms = (sumSquares / Double(frameBytes / 2)).squareRoot()
+            if 20 * log10(max(rms, 1e-9)) > thresholdDb { frames += 1 }
+            offset += frameBytes
+        }
+        return frames
+    }
+
     /// Runs entirely on sessionQueue: finalizes the capture, arbitrates the WS-vs-REST turn
     /// lifecycle, and is the only place that mutates currentTurnId / turnSettled / pendingFallbackTimer.
     private func runTurnPipeline(keyUpTime: CFAbsoluteTime) {
@@ -307,12 +349,14 @@ final class JustSpeakApp {
             return
         }
 
-        // Silent-clip gate: peak-scan the captured audio before spending an API call on it. Runs
+        // Silent-clip gate: scan the captured audio before spending an API call on it. Runs
         // on sessionQueue, ahead of both the WS and REST routes, so room tone never leaves the
         // machine. Abandons the turn the same way the micro-click guard above does (isProcessing
-        // is never set, the WS turn is never committed).
-        if let peakDb = Self.peakDbFS(of: pcmData), peakDb < silentClipPeakDb {
-            Logger.warn("INPUT", "No speech detected in clip (peak \(String(format: "%.1f", peakDb)) dBFS) - skipping API call.")
+        // is never set, the WS turn is never committed). Two tests: absolute peak (dead room),
+        // and speech-frame count (room tone whose peak is spiked by the hotkey's own click).
+        let speechFrames = Self.speechFrameCount(of: pcmData, thresholdDb: config.trailSilenceDb)
+        if let peakDb = Self.peakDbFS(of: pcmData), peakDb < silentClipPeakDb || speechFrames <= silentClipMaxSpeechFrames {
+            Logger.warn("INPUT", "No speech detected in clip (peak \(String(format: "%.1f", peakDb)) dBFS, \(speechFrames) speech frames) - skipping API call.")
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: "No speech detected")
                 self?.scheduleMicIdleRelease()
@@ -409,6 +453,16 @@ final class JustSpeakApp {
                             Logger.debug("SESSION", "WS failed for turn #\(turnId); hedge REST already in flight.")
                             return
                         }
+                        // "No speech recognized" (code -2) is not a transport failure: the live
+                        // STT model processed the whole clip (manual VAD) and heard nothing. When
+                        // the clip's own energy profile agrees, settle empty instead of handing
+                        // room tone to the REST model, which hallucinates text from silence.
+                        let nsError = error as NSError
+                        if nsError.domain == "JustSpeak", nsError.code == -2, speechFrames < self.wsNoSpeechTrustFrames {
+                            Logger.warn("WS", "No speech recognized (\(speechFrames) speech frames in clip); settling empty - REST fallback suppressed.")
+                            self.settle(turnId: turnId, route: "WS", outcome: .empty(audioDuration: duration))
+                            return
+                        }
                         // WS gave a definitive answer (an error); the hedge timer no longer needs
                         // to fire a second, redundant REST call.
                         self.pendingFallbackTimer?.cancel()
@@ -430,6 +484,9 @@ final class JustSpeakApp {
     /// diagnostic printout needs; failure is the REST-fallback-failed error path.
     private enum TurnOutcome {
         case success(text: String, transport: String, firstTokenMs: Double, roundtripMs: Double, audioDuration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, fallbackReason: String?, isLiveRoute: Bool, inputTokens: Int?, outputTokens: Int?)
+        // The live STT model heard nothing and the clip's energy profile agrees: a real
+        // no-speech turn, not an error - nothing is pasted and no fallback is attempted.
+        case empty(audioDuration: Double)
         case failure(Error)
     }
 
@@ -528,6 +585,41 @@ final class JustSpeakApp {
                 inputTokens: inputTokens,
                 outputTokens: outputTokens
             )
+
+        case .empty(let audioDuration):
+            DispatchQueue.main.async { [weak self] in
+                self?.hud?.showError(message: "No speech detected")
+            }
+            history?.record(TranscriptionHistoryStore.TurnRecord(
+                outcome: "empty",
+                text: nil,
+                charCount: 0,
+                wordCount: 0,
+                transport: route,
+                model: nil,
+                isLiveRoute: nil,
+                fallbackReason: nil,
+                audioSeconds: audioDuration,
+                firstTokenMs: nil,
+                roundtripMs: nil,
+                captureFinalizeMs: nil,
+                injectMs: nil,
+                totalMs: nil,
+                injected: nil,
+                inputTokens: nil,
+                outputTokens: nil,
+                tokensMetered: nil,
+                costUSD: nil,
+                languageCodes: config.languageCodes.joined(separator: ","),
+                smartMode: config.smartTranscription,
+                vadMode: config.vadMode,
+                error: nil,
+                appBundleId: turnFrontmostBundleId,
+                appName: turnFrontmostName
+            ))
+            processingLock.lock()
+            isProcessing = false
+            processingLock.unlock()
 
         case .failure(let error):
             Logger.error("REST", "Transcription failed: \(error.localizedDescription)")
