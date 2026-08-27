@@ -1,4 +1,4 @@
-// MARK: - Apple Intelligence Glowing Notch Bezel Aura (Hardware Bezel Illumination)
+// MARK: - Notch Bezel Aura (Downward Light Spill, Google-Color Time Cycle)
 
 final class AppleNotchAuraView: NSView {
     enum GlowState {
@@ -32,7 +32,9 @@ final class AppleNotchAuraView: NSView {
         displayTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            let speed: CGFloat = (self.state == .processing) ? 0.024 : 0.007
+            // One full 5-color loop: ~14s while listening (each hue holds ~1.7s, fades ~1.1s);
+            // processing triples the tempo so the wait reads as activity.
+            let speed: CGFloat = (self.state == .processing) ? 0.0036 : 0.0012
             self.phase = (self.phase + speed).truncatingRemainder(dividingBy: 1.0)
             self.needsDisplay = true
         }
@@ -74,87 +76,61 @@ final class AppleNotchAuraView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         if state == .idle { return }
-        
+
         let path = createNotchPath(in: self.bounds)
-        let leftX = (bounds.width - notchRect.width) / 2.0
-        let rightX = leftX + notchRect.width
-        
-        // 16-Stop Continuous Apple Intelligence Chromatic Gradient
-        let stops = 16
-        var cgColors: [CGColor] = []
-        var locations: [CGFloat] = []
-        for i in 0...stops {
-            let loc = CGFloat(i) / CGFloat(stops)
-            let color: NSColor
-            if state == .success {
-                color = AppleDesign.appleGreen
-            } else if state == .error {
-                color = AppleDesign.appleCoral
-            } else {
-                color = AppleDesign.siriSpectrum(at: loc + phase)
-            }
-            cgColors.append(color.cgColor)
-            locations.append(loc)
+        let bottomY = bounds.height - notchRect.height
+
+        // One tint per frame - the Google cycle lives in TIME, not along the stroke.
+        let tint: NSColor
+        switch state {
+        case .success: tint = AppleDesign.googleGreen
+        case .error:   tint = AppleDesign.googleRed
+        default:       tint = AppleDesign.googleSpectrum(at: phase)
         }
-        
+
+        // Voice gives the light its breath: a quiet floor so the glow never dies,
+        // headroom so speech visibly brightens and lengthens the spill.
+        let energy: CGFloat = (state == .listening) ? (0.30 + 0.70 * audioLevel) : 0.55
+
+        // 1. Downward light spill: a wide, shallow pool under the notch, as if the bezel
+        // were backlit. A circular radial gradient drawn through a horizontally scaled
+        // CTM becomes the ellipse; clipped so no light paints above the bezel line.
+        let dropRadius: CGFloat = 30.0 + 22.0 * energy
+        let halfSpan = notchRect.width / 2.0 + 46.0
+        let centerAlpha: CGFloat = 0.26 + 0.30 * energy
+
         let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
-        guard let gradient = CGGradient(colorsSpace: colorSpace, colors: cgColors as CFArray, locations: locations) else { return }
-        
-        // 1. Layer 1: Ethereal Atmospheric Aurora Bloom
-        let auraBlur: CGFloat = (state == .listening) ? (16.0 + 20.0 * audioLevel) : 16.0
-        let auraWidth: CGFloat = (state == .listening) ? (7.0 + 8.0 * audioLevel) : 7.0
-        let dominantGlowColor: NSColor
-        if state == .success {
-            dominantGlowColor = AppleDesign.appleGreen
-        } else if state == .error {
-            dominantGlowColor = AppleDesign.appleCoral
-        } else {
-            dominantGlowColor = AppleDesign.siriSpectrum(at: phase + 0.5)
+        let poolColors = [
+            tint.withAlphaComponent(centerAlpha).cgColor,
+            tint.withAlphaComponent(centerAlpha * 0.35).cgColor,
+            tint.withAlphaComponent(0.0).cgColor
+        ] as CFArray
+        let poolLocations: [CGFloat] = [0.0, 0.45, 1.0]
+        if let pool = CGGradient(colorsSpace: colorSpace, colors: poolColors, locations: poolLocations) {
+            context.saveGState()
+            context.clip(to: CGRect(x: 0, y: 0, width: bounds.width, height: bottomY))
+            context.translateBy(x: bounds.midX, y: bottomY)
+            context.scaleBy(x: halfSpan / dropRadius, y: 1.0)
+            context.drawRadialGradient(
+                pool,
+                startCenter: .zero, startRadius: 0,
+                endCenter: .zero, endRadius: dropRadius,
+                options: []
+            )
+            context.restoreGState()
         }
-        
+
+        // 2. Bezel rim: one thin line of the same hue hugging the notch outline, with a
+        // soft downward halo - definition, not decoration.
         context.saveGState()
         context.setShadow(
-            offset: CGSize(width: 0, height: -3),
-            blur: auraBlur,
-            color: dominantGlowColor.withAlphaComponent(0.70 + 0.25 * audioLevel).cgColor
+            offset: CGSize(width: 0, height: -2),
+            blur: 8.0 + 6.0 * energy,
+            color: tint.withAlphaComponent(0.6).cgColor
         )
         context.addPath(path)
-        context.setLineWidth(auraWidth)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-        context.replacePathWithStrokedPath()
-        context.clip()
-        
-        context.drawLinearGradient(
-            gradient,
-            start: CGPoint(x: leftX - 16, y: 0),
-            end: CGPoint(x: rightX + 16, y: 0),
-            options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
-        )
-        context.restoreGState()
-        
-        // 2. Layer 2: Precision Apple Intelligence Chromatic Ribbon
-        context.saveGState()
-        context.addPath(path)
-        context.setLineWidth(2.6)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-        context.replacePathWithStrokedPath()
-        context.clip()
-        
-        context.drawLinearGradient(
-            gradient,
-            start: CGPoint(x: leftX - 16, y: 0),
-            end: CGPoint(x: rightX + 16, y: 0),
-            options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
-        )
-        context.restoreGState()
-        
-        // 3. Layer 3: Refractive Specular Platinum Core Line
-        context.saveGState()
-        context.addPath(path)
-        context.setStrokeColor(NSColor(white: 1.0, alpha: 0.95).cgColor)
-        context.setLineWidth(0.8)
+        context.setStrokeColor(tint.withAlphaComponent(0.50 + 0.30 * energy).cgColor)
+        context.setLineWidth(1.5)
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.strokePath()

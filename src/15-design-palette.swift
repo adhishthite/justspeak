@@ -9,7 +9,16 @@ enum AppleDesign {
     static let appleGreen  = NSColor(displayP3Red: 0.19, green: 0.82, blue: 0.35, alpha: 1.0) // #30D158 (Apple systemGreen)
     static let appleCoral  = NSColor(displayP3Red: 1.00, green: 0.27, blue: 0.23, alpha: 1.0) // #FF453A
     static let appleGold   = NSColor(displayP3Red: 1.00, green: 0.80, blue: 0.00, alpha: 1.0) // #FFCC00
-    
+
+    // Google brand palette (notch glow). White must be EXACTLY achromatic (equal
+    // components -> OKLab chroma 0) so googleSpectrum's fades through it are pure
+    // desaturation with no hue discontinuity at the segment boundaries.
+    static let googleBlue   = NSColor(displayP3Red: 0.259, green: 0.522, blue: 0.957, alpha: 1.0) // #4285F4
+    static let googleRed    = NSColor(displayP3Red: 0.918, green: 0.263, blue: 0.208, alpha: 1.0) // #EA4335
+    static let googleYellow = NSColor(displayP3Red: 0.984, green: 0.737, blue: 0.016, alpha: 1.0) // #FBBC04
+    static let googleGreen  = NSColor(displayP3Red: 0.204, green: 0.659, blue: 0.325, alpha: 1.0) // #34A853
+    static let googleWhite  = NSColor(displayP3Red: 0.970, green: 0.970, blue: 0.970, alpha: 1.0)
+
     // MARK: OKLCH interpolation (Ottosson's OKLab, pure math - no dependencies)
     //
     // The chromatic loop interpolates in OKLCH rather than raw P3 RGB: straight RGB lerps
@@ -75,6 +84,47 @@ enum AppleDesign {
 
     // Anchor stops converted once; siriSpectrum below is pure math per call.
     private static let spectrumAnchors: [OKLCh] = [siriCyan, siriIndigo, siriMagenta, siriAmber].map(toOKLCh)
+
+    private static let googleAnchors: [OKLCh] = [googleBlue, googleRed, googleYellow, googleGreen, googleWhite].map(toOKLCh)
+
+    // One Google color at a time: each anchor DWELLS as a solid hue for most of its
+    // segment, then eases into the next (blue -> red -> yellow -> green -> white -> blue).
+    // This is deliberately the opposite of siriSpectrum, which spreads all hues across
+    // space at once; here the spectrum is distributed across time.
+    static func googleSpectrum(at t: CGFloat) -> NSColor {
+        let wrapped = t.truncatingRemainder(dividingBy: 1.0)
+        let count = googleAnchors.count
+        let pos = (wrapped < 0 ? wrapped + 1.0 : wrapped) * CGFloat(count)
+        let seg = Int(pos) % count
+        var frac = pos - CGFloat(Int(pos))
+
+        let dwell: CGFloat = 0.60
+        if frac <= dwell {
+            frac = 0
+        } else {
+            let f = (frac - dwell) / (1.0 - dwell)
+            frac = f * f * (3 - 2 * f) // smoothstep: no visible seam at either end of the fade
+        }
+
+        let c1 = googleAnchors[seg]
+        let c2 = googleAnchors[(seg + 1) % count]
+
+        // White is achromatic, so its stored hue is numerically arbitrary; borrow the
+        // chromatic endpoint's hue so the fade is a pure desaturation, not a hue swing.
+        var h1 = c1.h
+        var h2 = c2.h
+        if c1.C < 0.02 { h1 = h2 }
+        if c2.C < 0.02 { h2 = h1 }
+        var dh = h2 - h1
+        if dh > .pi { dh -= 2 * .pi }
+        if dh < -.pi { dh += 2 * .pi }
+
+        return fromOKLCh(OKLCh(
+            L: c1.L + (c2.L - c1.L) * frac,
+            C: c1.C + (c2.C - c1.C) * frac,
+            h: h1 + dh * frac
+        ))
+    }
 
     // Continuous Apple Intelligence 4-phase chromatic loop: Cyan -> Indigo -> Magenta -> Amber -> Cyan
     static func siriSpectrum(at t: CGFloat) -> NSColor {
