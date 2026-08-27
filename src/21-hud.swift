@@ -332,11 +332,15 @@ final class FloatingHUD {
         // of the sentence is always visible, with a slim caret marking the live edge.
         setTranscript(clean, color: .white, caret: true, truncation: .byTruncatingHead)
 
-        // Fluid Dynamic Island auto-expansion based on text width
-        let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 13.5)
-        let textWidth = (clean as NSString).size(withAttributes: [.font: font]).width
-        let neededWidth = max(minPillWidth, textWidth + 64.0)
-        updatePillWidth(targetWidth: neededWidth)
+        // Fluid Dynamic Island auto-expansion based on text width. Once the pill is at max
+        // width it can only stay there until the next showListening resets it, so stop paying
+        // the full-transcript measurement on every interim update.
+        if currentWidth < maxPillWidth {
+            let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 13.5)
+            let textWidth = (clean as NSString).size(withAttributes: [.font: font]).width
+            let neededWidth = max(minPillWidth, textWidth + 64.0)
+            updatePillWidth(targetWidth: neededWidth)
+        }
     }
 
     func showProcessing() {

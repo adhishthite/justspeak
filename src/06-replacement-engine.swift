@@ -4,18 +4,32 @@
 // via boost vocabulary, but this layer *guarantees* it - longest-match-first, word-boundary,
 // case-preserving (ALL-CAPS / Title / lower propagation).
 enum ReplacementEngine {
-    static func apply(_ text: String, rules: [ReplacementRule]) -> String {
-        guard !rules.isEmpty else { return text }
-        var result = text
+    // Sorted + regex-compiled once at config load; apply() runs on the paste path between
+    // settlement and injection, so per-turn sorting/compilation was pure latency.
+    struct CompiledRule {
+        let regex: NSRegularExpression
+        let wrong: String
+        let right: String
+    }
+
+    static func compile(_ rules: [ReplacementRule]) -> [CompiledRule] {
         // Longest wrong-form first so "gemini api" wins over "gemini".
-        for rule in rules.sorted(by: { $0.wrong.count > $1.wrong.count }) {
-            guard !rule.wrong.isEmpty else { continue }
+        return rules.sorted(by: { $0.wrong.count > $1.wrong.count }).compactMap { rule in
+            guard !rule.wrong.isEmpty else { return nil }
             // Lookarounds instead of \b: word boundaries silently never match when the wrong
             // form starts/ends with punctuation ("e.g.", "c++").
             let pattern = "(?<![\\w])\(NSRegularExpression.escapedPattern(for: rule.wrong))(?![\\w])"
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+            return CompiledRule(regex: regex, wrong: rule.wrong, right: rule.right)
+        }
+    }
+
+    static func apply(_ text: String, compiled: [CompiledRule]) -> String {
+        guard !compiled.isEmpty else { return text }
+        var result = text
+        for rule in compiled {
             let ns = result as NSString
-            let matches = regex.matches(in: result, range: NSRange(location: 0, length: ns.length)).reversed()
+            let matches = rule.regex.matches(in: result, range: NSRange(location: 0, length: ns.length)).reversed()
             let mutable = NSMutableString(string: result)
             for match in matches {
                 let original = ns.substring(with: match.range)

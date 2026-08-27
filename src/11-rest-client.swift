@@ -31,23 +31,16 @@ struct GeminiRestClient {
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
         request.timeoutInterval = 10.0
 
-        let payload: [String: Any]
+        // Base64's alphabet (A-Za-z0-9+/=) needs no JSON escaping, so the envelope is spliced
+        // around the audio payload directly - running the multi-MB string through
+        // JSONSerialization would escape-scan and copy it a second time for nothing. The
+        // small prompt/system strings still go through JSONSerialization for real escaping.
+        let audioPart = "{\"inlineData\":{\"mimeType\":\"audio/wav\",\"data\":\"" + base64Wav + "\"}}"
+
+        let body: String
         if model.contains("transcribe") {
             // Dedicated STT Foundation Model (Pure Audio, zero developer instruction requirement)
-            payload = [
-                "contents": [
-                    [
-                        "parts": [
-                            [
-                                "inlineData": [
-                                    "mimeType": "audio/wav",
-                                    "data": base64Wav,
-                                ]
-                            ]
-                        ]
-                    ]
-                ]
-            ]
+            body = "{\"contents\":[{\"parts\":[" + audioPart + "]}]}"
         } else {
             // General Multimodal LLM (Prompt & System Instruction guided)
             var promptText =
@@ -66,40 +59,19 @@ struct GeminiRestClient {
                 systemText += "\nCustom vocabulary: \(vocabList)"
             }
 
-            payload = [
-                "contents": [
-                    [
-                        "parts": [
-                            [
-                                "inlineData": [
-                                    "mimeType": "audio/wav",
-                                    "data": base64Wav,
-                                ]
-                            ],
-                            [
-                                "text": promptText
-                            ],
-                        ]
-                    ]
-                ],
-                "generationConfig": [
-                    "temperature": 0.0
-                ],
-                "systemInstruction": [
-                    "parts": [
-                        [
-                            "text": systemText
-                        ]
-                    ]
-                ],
-            ]
+            guard let promptJson = jsonFragment(["text": promptText]),
+                let systemJson = jsonFragment(["parts": [["text": systemText]]])
+            else {
+                completion(.failure(NSError(domain: "JustSpeak", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize REST JSON."])))
+                return
+            }
+            body =
+                "{\"contents\":[{\"parts\":[" + audioPart + "," + promptJson + "]}],"
+                + "\"generationConfig\":{\"temperature\":0},"
+                + "\"systemInstruction\":" + systemJson + "}"
         }
 
-        guard let requestBody = try? JSONSerialization.data(withJSONObject: payload) else {
-            completion(.failure(NSError(domain: "JustSpeak", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize REST JSON."])))
-            return
-        }
-        request.httpBody = requestBody
+        request.httpBody = Data(body.utf8)
 
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
             let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
@@ -219,6 +191,12 @@ struct GeminiRestClient {
         }
 
         task.resume()
+    }
+
+    /// Serializes one small object to a JSON string for splicing into the hand-built envelope.
+    private static func jsonFragment(_ obj: Any) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     /// Extracts a short retry hint from a 429: the `Retry-After` header (seconds), else the

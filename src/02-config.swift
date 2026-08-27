@@ -18,6 +18,9 @@ struct Config {
     var customVocabulary: [String] = []
     var customVocabularyFile: String = ""
     var replacementRules: [ReplacementRule] = []
+    // Sorted + regex-compiled form of replacementRules, built once at load (the raw rules
+    // stay around for display and the analyzer).
+    var compiledReplacementRules: [ReplacementEngine.CompiledRule] = []
     var hotkey: String = "right_option"
     var hotkeyMode: String = "push_to_talk"  // "push_to_talk" or "toggle"
     var soundFeedback: Bool = true
@@ -297,6 +300,7 @@ struct Config {
         // recognizer to keep mishearing it the same way.
         let vocabSplit = splitVocabularyItems(combinedVocab)
         config.replacementRules = vocabSplit.rules
+        config.compiledReplacementRules = ReplacementEngine.compile(vocabSplit.rules)
         combinedVocab = vocabSplit.vocab + vocabSplit.rules.map { $0.right }
 
         // Deduplicate while preserving order

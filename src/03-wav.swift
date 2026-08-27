@@ -9,6 +9,7 @@ extension FixedWidthInteger {
 func createWavData(from pcm16Data: Data, sampleRate: Int = 16000, channels: Int = 1) -> Data {
     var wav = Data()
     let dataSize = pcm16Data.count
+    wav.reserveCapacity(44 + dataSize)
     let chunkSize = UInt32(36 + dataSize)
 
     // RIFF Chunk Descriptor

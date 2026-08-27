@@ -798,7 +798,7 @@ final class JustSpeakApp {
         }
 
         // Deterministic wrong->right enforcement (client-side guarantee on top of boost bias).
-        let text = ReplacementEngine.apply(trimmed, rules: config.replacementRules)
+        let text = ReplacementEngine.apply(trimmed, compiled: config.compiledReplacementRules)
 
         print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
         print("\(ANSI.bold)\(text)\(ANSI.reset)")

@@ -41,8 +41,15 @@ struct TextInjector {
         // dictation doesn't fuse onto this one.
         let payload = appendSpace ? trimmed + " " : trimmed
 
-        // 1. Snapshot previous clipboard to preserve user data
+        // 1. Snapshot previous clipboard to preserve user data. The snapshot materializes
+        // every representation of every pasteboard item synchronously on the paste path, so
+        // surface it when it's actually slow (large images/files on the clipboard).
+        let snapshotStart = CFAbsoluteTimeGetCurrent()
         let previousClipboard = restorePreviousClipboard ? snapshotClipboard() : []
+        let snapshotMs = (CFAbsoluteTimeGetCurrent() - snapshotStart) * 1000.0
+        if snapshotMs > 5.0 {
+            Logger.debug("INJECT", "Clipboard snapshot took \(String(format: "%.0f", snapshotMs))ms (\(previousClipboard.count) items)")
+        }
 
         // 2. Put text onto pasteboard for active app injection. Written as an NSPasteboardItem
         // with transient/auto-generated marker types so clipboard managers skip archiving it.

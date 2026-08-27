@@ -51,7 +51,7 @@ struct Diagnostics {
             Thread.sleep(forTimeInterval: 1.0)
         }
 
-        let (pcmData, duration, chunks, _) = engine.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
+        let (pcmData, duration, chunks, _, _, _) = engine.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
         SoundManager.playCommitSound()
         engine.stopEngine()
 
