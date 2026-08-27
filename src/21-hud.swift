@@ -30,6 +30,15 @@ final class FloatingHUD {
     // Entrance animation; set once at startup from config. "slide" is the shipped default.
     var revealStyle: String = "slide"
 
+    // Ambient mote emission under the notch while listening; forwarded to the aura view.
+    var particlesEnabled: Bool = true {
+        didSet { notchGlowView.particlesEnabled = particlesEnabled }
+    }
+
+    // Screen-share privacy: the pill never renders dictated words - a generic placeholder
+    // stands in while streaming and the success beat shows no transcript.
+    var privacyMode: Bool = false
+
     init() {
         let screen = NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
         self.screenFrame = screen.frame
@@ -414,6 +423,13 @@ final class FloatingHUD {
     }
 
     func updateLiveText(_ text: String) {
+        // Privacy mode: acknowledge that speech is landing without rendering a word of it.
+        // The pill also stays at minimum width - nothing to read, nothing to grow for.
+        if privacyMode {
+            setTranscript("Speaking…", color: NSColor(white: 1.0, alpha: 0.85), caret: true)
+            return
+        }
+
         let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         guard !clean.isEmpty else { return }
 
@@ -441,7 +457,7 @@ final class FloatingHUD {
         // Keep the user's words on screen, just dimmed - wiping them for a status message
         // makes the pill feel like it lost the dictation.
         let existing = currentTranscriptText
-        if existing.isEmpty || existing == "Speak, then release to paste" {
+        if privacyMode || existing.isEmpty || existing == "Speak, then release to paste" {
             setTranscript("Polishing…", color: NSColor(white: 1.0, alpha: 0.70), caret: false)
         } else {
             setTranscript(existing, color: NSColor(white: 1.0, alpha: 0.70), caret: false)
@@ -462,7 +478,7 @@ final class FloatingHUD {
         setHeader("Pasted", color: AppleDesign.appleGreen)
         let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         transcriptLabel.lineBreakMode = .byTruncatingTail
-        setTranscript(clean.isEmpty ? "Done" : clean, color: .white, caret: false)
+        setTranscript(privacyMode || clean.isEmpty ? "Done" : clean, color: .white, caret: false)
         waveformView.reset()
 
         let workItem = DispatchWorkItem { [weak self] in

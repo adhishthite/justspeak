@@ -30,6 +30,12 @@ struct Config {
     var showHUD: Bool = true
     // HUD pill entrance animation: "slide" (shipped default), "bloom", "drift", "unfurl".
     var hudRevealStyle: String = "slide"
+    // Ambient particle motes under the notch while listening (CAEmitterLayer, GPU-composited;
+    // skipped under Reduce Motion).
+    var hudParticles: Bool = true
+    // Screen-share privacy: HUD and terminal never render dictated text (paste still happens;
+    // the history DB still records locally).
+    var privacyMode: Bool = false
     // Duck the system output while recording so music/video on speakers doesn't bleed into
     // the mic (hurting accuracy and billing audio tokens for it). Opt-in: changing the output
     // volume uninvited is surprising.
@@ -209,6 +215,8 @@ struct Config {
                         case "RELEASE_SOUND": config.releaseSound = (value.lowercased() == "true" || value == "1")
                         case "SHOW_HUD": config.showHUD = (value.lowercased() == "true" || value == "1")
                         case "HUD_REVEAL": if ["slide", "bloom", "drift", "unfurl"].contains(value.lowercased()) { config.hudRevealStyle = value.lowercased() }
+                        case "HUD_PARTICLES": config.hudParticles = (value.lowercased() == "true" || value == "1")
+                        case "PRIVACY_MODE": config.privacyMode = (value.lowercased() == "true" || value == "1")
                         case "DUCK_AUDIO": config.duckAudio = (value.lowercased() == "true" || value == "1")
                         case "DUCK_FRACTION": if let f = Double(value) { config.duckFraction = min(1.0, max(0.0, f)) }
                         case "ENABLE_LIVE_WEBSOCKET": config.enableLiveWebSocket = (value.lowercased() == "true" || value == "1")
@@ -254,6 +262,8 @@ struct Config {
         if let rel = env["RELEASE_SOUND"] { config.releaseSound = (rel.lowercased() == "true" || rel == "1") }
         if let hud = env["SHOW_HUD"] { config.showHUD = (hud.lowercased() == "true" || hud == "1") }
         if let reveal = env["HUD_REVEAL"], ["slide", "bloom", "drift", "unfurl"].contains(reveal.lowercased()) { config.hudRevealStyle = reveal.lowercased() }
+        if let motes = env["HUD_PARTICLES"] { config.hudParticles = (motes.lowercased() == "true" || motes == "1") }
+        if let priv = env["PRIVACY_MODE"] { config.privacyMode = (priv.lowercased() == "true" || priv == "1") }
         if let duck = env["DUCK_AUDIO"] { config.duckAudio = (duck.lowercased() == "true" || duck == "1") }
         if let frac = env["DUCK_FRACTION"], let f = Double(frac) { config.duckFraction = min(1.0, max(0.0, f)) }
         if let ws = env["ENABLE_LIVE_WEBSOCKET"] { config.enableLiveWebSocket = (ws.lowercased() == "true" || ws == "1") }

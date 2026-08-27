@@ -106,6 +106,8 @@ final class JustSpeakApp {
         if config.showHUD {
             self.hud = FloatingHUD()
             self.hud?.revealStyle = config.hudRevealStyle
+            self.hud?.particlesEnabled = config.hudParticles
+            self.hud?.privacyMode = config.privacyMode
         }
         self.history = config.historyEnabled ? TranscriptionHistoryStore(config: config) : nil
     }
@@ -847,9 +849,15 @@ final class JustSpeakApp {
         // Deterministic wrong->right enforcement (client-side guarantee on top of boost bias).
         let text = ReplacementEngine.apply(trimmed, compiled: config.compiledReplacementRules)
 
-        print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
-        print("\(ANSI.bold)\(text)\(ANSI.reset)")
-        print("\(ANSI.bold)\(ANSI.magenta)─────────────────────────────────────────────────────────────\(ANSI.reset)")
+        // Privacy mode keeps dictated words off the terminal too - a shared screen with a
+        // visible terminal leaks exactly like the pill would.
+        if config.privacyMode {
+            print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed ───\(ANSI.reset) \(ANSI.gray)privacy mode: \(text.count) chars pasted, not shown\(ANSI.reset)")
+        } else {
+            print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
+            print("\(ANSI.bold)\(text)\(ANSI.reset)")
+            print("\(ANSI.bold)\(ANSI.magenta)─────────────────────────────────────────────────────────────\(ANSI.reset)")
+        }
 
         // Active Window Injection: paste, unless secure input is held or the frontmost app
         // changed mid-turn - both downgrade to clipboard-only delivery instead of synthesizing
@@ -1026,6 +1034,7 @@ final class JustSpeakApp {
             Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")\(config.replacementRules.isEmpty ? "" : " \(ANSI.gray)(+ \(config.replacementRules.count) replacement rules)\(ANSI.reset)")
             Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
             Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+            Privacy Mode:      \(config.privacyMode ? "\(ANSI.yellow)On (HUD & terminal hide dictated text)\(ANSI.reset)" : "\(ANSI.gray)Off\(ANSI.reset)")
             """)
     }
 }
