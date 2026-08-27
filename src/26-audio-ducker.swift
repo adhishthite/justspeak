@@ -99,7 +99,7 @@ final class AudioDucker {
     // Master element first; many external DACs (and some Bluetooth outputs) only expose
     // per-channel volume, so fall back to left/right (elements 1, 2) when master isn't settable.
     private static func volumeElements(for deviceID: AudioDeviceID) -> [AudioObjectPropertyElement]? {
-        let main = AudioObjectPropertyElement(0) // == kAudioObjectPropertyElementMain, spelled out to dodge the deprecated alias warning
+        let main = AudioObjectPropertyElement(0)  // == kAudioObjectPropertyElementMain, spelled out to dodge the deprecated alias warning
         if isVolumeSettable(deviceID: deviceID, element: main) {
             return [main]
         }
