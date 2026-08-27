@@ -354,7 +354,8 @@ final class JustSpeakApp {
     /// lifecycle, and is the only place that mutates currentTurnId / turnSettled / pendingFallbackTimer.
     private func runTurnPipeline(keyUpTime: CFAbsoluteTime) {
         let pipelineStartTime = CFAbsoluteTimeGetCurrent()
-        let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
+        let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(
+            gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
 
         // Discard accidental micro-clicks (< 150ms or < 2KB of real captured audio, ignoring
         // the fixed pre-roll/silence-flush padding that stopRecording always appends).
