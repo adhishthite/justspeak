@@ -7,6 +7,7 @@ final class JustSpeakApp {
     private var hotkeyManager: HotkeyManager?
     private var hud: FloatingHUD?
     private let history: TranscriptionHistoryStore?
+    private var correctionWatcher: CorrectionWatcher?
 
     // Cross-thread "is a turn active" flag - read synchronously from the event-tap thread in
     // handleKeyDown (must stay fast/non-blocking), written only from sessionQueue-executed code.
@@ -116,6 +117,12 @@ final class JustSpeakApp {
             self.hud?.privacyMode = config.privacyMode
         }
         self.history = config.historyEnabled ? TranscriptionHistoryStore(config: config) : nil
+        if config.learnCorrections {
+            self.correctionWatcher = CorrectionWatcher(config: config, history: self.history)
+            if !config.historyEnabled {
+                Logger.warn("LEARN", "LEARN_CORRECTIONS is on but HISTORY=false - observed corrections will be printed but not stored for `make analyze`.")
+            }
+        }
     }
 
     func start() {
@@ -335,6 +342,10 @@ final class JustSpeakApp {
         DispatchQueue.main.async { [weak self] in
             self?.hud?.showListening()
         }
+
+        // A new capture invalidates any pending post-paste read-back: the upcoming paste
+        // would rewrite the field and the diff would misread it as a typed edit.
+        correctionWatcher?.cancelPending()
 
         captureActive = true
         liveClient?.startNewTurn()
@@ -921,6 +932,14 @@ final class JustSpeakApp {
                 copyOnlyReason = "focus changed"
             } else {
                 (injected, injectMs) = TextInjector.inject(text: text, restorePreviousClipboard: config.restoreClipboard, completionSound: config.soundFeedback, appendSpace: config.trailingSpace)
+                // Arm the typed-correction read-back only on a real paste into a verified
+                // frontmost app; copy-only downgrades never observe anything.
+                if injected, config.learnCorrections, let pid = frontNow?.processIdentifier ?? turnFrontmostPID {
+                    let appName = frontNow?.localizedName ?? turnFrontmostName ?? ""
+                    DispatchQueue.main.async { [weak self] in
+                        self?.correctionWatcher?.arm(pastedText: text, targetPid: pid, appName: appName)
+                    }
+                }
             }
         }
 

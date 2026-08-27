@@ -13,6 +13,11 @@
 # term - the misheard form is rewritten to the right-hand side after transcription, and
 # the right-hand side is also added to the boost vocabulary:
 #   cooper netties => Kubernetes
+#
+# A "# context: ..." line describes who is dictating. It never affects recognition; it is
+# read only by `make analyze`, which uses it to judge what a garbled phrase plausibly meant
+# (multiple context lines are joined; the ANALYZE_CONTEXT env knob overrides them):
+#   context: Solutions architect; daily terms are GCP services, AI products, customer names.
 
 # Names & Proper Nouns
 Adhish

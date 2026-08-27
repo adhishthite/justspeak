@@ -137,6 +137,17 @@ final class TranscriptionHistoryStore {
             );
             CREATE INDEX IF NOT EXISTS idx_transcriptions_ts ON transcriptions(ts_epoch);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id);
+            CREATE TABLE IF NOT EXISTS corrections (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts_utc TEXT NOT NULL,
+              ts_epoch REAL NOT NULL,
+              session_id TEXT NOT NULL,
+              wrong_text TEXT NOT NULL,
+              right_text TEXT NOT NULL,
+              app_name TEXT,
+              source TEXT NOT NULL DEFAULT 'ax_readback'
+            );
+            CREATE INDEX IF NOT EXISTS idx_corrections_ts ON corrections(ts_epoch);
             """
         if sqlite3_exec(opened, schema, nil, nil, nil) != SQLITE_OK {
             failed = true
@@ -260,6 +271,39 @@ final class TranscriptionHistoryStore {
             if sqlite3_step(stmt) != SQLITE_DONE {
                 self.failed = true
                 Logger.warn("HISTORY", "Failed to insert history row: \(String(cString: sqlite3_errmsg(db)))")
+            }
+            sqlite3_finalize(stmt)
+        }
+    }
+
+    // Typed-correction observation from CorrectionWatcher: only the changed word pair is
+    // stored, never the surrounding field content. Fire-and-forget like record().
+    func recordCorrection(wrong: String, right: String, appName: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.openIfNeeded()
+            guard !self.failed, let db = self.db else { return }
+
+            let sql = """
+                INSERT INTO corrections (ts_utc, ts_epoch, session_id, wrong_text, right_text, app_name, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                Logger.warn("HISTORY", "Failed to prepare correction insert: \(String(cString: sqlite3_errmsg(db)))")
+                sqlite3_finalize(stmt)
+                return
+            }
+            let now = Date()
+            self.bindText(stmt, 1, TranscriptionHistoryStore.isoFormatter.string(from: now))
+            self.bindDouble(stmt, 2, now.timeIntervalSince1970)
+            self.bindText(stmt, 3, self.sessionId)
+            self.bindText(stmt, 4, wrong)
+            self.bindText(stmt, 5, right)
+            self.bindText(stmt, 6, appName.isEmpty ? nil : appName)
+            self.bindText(stmt, 7, "ax_readback")
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                Logger.warn("HISTORY", "Failed to insert correction row: \(String(cString: sqlite3_errmsg(db)))")
             }
             sqlite3_finalize(stmt)
         }
