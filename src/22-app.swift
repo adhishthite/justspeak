@@ -872,9 +872,11 @@ final class JustSpeakApp {
         let text = ReplacementEngine.apply(trimmed, compiled: config.compiledReplacementRules)
 
         // Privacy mode keeps dictated words off the terminal too - a shared screen with a
-        // visible terminal leaks exactly like the pill would.
+        // visible terminal leaks exactly like the pill would. Say "transcribed", not "pasted":
+        // delivery isn't known yet (secure input / lost accessibility / focus change all
+        // downgrade to copy-only below) - the Injection Latency line reports the real outcome.
         if config.privacyMode {
-            print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed ───\(ANSI.reset) \(ANSI.gray)privacy mode: \(text.count) chars pasted, not shown\(ANSI.reset)")
+            print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed ───\(ANSI.reset) \(ANSI.gray)privacy mode: \(text.count) chars transcribed, not shown\(ANSI.reset)")
         } else {
             print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
             print("\(ANSI.bold)\(text)\(ANSI.reset)")
