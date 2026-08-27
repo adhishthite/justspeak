@@ -27,4 +27,7 @@ for f in "${SCRIPT_DIR}"/src/*.swift; do
   cat "$f" >> "${GEN}"
 done
 
+# The interpreted script's argv[0] is the generated file inside .build/, so Config.load
+# can't find .env/vocabulary beside the runner from it; hand it the real home instead.
+export JUSTSPEAK_HOME="${SCRIPT_DIR}"
 exec /usr/bin/swift "${GEN}" "$@"

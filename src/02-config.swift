@@ -155,7 +155,15 @@ struct Config {
         var rawLanguages: String? = nil
 
         let currentDir = FileManager.default.currentDirectoryPath
-        let execDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
+        // Interpreted via the runner, argv[0] is .build/justspeak.gen.swift — useless for
+        // finding files beside the runner. The runner exports JUSTSPEAK_HOME with the repo
+        // directory; argv[0] stays as the fallback for direct single-file invocation.
+        let execDir: String
+        if let home = ProcessInfo.processInfo.environment["JUSTSPEAK_HOME"], !home.isEmpty {
+            execDir = home
+        } else {
+            execDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
+        }
         let envPaths = [
             "\(currentDir)/.env",
             "\(execDir)/.env",
