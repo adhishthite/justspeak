@@ -131,7 +131,12 @@ final class CorrectionWatcher {
     private static func bestWindow(pasted: [String], field: [String]) -> [String] {
         let n = pasted.count
         if field.count <= n {
-            return overlapScore(pasted, field) >= 0.5 ? field : []
+            if overlapScore(pasted, field) >= 0.5 { return field }
+            // A short paste can be edited entirely ("cloud" -> "Claude"): with no unchanged
+            // tokens to anchor on the overlap gate can never pass, so for tiny equal-length
+            // fields hand the whole thing to the LCS + gate stack and let them judge.
+            if n <= 4 && field.count == n { return field }
+            return []
         }
         // Always slide an exact-length window: comparing against the whole field dilutes
         // the overlap score when the paste sits inside a larger draft.

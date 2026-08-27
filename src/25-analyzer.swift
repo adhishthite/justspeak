@@ -112,10 +112,22 @@ struct VocabularyAnalyzer {
             ORDER BY ts_epoch DESC LIMIT 500
             """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            Logger.error("ANALYZE", "Failed to query history: \(String(cString: sqlite3_errmsg(db)))")
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
+            // Legacy DB predating the app_name column: its ALTER runs on the app's write
+            // path, which may not have happened since upgrading. Analyze without app context
+            // rather than failing (NULL keeps the column indices aligned).
             sqlite3_finalize(stmt)
-            exit(1)
+            stmt = nil
+            let legacySql = """
+                SELECT ts_epoch, NULL, text FROM transcriptions
+                WHERE outcome = 'success' AND text IS NOT NULL AND length(trim(text)) > 0 AND ts_epoch >= ?
+                ORDER BY ts_epoch DESC LIMIT 500
+                """
+            guard sqlite3_prepare_v2(db, legacySql, -1, &stmt, nil) == SQLITE_OK else {
+                Logger.error("ANALYZE", "Failed to query history: \(String(cString: sqlite3_errmsg(db)))")
+                sqlite3_finalize(stmt)
+                exit(1)
+            }
         }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_double(stmt, 1, Date().timeIntervalSince1970 - Double(days) * 86400.0)
