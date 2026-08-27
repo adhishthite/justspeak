@@ -150,7 +150,11 @@ All settings can be configured in `.env` or set as environment variables:
 | `HOTKEY` | `right_option` | Trigger key (`right_option`, `left_option`, `right_control`, `left_control`, `right_cmd`, `left_cmd`, `fn`, `f13`–`f20`, or a raw numeric keyCode) |
 | `HOTKEY_MODE` | `push_to_talk` | `push_to_talk` (hold to speak) or `toggle` (press to start, press to stop) |
 | `SOUND_FEEDBACK` | `true` | Subtle Apple system earcons on start / commit |
+| `RELEASE_SOUND` | `true` | Soft tick at key release acknowledging the hold ended while the transcript settles (needs `SOUND_FEEDBACK`) |
 | `SHOW_HUD` | `true` | Native floating Dynamic Island capsule + notch light spill |
+| `HUD_REVEAL` | `slide` | Pill entrance animation: `slide`, `bloom` (inflate from the notch), `drift` (subtle fade-drift), `unfurl` (unroll with settle-back). Preview with `make hud-demo` |
+| `DUCK_AUDIO` | `false` | Duck the system output volume while recording so speaker audio doesn't bleed into the mic (restored afterwards; a mid-turn manual volume change wins) |
+| `DUCK_FRACTION` | `0.2` | Fraction of the current output volume kept while ducked (0.0-1.0) |
 | `ENABLE_LIVE_WEBSOCKET` | `true` | Stream audio chunks via Live WebSockets (`true`) or REST only (`false`) |
 | `REST_FALLBACK_TIMEOUT` | `4.0` | Maximum seconds to wait for WebSocket response before falling back to REST (`.env.example` ships `2.5`) |
 | `PRE_ROLL_MS` | `400` | Always-on rolling ring buffer (ms) dispatched instantly at key-down so the first syllable is never clipped (0-1000) |

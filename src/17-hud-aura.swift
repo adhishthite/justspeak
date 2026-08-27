@@ -204,4 +204,70 @@ final class AppleNotchAuraView: NSView {
         strokeHalo(context: context, path: capsule, tint: tint, energy: energy)
         context.restoreGState()
     }
+
+    // One-shot success punctuation: a stroked copy of the halo path expands outward and fades.
+    // Runs as its own CAAnimation so it needs no display-tick frames (success freezes the tick).
+    func emitSuccessRipple() {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        guard wantsLayer, let hostLayer = self.layer else { return }
+
+        // Start/end paths share the same construction (createNotchPath, or the capsule math
+        // drawPillAura uses) so Core Animation interpolates between them element-for-element
+        // instead of cross-fading two unrelated shapes.
+        let startPath: CGPath
+        let endPath: CGPath
+        if pillMode {
+            let w = pillSize.width
+            let h = pillSize.height
+            guard w > 0, h > 0 else { return }
+            let rect = CGRect(x: (bounds.width - w) / 2.0, y: (bounds.height - h) / 2.0, width: w, height: h)
+            startPath = CGPath(roundedRect: rect, cornerWidth: h / 2.0, cornerHeight: h / 2.0, transform: nil)
+            let outerRect = rect.insetBy(dx: -18.0, dy: -18.0)
+            let outerRadius = h / 2.0 + 18.0
+            endPath = CGPath(roundedRect: outerRect, cornerWidth: outerRadius, cornerHeight: outerRadius, transform: nil)
+        } else {
+            startPath = createNotchPath(in: bounds, outset: 2.5)
+            endPath = createNotchPath(in: bounds, outset: 22.0)
+        }
+
+        let shapeLayer = CAShapeLayer()
+        shapeLayer.frame = bounds
+        // Shape layers rasterize at contentsScale (default 1.0) - inherit the host's so the
+        // ring stays crisp on Retina.
+        shapeLayer.contentsScale = hostLayer.contentsScale
+        shapeLayer.fillColor = NSColor.clear.cgColor
+        shapeLayer.strokeColor = AppleDesign.googleGreen.cgColor
+        shapeLayer.lineCap = .round
+        shapeLayer.lineJoin = .round
+        // Model values land on the END state before the animation is added, so removing
+        // the layer after the animation finishes shows no flash back to the start frame.
+        shapeLayer.path = endPath
+        shapeLayer.opacity = 0.0
+        shapeLayer.lineWidth = 1.0
+        hostLayer.addSublayer(shapeLayer)
+
+        let pathAnim = CABasicAnimation(keyPath: "path")
+        pathAnim.fromValue = startPath
+        pathAnim.toValue = endPath
+
+        let opacityAnim = CABasicAnimation(keyPath: "opacity")
+        opacityAnim.fromValue = 0.9
+        opacityAnim.toValue = 0.0
+
+        let lineWidthAnim = CABasicAnimation(keyPath: "lineWidth")
+        lineWidthAnim.fromValue = 3.0
+        lineWidthAnim.toValue = 1.0
+
+        let group = CAAnimationGroup()
+        group.animations = [pathAnim, opacityAnim, lineWidthAnim]
+        group.duration = 0.55
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+
+        CATransaction.begin()
+        CATransaction.setCompletionBlock {
+            shapeLayer.removeFromSuperlayer()
+        }
+        shapeLayer.add(group, forKey: "successRipple")
+        CATransaction.commit()
+    }
 }

@@ -32,13 +32,33 @@ final class SoundManager {
     private static var commitSound: NSSound? = {
         for path in commitSoundPaths {
             if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
-                sound.volume = 0.65
+                sound.volume = 0.35
                 return sound
             }
         }
         let fallback = NSSound(named: "Hero")
         fallback?.volume = 0.45
         return fallback
+    }()
+
+    // Key-release acknowledgment. Deliberately quieter and shorter than the commit earcon -
+    // it says "release registered, settling" while the commit sound still owns "text landed".
+    // end_record is macOS's own "recording stopped" earcon; no collision with the commit
+    // sound, which resolves to jbl_confirm first. No named-sound fallback on purpose: the
+    // legacy alert names read as the system error beep - silence beats a wrong-meaning cue.
+    private static let releaseSoundPaths = [
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/end_record.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/acknowledgment_received.caf",
+    ]
+
+    private static var releaseSound: NSSound? = {
+        for path in releaseSoundPaths {
+            if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
+                sound.volume = 0.35
+                return sound
+            }
+        }
+        return nil
     }()
 
     private static var errorSound: NSSound? = {
@@ -57,6 +77,13 @@ final class SoundManager {
         DispatchQueue.global(qos: .userInteractive).async {
             startSound?.stop()
             startSound?.play()
+        }
+    }
+
+    static func playReleaseSound() {
+        DispatchQueue.global(qos: .userInteractive).async {
+            releaseSound?.stop()
+            releaseSound?.play()
         }
     }
 

@@ -27,6 +27,9 @@ final class FloatingHUD {
     private var notchInfo: NotchGeometry
     private var screenFrame: NSRect
 
+    // Entrance animation; set once at startup from config. "slide" is the shipped default.
+    var revealStyle: String = "slide"
+
     init() {
         let screen = NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
         self.screenFrame = screen.frame
@@ -299,21 +302,107 @@ final class FloatingHUD {
         waveformView.frame = NSRect(x: minPillWidth - 48, y: 26, width: 32, height: 16)
         transcriptLabel.frame = NSRect(x: 16, y: 7, width: minPillWidth - 32, height: 20)
 
-        // Signature entrance: the pill slides out from beneath the notch, as if the notch
-        // itself extends. Reduced-motion preference gets a plain fade.
+        // Entrance: reduced-motion preference overrides every style with a plain fade at
+        // the final rect. Otherwise branch on revealStyle (unknown strings fall back to "slide").
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let startRect = reduceMotion ? finalRect : finalRect.offsetBy(dx: 0, dy: 10)
-        pillPanel.setFrame(startRect, display: true)
 
-        notchPanel.orderFrontRegardless()
-        pillPanel.orderFrontRegardless()
+        if reduceMotion {
+            pillPanel.setFrame(finalRect, display: true)
+            notchPanel.orderFrontRegardless()
+            pillPanel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
+                notchPanel.animator().alphaValue = 1.0
+                pillPanel.animator().alphaValue = 1.0
+            }
+            return
+        }
 
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = reduceMotion ? 0.16 : 0.28
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
-            notchPanel.animator().alphaValue = 1.0
-            pillPanel.animator().alphaValue = 1.0
-            pillPanel.animator().setFrame(finalRect, display: true)
+        switch revealStyle {
+        case "drift":
+            // Understated: a short rise with almost no travel, ease-out.
+            let startRect = finalRect.offsetBy(dx: 0, dy: 4)
+            pillPanel.setFrame(startRect, display: true)
+            notchPanel.orderFrontRegardless()
+            pillPanel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.30
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.25, 1.0, 0.5, 1.0)
+                notchPanel.animator().alphaValue = 1.0
+                pillPanel.animator().alphaValue = 1.0
+                pillPanel.animator().setFrame(finalRect, display: true)
+            }
+
+        case "bloom":
+            // Inflate from the housing: top edge stays pinned to the notch so the pill
+            // never gapes away from the bezel while it grows into place.
+            let startWidth = finalRect.width * 0.88
+            let startHeight = finalRect.height * 0.88
+            let startRect = NSRect(
+                x: finalRect.midX - startWidth / 2.0,
+                y: finalRect.maxY - startHeight,
+                width: startWidth,
+                height: startHeight
+            )
+            pillPanel.setFrame(startRect, display: true)
+            notchPanel.orderFrontRegardless()
+            pillPanel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.30
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.15, 0.3, 1.0)
+                notchPanel.animator().alphaValue = 1.0
+                pillPanel.animator().alphaValue = 1.0
+                pillPanel.animator().setFrame(finalRect, display: true)
+            }
+
+        case "unfurl":
+            // Bounciest: unroll down past full height (top edge pinned throughout, never
+            // a dy offset - an overshoot expressed as position would open a gap under the
+            // notch) then settle back up to the final rect.
+            let stage1Height = finalRect.height * 0.70
+            let stage1Rect = NSRect(
+                x: finalRect.minX, y: finalRect.maxY - stage1Height,
+                width: finalRect.width, height: stage1Height
+            )
+            let overshootHeight = finalRect.height * 1.06
+            let overshootRect = NSRect(
+                x: finalRect.minX, y: finalRect.maxY - overshootHeight,
+                width: finalRect.width, height: overshootHeight
+            )
+            pillPanel.setFrame(stage1Rect, display: true)
+            notchPanel.orderFrontRegardless()
+            pillPanel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup(
+                { context in
+                    context.duration = 0.20
+                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    notchPanel.animator().alphaValue = 1.0
+                    pillPanel.animator().alphaValue = 1.0
+                    pillPanel.animator().setFrame(overshootRect, display: true)
+                },
+                completionHandler: {
+                    NSAnimationContext.runAnimationGroup { context in
+                        context.duration = 0.12
+                        context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                        self.pillPanel.animator().setFrame(finalRect, display: true)
+                    }
+                })
+
+        default:
+            // "slide": the pill slides out from beneath the notch, as if the notch itself
+            // extends. Also the fallback for any unrecognized revealStyle value.
+            let startRect = finalRect.offsetBy(dx: 0, dy: 10)
+            pillPanel.setFrame(startRect, display: true)
+            notchPanel.orderFrontRegardless()
+            pillPanel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.28
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
+                notchPanel.animator().alphaValue = 1.0
+                pillPanel.animator().alphaValue = 1.0
+                pillPanel.animator().setFrame(finalRect, display: true)
+            }
         }
     }
 
@@ -368,6 +457,7 @@ final class FloatingHUD {
         stopDisplayTick()
         notchGlowView.state = .success
         orbIcon.state = .success
+        notchGlowView.emitSuccessRipple()
 
         setHeader("Pasted", color: AppleDesign.appleGreen)
         let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)

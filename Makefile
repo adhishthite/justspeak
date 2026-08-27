@@ -3,7 +3,7 @@
 
 RUNNER = ./justspeak
 
-.PHONY: all run start check-permissions test-api test-audio analyze setup install clean check lint format help
+.PHONY: all run start check-permissions test-api test-audio analyze hud-demo setup install clean check lint format help
 
 all: run
 
@@ -29,6 +29,10 @@ test-audio: setup
 ## analyze: Mine dictation history for vocabulary suggestions (Gemini-powered, interactive)
 analyze: setup
 	@$(RUNNER) --analyze
+
+## hud-demo: Loop the HUD through its states with synthetic data (no mic, no API)
+hud-demo: setup
+	@$(RUNNER) --hud-demo
 
 ## setup: Initialize local .env configuration from .env.example
 setup:
