@@ -17,9 +17,9 @@ final class FloatingHUD {
     private let minPillWidth: CGFloat = 330
     private let maxPillWidth: CGFloat = 520
     private let pillHeight: CGFloat = 52
-    // Tucked nearly flush beneath the notch so the pill reads as the notch extruding,
-    // not a separate floating window.
-    private let pillGap: CGFloat = 2.0
+    // A deliberate air gap beneath the notch: the aura's light spill needs visible
+    // wallpaper between the bezel and the pill to land on.
+    private let pillGap: CGFloat = 14.0
     private var notchInfo: NotchGeometry
     private var screenFrame: NSRect
 
@@ -31,7 +31,7 @@ final class FloatingHUD {
         // 1. Setup Hardware Notch Glow Overlay Panel
         let padding: CGFloat = 50.0
         let glowWidth = notchInfo.rect.width + padding * 2
-        let glowHeight = notchInfo.rect.height + padding + 12.0
+        let glowHeight = notchInfo.rect.height + padding + 44.0
         let glowX = notchInfo.rect.minX - padding
         let glowY = screen.frame.height - glowHeight
         
@@ -122,6 +122,10 @@ final class FloatingHUD {
         ) { [weak self] _ in
             self?.applyScreenLayout()
         }
+
+        // On non-notch displays the aura panel must wrap the pill instead of a phantom
+        // cutout; applyScreenLayout holds that branch, so run it once at startup.
+        applyScreenLayout()
     }
 
     // Recomputes screenFrame, notchInfo, and repositions the notch/pill panels to match -
@@ -131,21 +135,37 @@ final class FloatingHUD {
         self.screenFrame = screen.frame
         self.notchInfo = NotchGeometry.detect(screen: screen)
 
-        // Notch Glow Overlay Panel geometry
-        let padding: CGFloat = 50.0
-        let glowWidth = notchInfo.rect.width + padding * 2
-        let glowHeight = notchInfo.rect.height + padding + 12.0
-        let glowX = notchInfo.rect.minX - padding
-        let glowY = screenFrame.height - glowHeight
-        notchPanel.setFrame(NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight), display: true)
-        notchGlowView.frame = NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight)
-        notchGlowView.notchRect = notchInfo.rect
-        notchGlowView.needsDisplay = true
-
         // Floating Dynamic Island Panel geometry (preserves currentWidth)
         let pillX = screenFrame.midX - currentWidth / 2.0
         let pillY = screenFrame.height - notchInfo.rect.height - pillHeight - pillGap
         pillPanel.setFrame(NSRect(x: pillX, y: pillY, width: currentWidth, height: pillHeight), display: true)
+
+        if notchInfo.hasPhysicalNotch {
+            // Aura panel hugs the hardware notch, with room below for the light spill.
+            let padding: CGFloat = 50.0
+            let glowWidth = notchInfo.rect.width + padding * 2
+            let glowHeight = notchInfo.rect.height + padding + 44.0
+            let glowX = notchInfo.rect.minX - padding
+            let glowY = screenFrame.height - glowHeight
+            notchPanel.setFrame(NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight), display: true)
+            notchGlowView.frame = NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight)
+            notchGlowView.notchRect = notchInfo.rect
+            notchGlowView.pillMode = false
+        } else {
+            // No hardware notch: the aura rings the pill. The panel is sized to the pill's
+            // MAXIMUM footprint so width animations never need a panel reframe - the view
+            // redraws the capsule at pillSize every animation tick anyway.
+            let margin: CGFloat = 44.0
+            let auraWidth = maxPillWidth + margin * 2
+            let auraHeight = pillHeight + margin * 2
+            let auraX = screenFrame.midX - auraWidth / 2.0
+            let auraY = pillY - margin
+            notchPanel.setFrame(NSRect(x: auraX, y: auraY, width: auraWidth, height: auraHeight), display: true)
+            notchGlowView.frame = NSRect(x: 0, y: 0, width: auraWidth, height: auraHeight)
+            notchGlowView.pillMode = true
+            notchGlowView.pillSize = CGSize(width: currentWidth, height: pillHeight)
+        }
+        notchGlowView.needsDisplay = true
     }
 
     private func updatePillWidth(targetWidth: CGFloat) {
@@ -165,6 +185,9 @@ final class FloatingHUD {
             backplateView.frame = NSRect(x: 0, y: 0, width: currentWidth, height: pillHeight)
             waveformView.frame = NSRect(x: currentWidth - 48, y: 26, width: 32, height: 16)
             transcriptLabel.frame = NSRect(x: 16, y: 7, width: currentWidth - 32, height: 20)
+        }
+        if !notchInfo.hasPhysicalNotch {
+            notchGlowView.pillSize = CGSize(width: clamped, height: pillHeight)
         }
     }
     
@@ -222,14 +245,14 @@ final class FloatingHUD {
         hideWorkItem?.cancel()
         currentWidth = minPillWidth
 
-        // Notch aura only exists where the hardware notch does; on external or non-notch
-        // displays the pill stands alone rather than glowing around a phantom cutout.
-        let hasNotch = notchInfo.hasPhysicalNotch
-        if hasNotch {
-            notchGlowView.state = .listening
-            notchGlowView.audioLevel = 0.0
-            notchGlowView.startAnimation()
+        // The aura hugs the hardware notch where there is one; on external or non-notch
+        // displays it rings the pill capsule instead (pillMode, set by applyScreenLayout).
+        if !notchInfo.hasPhysicalNotch {
+            notchGlowView.pillSize = CGSize(width: minPillWidth, height: pillHeight)
         }
+        notchGlowView.state = .listening
+        notchGlowView.audioLevel = 0.0
+        notchGlowView.startAnimation()
 
         // Pill Layout & Content
         orbIcon.state = .listening
@@ -255,13 +278,13 @@ final class FloatingHUD {
         let startRect = reduceMotion ? finalRect : finalRect.offsetBy(dx: 0, dy: 10)
         pillPanel.setFrame(startRect, display: true)
 
-        if hasNotch { notchPanel.orderFrontRegardless() }
+        notchPanel.orderFrontRegardless()
         pillPanel.orderFrontRegardless()
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = reduceMotion ? 0.16 : 0.28
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.0)
-            if hasNotch { notchPanel.animator().alphaValue = 1.0 }
+            notchPanel.animator().alphaValue = 1.0
             pillPanel.animator().alphaValue = 1.0
             pillPanel.animator().setFrame(finalRect, display: true)
         }

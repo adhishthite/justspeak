@@ -12,6 +12,10 @@ final class AppleNotchAuraView: NSView {
     var notchRect: NSRect = .zero
     var audioLevel: CGFloat = 0.0 // 0.0 ... 1.0
     var state: GlowState = .idle
+    // Displays without a hardware notch have no bezel to illuminate; the aura rings
+    // the floating pill instead. pillSize tracks the pill's live width as it expands.
+    var pillMode: Bool = false
+    var pillSize: CGSize = .zero
     
     private var phase: CGFloat = 0.0
     private var displayTimer: Timer?
@@ -47,15 +51,20 @@ final class AppleNotchAuraView: NSView {
         displayTimer = nil
     }
     
-    private func createNotchPath(in bounds: NSRect) -> CGPath {
+    // outset dilates the path beyond the hardware cutout: a stroke centered on the exact
+    // notch outline loses its inner half inside the cutout (those pixels don't exist),
+    // which reads as a thin hard line with clipped corners. Pushed outward, the full
+    // stroke width and its blur land on real wallpaper. Radii grow by the same amount
+    // so the dilated path stays parallel to the bezel curve.
+    private func createNotchPath(in bounds: NSRect, outset: CGFloat = 0.0) -> CGPath {
         let path = CGMutablePath()
-        let cornerRadius: CGFloat = 14.0
-        let outerCornerRadius: CGFloat = 6.0
-        
+        let cornerRadius: CGFloat = 14.0 + outset
+        let outerCornerRadius: CGFloat = 6.0 + outset
+
         let topY = bounds.height
-        let bottomY = bounds.height - notchRect.height
-        let leftX = (bounds.width - notchRect.width) / 2.0
-        let rightX = leftX + notchRect.width
+        let bottomY = bounds.height - notchRect.height - outset
+        let leftX = (bounds.width - notchRect.width) / 2.0 - outset
+        let rightX = leftX + notchRect.width + 2.0 * outset
         
         path.move(to: CGPoint(x: leftX - outerCornerRadius, y: topY))
         path.addQuadCurve(to: CGPoint(x: leftX, y: topY - outerCornerRadius),
@@ -77,9 +86,6 @@ final class AppleNotchAuraView: NSView {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         if state == .idle { return }
 
-        let path = createNotchPath(in: self.bounds)
-        let bottomY = bounds.height - notchRect.height
-
         // One tint per frame - the Google cycle lives in TIME, not along the stroke.
         let tint: NSColor
         switch state {
@@ -92,10 +98,18 @@ final class AppleNotchAuraView: NSView {
         // headroom so speech visibly brightens and lengthens the spill.
         let energy: CGFloat = (state == .listening) ? (0.30 + 0.70 * audioLevel) : 0.55
 
+        if pillMode {
+            drawPillAura(context: context, tint: tint, energy: energy)
+            return
+        }
+
+        let path = createNotchPath(in: self.bounds, outset: 2.5)
+        let bottomY = bounds.height - notchRect.height
+
         // 1. Downward light spill: a wide, shallow pool under the notch, as if the bezel
         // were backlit. A circular radial gradient drawn through a horizontally scaled
         // CTM becomes the ellipse; clipped so no light paints above the bezel line.
-        let dropRadius: CGFloat = 30.0 + 22.0 * energy
+        let dropRadius: CGFloat = 38.0 + 28.0 * energy
         let halfSpan = notchRect.width / 2.0 + 46.0
         let centerAlpha: CGFloat = 0.26 + 0.30 * energy
 
@@ -120,19 +134,47 @@ final class AppleNotchAuraView: NSView {
             context.restoreGState()
         }
 
-        // 2. Bezel rim: one thin line of the same hue hugging the notch outline, with a
-        // soft downward halo - definition, not decoration.
+        // 2. Bezel rim: a wide, low-alpha, heavily blurred band rather than a drawn line -
+        // the notch edge should read as lit, not outlined.
         context.saveGState()
         context.setShadow(
             offset: CGSize(width: 0, height: -2),
-            blur: 8.0 + 6.0 * energy,
-            color: tint.withAlphaComponent(0.6).cgColor
+            blur: 12.0 + 8.0 * energy,
+            color: tint.withAlphaComponent(0.55).cgColor
         )
         context.addPath(path)
-        context.setStrokeColor(tint.withAlphaComponent(0.50 + 0.30 * energy).cgColor)
-        context.setLineWidth(1.5)
+        context.setStrokeColor(tint.withAlphaComponent(0.28 + 0.22 * energy).cgColor)
+        context.setLineWidth(5.0)
         context.setLineCap(.round)
         context.setLineJoin(.round)
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    // No-notch displays: the aura rings the pill capsule instead. Even-odd clipping
+    // keeps every photon outside the capsule so the pill face stays hardware-black.
+    private func drawPillAura(context: CGContext, tint: NSColor, energy: CGFloat) {
+        let w = pillSize.width
+        let h = pillSize.height
+        guard w > 0, h > 0 else { return }
+        let rect = CGRect(x: (bounds.width - w) / 2.0, y: (bounds.height - h) / 2.0, width: w, height: h)
+        let capsule = CGPath(roundedRect: rect, cornerWidth: h / 2.0, cornerHeight: h / 2.0, transform: nil)
+
+        context.saveGState()
+        let mask = CGMutablePath()
+        mask.addRect(bounds)
+        mask.addPath(capsule)
+        context.addPath(mask)
+        context.clip(using: .evenOdd)
+
+        context.setShadow(
+            offset: .zero,
+            blur: 14.0 + 10.0 * energy,
+            color: tint.withAlphaComponent(0.55 + 0.25 * energy).cgColor
+        )
+        context.addPath(capsule)
+        context.setStrokeColor(tint.withAlphaComponent(0.30 + 0.25 * energy).cgColor)
+        context.setLineWidth(5.0)
         context.strokePath()
         context.restoreGState()
     }
