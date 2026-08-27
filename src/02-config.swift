@@ -98,6 +98,12 @@ struct Config {
     // GCP services, AI products") so the model can judge what a garbled phrase plausibly
     // meant. Also settable as "# context: ..." lines in the vocabulary file; the knob wins.
     var analyzeContext: String = ""
+    // Opt-in typed-correction capture: after a paste, read the focused field back once via
+    // the Accessibility API and record gated single-word edits ("cloud" -> "Claude") to the
+    // corrections table for `make analyze`. Off by default: it reads field content (only the
+    // changed word pairs are ever stored or shown).
+    var learnCorrections: Bool = false
+    var learnDelayMs: Int = 8000  // paste-to-read-back delay; the user needs time to notice and fix
 
     static func parseVocabulary(from text: String) -> [String] {
         var items: [String] = []
@@ -254,6 +260,8 @@ struct Config {
                         case "HISTORY_DB": config.historyDbPath = value
                         case "ANALYZE_MODEL": config.analyzeModel = value
                         case "ANALYZE_CONTEXT": config.analyzeContext = value
+                        case "LEARN_CORRECTIONS": config.learnCorrections = (value.lowercased() == "true" || value == "1")
+                        case "LEARN_DELAY_MS": if let ms = Int(value) { config.learnDelayMs = min(60000, max(2000, ms)) }
                         case "LIVE_INPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.liveInputPricePer1M = p }
                         case "LIVE_OUTPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.liveOutputPricePer1M = p }
                         case "REST_INPUT_PRICE_PER_1M": if let p = Double(value), p >= 0 { config.restInputPricePer1M = p }
@@ -303,6 +311,8 @@ struct Config {
         if let histDb = env["HISTORY_DB"], !histDb.isEmpty { config.historyDbPath = histDb }
         if let am = env["ANALYZE_MODEL"], !am.isEmpty { config.analyzeModel = am }
         if let ac = env["ANALYZE_CONTEXT"], !ac.isEmpty { config.analyzeContext = ac }
+        if let lc = env["LEARN_CORRECTIONS"] { config.learnCorrections = (lc.lowercased() == "true" || lc == "1") }
+        if let ld = env["LEARN_DELAY_MS"], let ms = Int(ld) { config.learnDelayMs = min(60000, max(2000, ms)) }
         if let p = env["LIVE_INPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.liveInputPricePer1M = v }
         if let p = env["LIVE_OUTPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.liveOutputPricePer1M = v }
         if let p = env["REST_INPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.restInputPricePer1M = v }

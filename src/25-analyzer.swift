@@ -20,6 +20,15 @@ struct VocabularyAnalyzer {
         let text: String
     }
 
+    // A word pair CorrectionWatcher observed the user typing over a paste - ground truth,
+    // not inference (only exists when LEARN_CORRECTIONS was on).
+    private struct ObservedCorrection {
+        let ts: Double
+        let wrong: String
+        let right: String
+        let app: String
+    }
+
     static func run(config: Config, days: Int) {
         print("\n\(ANSI.bold)JustSpeak Vocabulary Analyzer\(ANSI.reset)")
 
@@ -50,7 +59,12 @@ struct VocabularyAnalyzer {
             Logger.info("ANALYZE", "\(pairs.count) possible re-dictation pair(s) - direct correction evidence.")
         }
 
-        let prompt = buildPrompt(rows: rows, pairs: pairs, config: config)
+        let observed = loadCorrections(dbPath: dbPath, days: days)
+        if !observed.isEmpty {
+            Logger.info("ANALYZE", "\(observed.count) observed typed correction(s) from LEARN_CORRECTIONS - ground truth.")
+        }
+
+        let prompt = buildPrompt(rows: rows, pairs: pairs, observed: observed, config: config)
         guard let raw = requestAnalysis(prompt: prompt, model: model, config: config) else {
             exit(1)
         }
@@ -125,6 +139,45 @@ struct VocabularyAnalyzer {
         return results
     }
 
+    // Lenient companion to loadRows: the corrections table only exists once
+    // LEARN_CORRECTIONS has run, so a failed prepare on an older DB is expected silence,
+    // not an error.
+    private static func loadCorrections(dbPath: String, days: Int) -> [ObservedCorrection] {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(dbPath, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let db = handle else {
+            if let handle = handle { sqlite3_close(handle) }
+            return []
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_exec(db, "PRAGMA busy_timeout=2000;", nil, nil, nil)
+
+        let sql = """
+            SELECT ts_epoch, wrong_text, right_text, app_name FROM corrections
+            WHERE ts_epoch >= ? ORDER BY ts_epoch DESC LIMIT 200
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            sqlite3_finalize(stmt)
+            return []
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_double(stmt, 1, Date().timeIntervalSince1970 - Double(days) * 86400.0)
+
+        var results: [ObservedCorrection] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let cWrong = sqlite3_column_text(stmt, 1), let cRight = sqlite3_column_text(stmt, 2) else { continue }
+            let app = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
+            results.append(
+                ObservedCorrection(
+                    ts: sqlite3_column_double(stmt, 0),
+                    wrong: String(cString: cWrong),
+                    right: String(cString: cRight),
+                    app: app
+                ))
+        }
+        return results
+    }
+
     // A near-identical dictation seconds after another usually means the user re-said a
     // mangled turn: the differing words are direct correction evidence. This pass is pure
     // recall over adjacent rows (rows arrive newest-first); the model judges whether each
@@ -150,7 +203,7 @@ struct VocabularyAnalyzer {
         Set(text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
     }
 
-    private static func buildPrompt(rows: [Row], pairs: [(older: Row, newer: Row)], config: Config) -> String {
+    private static func buildPrompt(rows: [Row], pairs: [(older: Row, newer: Row)], observed: [ObservedCorrection], config: Config) -> String {
         var existing: [String] = config.customVocabulary
         existing.append(contentsOf: config.replacementRules.map { "\($0.wrong) => \($0.right)" })
         let existingBlock = existing.isEmpty ? "(none)" : existing.joined(separator: "\n")
@@ -174,6 +227,13 @@ struct VocabularyAnalyzer {
             ? ""
             : "\nABOUT THE USER (use this to judge what a garbled phrase plausibly meant):\n\(config.analyzeContext)\n"
 
+        let observedBlock = observed.isEmpty
+            ? "(none)"
+            : observed.map { c in
+                let app = c.app.isEmpty ? "?" : c.app
+                return "\"\(c.wrong)\" -> \"\(c.right)\" (\(app), \(df.string(from: Date(timeIntervalSince1970: c.ts))))"
+            }.joined(separator: "\n")
+
         return """
             You are analyzing a user's voice-dictation history to improve their speech-to-text setup.
             Below are their recent transcriptions (newest first, each prefixed with local time and the app dictated into), their EXISTING custom vocabulary, and detected re-dictation pairs.
@@ -185,6 +245,7 @@ struct VocabularyAnalyzer {
                - The wrong form must appear verbatim in the transcriptions. The right form does NOT have to appear anywhere - infer it from the existing vocabulary, the app column, the user description, and world knowledge.
                - A single occurrence is enough when the intended term is unambiguous in its sentence; otherwise require repetition.
                - In a re-dictation pair, the words differing between A and B are usually the correction (B is what the user meant).
+               - The OBSERVED TYPED CORRECTIONS are ground truth (the user manually fixed the pasted text): propose each as a rule unless already covered by the existing vocabulary or clearly a one-off contextual edit.
                - Never suggest a rule for grammar, style, punctuation, or capitalization-only differences - only real word substitutions.
                - Each side at most 4 words, and only propose a rule if this user would essentially never mean the wrong form literally: the rule fires on every future dictation.
 
@@ -201,6 +262,9 @@ struct VocabularyAnalyzer {
 
             RE-DICTATION PAIRS (older A, then newer B, seconds apart):
             \(pairBlock)
+
+            OBSERVED TYPED CORRECTIONS (the user edited the pasted text; ground truth):
+            \(observedBlock)
 
             TRANSCRIPTIONS:
             \(transcriptBlock)
