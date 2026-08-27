@@ -24,6 +24,13 @@ final class AudioDucker {
     private let lock = NSLock()
     private var state: DuckedState?
 
+    var isDucked: Bool {
+        lock.lock()
+        let ducked = state != nil
+        lock.unlock()
+        return ducked
+    }
+
     private init() {}
 
     func duck(toFraction fraction: Float) {

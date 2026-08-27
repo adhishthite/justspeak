@@ -67,6 +67,12 @@ final class JustSpeakApp {
     // re-armed whenever a turn finishes.
     private var micIdleWorkItem: DispatchWorkItem?
 
+    // Main-thread-only: the delayed duck for the current turn. Ducking waits ~350ms so the
+    // begin earcon plays at full volume (an immediate duck swallowed it - "my sounds
+    // disappeared"); the item itself checks captureActive so a micro-click turn that already
+    // restored can never leave the output stuck ducked.
+    private var pendingDuckItem: DispatchWorkItem?
+
     /// Main-thread-only. Schedules the mic to be released after the configured idle window so
     /// the macOS mic indicator turns off between dictation sessions; 0 disables the timeout.
     private func scheduleMicIdleRelease() {
@@ -334,10 +340,17 @@ final class JustSpeakApp {
         liveClient?.startNewTurn()
         audioCapture.startRecording()
 
-        // After the begin earcon: the cue plays at ducked volume (the whole output is ducked),
-        // but so does whatever was playing - relative salience is preserved.
+        // Duck AFTER the begin earcon has played, not with it - Talkify's ordering. The
+        // 350ms delay covers the cue; captureActive gates the item so it can't fire after
+        // a short turn has already restored.
         if config.duckAudio {
-            AudioDucker.shared.duck(toFraction: Float(config.duckFraction))
+            let duckItem = DispatchWorkItem { [weak self] in
+                guard let self = self, self.captureActive else { return }
+                self.pendingDuckItem = nil
+                AudioDucker.shared.duck(toFraction: Float(self.config.duckFraction))
+            }
+            pendingDuckItem = duckItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: duckItem)
         }
     }
 
@@ -352,9 +365,12 @@ final class JustSpeakApp {
         captureActive = false
 
         // Release acknowledged, before the settle race: on a slow REST fallback there are
-        // otherwise seconds of silence between letting go and the commit earcon.
+        // otherwise seconds of silence between letting go and the commit earcon. While the
+        // output is ducked the cue's own volume is boosted to compensate.
         if config.soundFeedback && config.releaseSound {
-            SoundManager.playReleaseSound()
+            let scale: Float =
+                AudioDucker.shared.isDucked ? Float(1.0 / max(0.15, config.duckFraction)) : 1.0
+            SoundManager.playReleaseSound(volumeScale: scale)
         }
 
         // The turn is busy from this instant, not from when the pipeline finishes draining:
@@ -384,8 +400,14 @@ final class JustSpeakApp {
         let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(
             gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
         // Mic capture for this turn is over and every pipeline exit path passes this point -
-        // one restore site instead of one per abandoned-turn/settle branch.
+        // one restore site instead of one per abandoned-turn/settle branch. The pending-duck
+        // cancel hops to main (its owning thread); the item's captureActive guard covers the
+        // window until the hop lands.
         if config.duckAudio {
+            DispatchQueue.main.async { [weak self] in
+                self?.pendingDuckItem?.cancel()
+                self?.pendingDuckItem = nil
+            }
             AudioDucker.shared.restore()
         }
         turnPeakDb = peakDb

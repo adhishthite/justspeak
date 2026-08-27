@@ -80,8 +80,11 @@ final class SoundManager {
         }
     }
 
-    static func playReleaseSound() {
+    // volumeScale compensates for system-output ducking: the cue plays through a device
+    // sitting at DUCK_FRACTION, so its own volume is scaled up (capped at 1.0) to survive.
+    static func playReleaseSound(volumeScale: Float = 1.0) {
         DispatchQueue.global(qos: .userInteractive).async {
+            releaseSound?.volume = min(1.0, 0.35 * volumeScale)
             releaseSound?.stop()
             releaseSound?.play()
         }
