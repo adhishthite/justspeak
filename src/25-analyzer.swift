@@ -254,26 +254,53 @@ struct VocabularyAnalyzer {
             target = FileManager.default.currentDirectoryPath + "/" + target
         }
 
-        print("\nAppend all \(suggestions.count) suggestion(s) to \(ANSI.bold)\(target)\(ANSI.reset)? (y/N) ", terminator: "")
-        guard let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-            answer == "y" || answer == "yes"
-        else {
+        print("\nAppend to \(ANSI.bold)\(target)\(ANSI.reset)?")
+        print("  \(ANSI.bold)y\(ANSI.reset) = all \(suggestions.count), numbers pick a few (e.g. \"1 3\" or \"2-4\"), \(ANSI.bold)Enter\(ANSI.reset) = none: ", terminator: "")
+        let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard let indices = parseSelection(answer, count: suggestions.count) else {
+            print("Didn't understand \"\(answer)\" - nothing written.")
+            return
+        }
+        guard !indices.isEmpty else {
             print("Nothing written. Copy any line above into your vocabulary file manually.")
             return
         }
+        let chosen = indices.map { suggestions[$0] }
 
         var existing = (try? String(contentsOfFile: target, encoding: .utf8)) ?? ""
         if !existing.isEmpty && !existing.hasSuffix("\n") { existing += "\n" }
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         var block = "\n# Added by --analyze on \(formatter.string(from: Date()))\n"
-        block += suggestions.map { $0.line }.joined(separator: "\n") + "\n"
+        block += chosen.map { $0.line }.joined(separator: "\n") + "\n"
 
         do {
             try (existing + block).write(toFile: target, atomically: true, encoding: .utf8)
-            Logger.success("ANALYZE", "Appended \(suggestions.count) line(s) to \(target). They load on the next launch.")
+            Logger.success("ANALYZE", "Appended \(chosen.count) of \(suggestions.count) line(s) to \(target). They load on the next launch.")
         } catch {
             Logger.error("ANALYZE", "Failed to write \(target): \(error.localizedDescription)")
         }
+    }
+
+    // The answer is either an all/none keyword or a 1-based pick over the printed list
+    // ("2", "1 3", "1,3-4"). Strict on purpose: any token that doesn't parse or is out of
+    // range invalidates the whole answer (nil) so a typo appends nothing rather than a subset.
+    private static func parseSelection(_ input: String, count: Int) -> [Int]? {
+        if input.isEmpty || input == "n" || input == "no" { return [] }
+        if input == "y" || input == "yes" || input == "a" || input == "all" { return Array(0..<count) }
+        let tokens = input.split(whereSeparator: { $0 == "," || $0 == " " })
+        if tokens.isEmpty { return nil }
+        var picked = Set<Int>()
+        for token in tokens {
+            let parts = token.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            if parts.count == 2 {
+                guard let lo = Int(parts[0]), let hi = Int(parts[1]), lo >= 1, hi <= count, lo <= hi else { return nil }
+                picked.formUnion((lo - 1)...(hi - 1))
+            } else {
+                guard let n = Int(token), n >= 1, n <= count else { return nil }
+                picked.insert(n - 1)
+            }
+        }
+        return picked.sorted()
     }
 }
