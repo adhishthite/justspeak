@@ -349,63 +349,11 @@ final class JustSpeakApp {
         }
     }
 
-    /// Peak amplitude of the captured clip, in dBFS, for the silent-clip gate. Scans everything
-    /// in pcmData except the trailing 22,400-byte silence flush stopRecording always appends (a
-    /// fixed guard, not real audio, that would otherwise mask genuine silence). Samples are
-    /// assembled from raw byte pairs rather than a bound-memory reinterpret so this never relies
-    /// on Data's underlying storage being 2-byte aligned. Returns nil when the clip is too short
-    /// to have anything past the guard - callers should treat that as "not silent".
-    private static func peakDbFS(of pcmData: Data, guardBytes: Int = 22400) -> Double? {
-        guard pcmData.count > guardBytes else { return nil }
-        let scanCount = pcmData.count - guardBytes
-        let base = pcmData.startIndex
-        var maxAbs: Int16 = 0
-        var offset = 0
-        while offset + 1 < scanCount {
-            let lo = pcmData[base + offset]
-            let hi = pcmData[base + offset + 1]
-            let sample = Int16(bitPattern: UInt16(lo) | (UInt16(hi) << 8))
-            let absSample = sample == Int16.min ? Int16.max : abs(sample)
-            if absSample > maxAbs { maxAbs = absSample }
-            offset += 2
-        }
-        return 20 * log10(max(Double(maxAbs), 1.0) / 32768.0)
-    }
-
-    /// Count of 20ms frames (320 samples @ 16kHz mono) whose RMS exceeds thresholdDb, scanning
-    /// the same region peakDbFS does (everything except the trailing silence-flush guard).
-    /// This is the speech-evidence metric: room tone yields 0 frames, a hotkey click 1-2, and
-    /// any real utterance well above that. Byte-pair assembly for the same alignment reason.
-    private static func speechFrameCount(of pcmData: Data, thresholdDb: Double, guardBytes: Int = 22400) -> Int {
-        guard pcmData.count > guardBytes else { return 0 }
-        let scanCount = pcmData.count - guardBytes
-        let base = pcmData.startIndex
-        let frameBytes = 640  // 20ms of 16-bit mono @ 16kHz
-        var frames = 0
-        var offset = 0
-        while offset + frameBytes <= scanCount {
-            var sumSquares = 0.0
-            var i = 0
-            while i + 1 < frameBytes {
-                let lo = pcmData[base + offset + i]
-                let hi = pcmData[base + offset + i + 1]
-                let sample = Int16(bitPattern: UInt16(lo) | (UInt16(hi) << 8))
-                let s = Double(sample) / 32768.0
-                sumSquares += s * s
-                i += 2
-            }
-            let rms = (sumSquares / Double(frameBytes / 2)).squareRoot()
-            if 20 * log10(max(rms, 1e-9)) > thresholdDb { frames += 1 }
-            offset += frameBytes
-        }
-        return frames
-    }
-
     /// Runs entirely on sessionQueue: finalizes the capture, arbitrates the WS-vs-REST turn
     /// lifecycle, and is the only place that mutates currentTurnId / turnSettled / pendingFallbackTimer.
     private func runTurnPipeline(keyUpTime: CFAbsoluteTime) {
         let pipelineStartTime = CFAbsoluteTimeGetCurrent()
-        let (pcmData, duration, chunks, capturedBytes) = audioCapture.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
+        let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
 
         // Discard accidental micro-clicks (< 150ms or < 2KB of real captured audio, ignoring
         // the fixed pre-roll/silence-flush padding that stopRecording always appends).
@@ -422,13 +370,13 @@ final class JustSpeakApp {
             return
         }
 
-        // Silent-clip gate: scan the captured audio before spending an API call on it. Runs
-        // on sessionQueue, ahead of both the WS and REST routes, so room tone never leaves the
-        // machine. Abandons the turn the same way the micro-click guard above does (isProcessing
-        // cleared, the WS turn never committed). Two tests: absolute peak (dead room), and
-        // speech-frame count (room tone whose peak is spiked by the hotkey's own click).
-        let speechFrames = Self.speechFrameCount(of: pcmData, thresholdDb: config.trailSilenceDb)
-        if let peakDb = Self.peakDbFS(of: pcmData), peakDb < silentClipPeakDb || speechFrames <= silentClipMaxSpeechFrames {
+        // Silent-clip gate: judge the captured audio before spending an API call on it, so
+        // room tone never leaves the machine. peakDb/speechFrames were accumulated inline
+        // during capture (peak = dead-room test; speech-frame count = room tone whose peak is
+        // spiked by the hotkey's own click) - nothing rescans the clip on this critical path.
+        // Abandons the turn the same way the micro-click guard above does (isProcessing
+        // cleared, the WS turn never committed). nil peak = no real audio = "not silent".
+        if let peakDb = peakDb, peakDb < silentClipPeakDb || speechFrames <= silentClipMaxSpeechFrames {
             Logger.warn("INPUT", "No speech detected in clip (peak \(String(format: "%.1f", peakDb)) dBFS, \(speechFrames) speech frames) - skipping API call.")
             noteNoSpeechTurn()
             DispatchQueue.main.async { [weak self] in

@@ -30,6 +30,18 @@ final class AudioCaptureEngine {
     private var pendingChunkBuffer = Data()
     private let streamingChunkTargetBytes = 4800
 
+    // Silence-gate statistics, accumulated inline as audio arrives so stopRecording never
+    // rescans the whole clip on the key-up critical path. Framing is continuous across
+    // chunks AND across the pre-roll/live boundary, matching the old whole-clip scan
+    // exactly. All under `lock`; per-frame dB values are classified against the caller's
+    // threshold at stopRecording time (the threshold is a stopRecording argument).
+    private static let speechFrameSamples = 320  // 20ms of 16kHz mono
+    private var turnMaxAbsSample: Int32 = 0
+    private var frameSumSquares: Double = 0
+    private var frameSampleCount: Int = 0
+    private var frameDbValues: [Double] = []
+    private var statSampleCount: Int = 0
+
     var onAudioChunk: ((Data) -> Void)?
     var onAudioLevel: ((Double) -> Void)?
 
@@ -216,6 +228,7 @@ final class AudioCaptureEngine {
             recordedPCMData.append(chunkData)
             pendingChunkBuffer.append(chunkData)
             chunkCount += 1
+            accumulateStats(samples: int16Pointer, count: Int(outputBuffer.frameLength))
 
             // 10Hz meter throttle decision must happen under the lock since it mutates
             // lastMeterUpdateTime; only snapshot the meter's inputs when actually needed.
@@ -289,10 +302,52 @@ final class AudioCaptureEngine {
         return "\(ANSI.green)\(filledStr)\(ANSI.gray)\(emptyStr)\(ANSI.reset)"
     }
 
+    // Assumes `lock` is held. Streams samples into the peak + 20ms-frame RMS accumulators.
+    // Pure math - no I/O or callbacks under the lock.
+    private func accumulateStats(samples: UnsafePointer<Int16>, count: Int) {
+        for i in 0..<count {
+            let s = Int32(samples[i])
+            let a = abs(s)
+            if a > turnMaxAbsSample { turnMaxAbsSample = a }
+            let norm = Double(s) / 32768.0
+            frameSumSquares += norm * norm
+            frameSampleCount += 1
+            if frameSampleCount == Self.speechFrameSamples {
+                let rms = (frameSumSquares / Double(Self.speechFrameSamples)).squareRoot()
+                frameDbValues.append(20 * log10(max(rms, 1e-9)))
+                frameSumSquares = 0
+                frameSampleCount = 0
+            }
+        }
+        statSampleCount += count
+    }
+
+    // Assumes `lock` is held. Byte-pair assembly because Data's storage isn't guaranteed
+    // 2-byte aligned; only used for the pre-roll (≤400ms), live audio feeds the pointer
+    // variant directly.
+    private func accumulateStats(data: Data) {
+        let sampleCount = data.count / 2
+        guard sampleCount > 0 else { return }
+        var samples = [Int16](repeating: 0, count: sampleCount)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            for i in 0..<sampleCount {
+                samples[i] = Int16(bitPattern: UInt16(raw[2 * i]) | (UInt16(raw[2 * i + 1]) << 8))
+            }
+        }
+        samples.withUnsafeBufferPointer { buf in
+            accumulateStats(samples: buf.baseAddress!, count: buf.count)
+        }
+    }
+
     func startRecording() {
         lock.lock()
         recordedPCMData.removeAll(keepingCapacity: true)
         pendingChunkBuffer.removeAll(keepingCapacity: true)
+        turnMaxAbsSample = 0
+        frameSumSquares = 0
+        frameSampleCount = 0
+        frameDbValues.removeAll(keepingCapacity: true)
+        statSampleCount = 0
 
         // Prepend rolling pre-roll buffer to prevent clipped first syllable
         preRollBytesInTurn = 0
@@ -301,6 +356,10 @@ final class AudioCaptureEngine {
             preRollBytesInTurn = preRollRingBuffer.count
             recordedPCMData.append(preRollRingBuffer)
             immediatePreRollChunk = preRollRingBuffer
+            // Pre-roll bytes bypass the live accumulation below (they were captured while
+            // idle), so their stats are folded in once here - a ≤400ms scan, off the key-up
+            // path entirely.
+            accumulateStats(data: preRollRingBuffer)
             preRollRingBuffer.removeAll(keepingCapacity: true)
         }
 
@@ -316,7 +375,7 @@ final class AudioCaptureEngine {
         }
     }
 
-    func stopRecording(gracePeriodMs: Int, maxTrailMs: Int, silenceThresholdDb: Double) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int) {
+    func stopRecording(gracePeriodMs: Int, maxTrailMs: Int, silenceThresholdDb: Double) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?, speechFrames: Int) {
         // True hold duration is measured at entry, BEFORE the post-roll wait - otherwise the
         // grace period pads every tap past the caller's micro-click duration threshold.
         let stopRequestTime = CFAbsoluteTimeGetCurrent()
@@ -389,16 +448,24 @@ final class AudioCaptureEngine {
         let data = recordedPCMData
         let duration = stopRequestTime - recordingStartTime
         let chunks = chunkCount
+
+        // 6. Silence-gate stats from the running accumulators - no rescan of the clip. The
+        // silence flush above was appended AFTER accumulation stopped, so it can never mask
+        // genuine silence; nil peak means zero real (pre-roll + key-held) samples, which
+        // callers treat as "not silent", matching the old too-short-clip behavior.
+        let peakDb: Double? = statSampleCount > 0 ? 20 * log10(max(Double(turnMaxAbsSample), 1.0) / 32768.0) : nil
+        var speechFrames = 0
+        for db in frameDbValues where db > silenceThresholdDb { speechFrames += 1 }
         lock.unlock()
 
-        // 6. Fire chunk callbacks outside the lock. Ordering preserved: trailing real audio first, then silence.
+        // 7. Fire chunk callbacks outside the lock. Ordering preserved: trailing real audio first, then silence.
         if let trailing = trailingChunk {
             onAudioChunk?(trailing)
         }
         onAudioChunk?(silenceData)
 
         Logger.endMeter()
-        return (data, duration, chunks, capturedBytes)
+        return (data, duration, chunks, capturedBytes, peakDb, speechFrames)
     }
 
     func stopEngine() {
