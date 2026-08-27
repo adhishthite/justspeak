@@ -38,6 +38,19 @@ struct Config {
     var trailSilenceDb: Double = -40.0
     var vadMode: String = "manual"  // "manual" (PTT key defines speech bounds), "tuned", or "auto"
     var vadSilenceMs: Int = 1500
+    // A/B knobs for aligning the Live protocol with the dedicated transcribe docs. Defaults
+    // preserve shipped behavior; flip individually on the Mac and compare per-turn latency
+    // diagnostics (and last-word accuracy for the silence flush) before adopting.
+    //
+    // Aligned endpointing sends only the documented end-of-turn signal for transcribe models
+    // (manual VAD -> activityEnd; auto/tuned -> audioStreamEnd) instead of the legacy
+    // audioStreamEnd + activityEnd + clientContent.turnComplete triple.
+    var wsEndpointAligned: Bool = false
+    // Streaming chunk size; docs recommend ~100ms for the dedicated model (150 = shipped).
+    var chunkMs: Int = 150
+    // Synthetic trailing silence appended after key-up so the speech encoder's lookahead
+    // window can finalize the last word. 0 disables it entirely.
+    var silenceFlushMs: Int = 700
     // Release the mic (status-bar indicator off) after this many seconds without a dictation;
     // the next key-down re-arms it. 0 = keep the mic always on (lowest latency, indicator lit).
     var micIdleTimeoutSec: Int = 300
@@ -182,6 +195,9 @@ struct Config {
                         case "TRAIL_SILENCE_DB": if let db = Double(value) { config.trailSilenceDb = min(-10.0, max(-80.0, db)) }
                         case "VAD_MODE": if ["manual", "tuned", "auto"].contains(value.lowercased()) { config.vadMode = value.lowercased() }
                         case "VAD_SILENCE_MS": if let ms = Int(value) { config.vadSilenceMs = min(5000, max(200, ms)) }
+                        case "WS_ENDPOINT_ALIGNED": config.wsEndpointAligned = (value.lowercased() == "true" || value == "1")
+                        case "CHUNK_MS": if let ms = Int(value) { config.chunkMs = min(500, max(20, ms)) }
+                        case "SILENCE_FLUSH_MS": if let ms = Int(value) { config.silenceFlushMs = min(2000, max(0, ms)) }
                         case "MIC_IDLE_TIMEOUT": if let sec = Int(value) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
                         case "HISTORY": config.historyEnabled = (value.lowercased() == "true" || value == "1")
                         case "HISTORY_DB": config.historyDbPath = value
@@ -220,6 +236,9 @@ struct Config {
         if let trailDb = env["TRAIL_SILENCE_DB"], let db = Double(trailDb) { config.trailSilenceDb = min(-10.0, max(-80.0, db)) }
         if let vad = env["VAD_MODE"], ["manual", "tuned", "auto"].contains(vad.lowercased()) { config.vadMode = vad.lowercased() }
         if let vadSilence = env["VAD_SILENCE_MS"], let ms = Int(vadSilence) { config.vadSilenceMs = min(5000, max(200, ms)) }
+        if let aligned = env["WS_ENDPOINT_ALIGNED"] { config.wsEndpointAligned = (aligned.lowercased() == "true" || aligned == "1") }
+        if let chunk = env["CHUNK_MS"], let ms = Int(chunk) { config.chunkMs = min(500, max(20, ms)) }
+        if let flush = env["SILENCE_FLUSH_MS"], let ms = Int(flush) { config.silenceFlushMs = min(2000, max(0, ms)) }
         if let micIdle = env["MIC_IDLE_TIMEOUT"], let sec = Int(micIdle) { config.micIdleTimeoutSec = min(7200, max(0, sec)) }
         if let hist = env["HISTORY"], !hist.isEmpty { config.historyEnabled = (hist.lowercased() == "true" || hist == "1") }
         if let histDb = env["HISTORY_DB"], !histDb.isEmpty { config.historyDbPath = histDb }

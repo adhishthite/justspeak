@@ -83,7 +83,7 @@ final class JustSpeakApp {
 
     init(config: Config) {
         self.config = config
-        self.audioCapture = AudioCaptureEngine(preRollMs: config.preRollMs)
+        self.audioCapture = AudioCaptureEngine(preRollMs: config.preRollMs, chunkMs: config.chunkMs, silenceFlushMs: config.silenceFlushMs)
         if config.enableLiveWebSocket && !config.geminiApiKey.isEmpty {
             self.liveClient = GeminiLiveClient(
                 apiKey: config.geminiApiKey,
@@ -92,7 +92,8 @@ final class JustSpeakApp {
                 languageCodes: config.languageCodes,
                 customVocabulary: config.customVocabulary,
                 vadMode: config.vadMode,
-                vadSilenceMs: config.vadSilenceMs
+                vadSilenceMs: config.vadSilenceMs,
+                endpointAligned: config.wsEndpointAligned
             )
         }
         if config.showHUD {

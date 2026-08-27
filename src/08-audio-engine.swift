@@ -26,9 +26,13 @@ final class AudioCaptureEngine {
     private let maxPreRollBytes: Int
     private var preRollBytesInTurn = 0
 
-    // Streaming chunk accumulator (~150ms chunks = 4800 bytes)
+    // Streaming chunk accumulator (CHUNK_MS; default 150ms = 4800 bytes, docs suggest ~100ms
+    // for the dedicated transcribe model)
     private var pendingChunkBuffer = Data()
-    private let streamingChunkTargetBytes = 4800
+    private let streamingChunkTargetBytes: Int
+
+    // Synthetic trailing silence appended at stopRecording (SILENCE_FLUSH_MS; 0 disables)
+    private let silenceFlushBytes: Int
 
     // Silence-gate statistics, accumulated inline as audio arrives so stopRecording never
     // rescans the whole clip on the key-up critical path. Framing is continuous across
@@ -45,7 +49,7 @@ final class AudioCaptureEngine {
     var onAudioChunk: ((Data) -> Void)?
     var onAudioLevel: ((Double) -> Void)?
 
-    init(preRollMs: Int = 400) {
+    init(preRollMs: Int = 400, chunkMs: Int = 150, silenceFlushMs: Int = 700) {
         // Standard 16kHz 16-bit Mono Linear PCM for speech AI models
         self.targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -55,6 +59,8 @@ final class AudioCaptureEngine {
         )!
         // 16,000 samples/sec * 2 bytes/sample = 32 bytes per ms
         self.maxPreRollBytes = max(0, preRollMs * 32)
+        self.streamingChunkTargetBytes = max(640, chunkMs * 32)
+        self.silenceFlushBytes = max(0, silenceFlushMs * 32)
     }
 
     func setup() -> Bool {
@@ -369,9 +375,16 @@ final class AudioCaptureEngine {
         isRecording = true
         lock.unlock()
 
-        // Immediately dispatch pre-roll audio to WebSocket so speech model receives head-start audio
+        // Immediately dispatch pre-roll audio to WebSocket so speech model receives head-start
+        // audio - split into streaming-target-sized frames rather than one oversized payload
+        // (the whole pre-roll still goes out right now; only the framing changes).
         if let chunk = immediatePreRollChunk {
-            onAudioChunk?(chunk)
+            var offset = chunk.startIndex
+            while offset < chunk.endIndex {
+                let end = chunk.index(offset, offsetBy: streamingChunkTargetBytes, limitedBy: chunk.endIndex) ?? chunk.endIndex
+                onAudioChunk?(chunk.subdata(in: offset..<end))
+                offset = end
+            }
         }
     }
 
@@ -439,11 +452,14 @@ final class AudioCaptureEngine {
             pendingChunkBuffer.removeAll(keepingCapacity: true)
         }
 
-        // 5. Append 700ms acoustic lookahead silence flush (22,400 bytes @ 16kHz 16-bit mono)
-        // This satisfies the bidirectional acoustic lookahead window required by speech encoders to finalize trailing words
-        let silenceFlushBytes = 22400
+        // 5. Append the acoustic lookahead silence flush (SILENCE_FLUSH_MS; default 700ms =
+        // 22,400 bytes @ 16kHz 16-bit mono). This satisfies the lookahead window speech
+        // encoders need to finalize trailing words; appended AFTER stat accumulation stopped,
+        // so the silence gate never sees it regardless of duration.
         let silenceData = Data(count: silenceFlushBytes)
-        recordedPCMData.append(silenceData)
+        if !silenceData.isEmpty {
+            recordedPCMData.append(silenceData)
+        }
 
         let data = recordedPCMData
         let duration = stopRequestTime - recordingStartTime
@@ -462,7 +478,9 @@ final class AudioCaptureEngine {
         if let trailing = trailingChunk {
             onAudioChunk?(trailing)
         }
-        onAudioChunk?(silenceData)
+        if !silenceData.isEmpty {
+            onAudioChunk?(silenceData)
+        }
 
         Logger.endMeter()
         return (data, duration, chunks, capturedBytes, peakDb, speechFrames)

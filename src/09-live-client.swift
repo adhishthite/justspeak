@@ -53,6 +53,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private let customVocabulary: [String]
     private let vadMode: String
     private let vadSilenceMs: Int
+    private let endpointAligned: Bool
 
     // Conversational models always run with server VAD disabled (their setup hard-codes it);
     // transcribe models do so when VAD_MODE=manual. Either way the client must bracket each
@@ -91,7 +92,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         languageCodes: [String] = ["en-IN", "mr-IN"],
         customVocabulary: [String] = [],
         vadMode: String = "manual",
-        vadSilenceMs: Int = 1500
+        vadSilenceMs: Int = 1500,
+        endpointAligned: Bool = false
     ) {
         self.apiKey = apiKey
         self.model = model
@@ -100,6 +102,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.customVocabulary = customVocabulary
         self.vadMode = vadMode
         self.vadSilenceMs = vadSilenceMs
+        self.endpointAligned = endpointAligned
         super.init()
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
@@ -648,21 +651,32 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.hasFiredTurnCompletion = false
         lock.unlock()
 
-        // 1. Dispatch audioStreamEnd signal to flush audio encoder pipeline
-        let endAudioPayload: [String: Any] = [
-            "realtimeInput": [
-                "audioStreamEnd": true
+        // End-of-turn signaling. Legacy (shipped) behavior sends all three of audioStreamEnd,
+        // activityEnd and clientContent.turnComplete. The dedicated transcribe docs show only
+        // ONE terminator per VAD mode (manual -> activityEnd; auto/tuned -> audioStreamEnd)
+        // and never clientContent.turnComplete - WS_ENDPOINT_ALIGNED opts into that shape for
+        // A/B testing. Conversational models are never aligned: clientContent.turnComplete is
+        // what triggers their generation.
+        let aligned = endpointAligned && model.contains("transcribe")
+
+        // 1. audioStreamEnd flushes the audio encoder pipeline (aligned manual mode omits it:
+        // the docs' manual recipe ends with activityEnd alone).
+        if !(aligned && usesManualActivity) {
+            let endAudioPayload: [String: Any] = [
+                "realtimeInput": [
+                    "audioStreamEnd": true
+                ]
             ]
-        ]
-        if let endAudioJson = try? JSONSerialization.data(withJSONObject: endAudioPayload),
-            let endAudioStr = String(data: endAudioJson, encoding: .utf8)
-        {
-            webSocketTask?.send(.string(endAudioStr)) { _ in }
+            if let endAudioJson = try? JSONSerialization.data(withJSONObject: endAudioPayload),
+                let endAudioStr = String(data: endAudioJson, encoding: .utf8)
+            {
+                webSocketTask?.send(.string(endAudioStr)) { _ in }
+            }
         }
 
         // 2. Dispatch manual activityEnd: the key release IS the end of speech whenever
-        // server VAD is disabled (after audioStreamEnd so all buffered audio lands inside
-        // the activity window)
+        // server VAD is disabled (in legacy mode after audioStreamEnd, so all buffered audio
+        // lands inside the activity window)
         if usesManualActivity {
             let endPayload: [String: Any] = [
                 "realtimeInput": [
@@ -676,23 +690,28 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
         }
 
-        // 3. Dispatch turnComplete signal to finalize transcript
-        let commitPayload: [String: Any] = [
-            "clientContent": [
-                "turnComplete": true
+        // 3. Dispatch turnComplete signal to finalize transcript (legacy only). NOTE for the
+        // A/B: the server may currently be echoing turnComplete back, which settles the turn
+        // immediately in handleIncomingMessage - aligned mode shifts settlement onto the
+        // attemptSettle timers, so compare latency in BOTH directions before adopting.
+        if !aligned {
+            let commitPayload: [String: Any] = [
+                "clientContent": [
+                    "turnComplete": true
+                ]
             ]
-        ]
 
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: commitPayload),
-            let jsonString = String(data: jsonData, encoding: .utf8)
-        else {
-            completion(.failure(NSError(domain: "JustSpeak", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize commit payload."])))
-            return
-        }
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: commitPayload),
+                let jsonString = String(data: jsonData, encoding: .utf8)
+            else {
+                completion(.failure(NSError(domain: "JustSpeak", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize commit payload."])))
+                return
+            }
 
-        webSocketTask?.send(.string(jsonString)) { error in
-            if let error = error {
-                Logger.debug("WS", "Commit turn send error: \(error.localizedDescription)")
+            webSocketTask?.send(.string(jsonString)) { error in
+                if let error = error {
+                    Logger.debug("WS", "Commit turn send error: \(error.localizedDescription)")
+                }
             }
         }
 

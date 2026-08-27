@@ -159,6 +159,9 @@ All settings can be configured in `.env` or set as environment variables:
 | `TRAIL_SILENCE_DB` | `-40.0` | RMS dBFS below which the mic is considered quiet for the adaptive trailing capture above (-80.0 to -10.0) |
 | `VAD_MODE` | `manual` | `manual` (push-to-talk hold defines speech bounds, server VAD off), `tuned` (pause-tolerant server VAD), `auto` (stock server VAD) |
 | `VAD_SILENCE_MS` | `1500` | Tuned mode only: pause length (ms) before server VAD ends speech (200-5000) |
+| `WS_ENDPOINT_ALIGNED` | `false` | A/B: send only the documented end-of-turn signal for transcribe models (manual VAD → `activityEnd`; auto/tuned → `audioStreamEnd`) instead of the legacy three-signal commit |
+| `CHUNK_MS` | `150` | A/B: streaming frame size (ms) for Live WebSocket audio, pre-roll included; docs suggest ~100 for the dedicated transcribe model (20-500) |
+| `SILENCE_FLUSH_MS` | `700` | A/B: synthetic trailing silence (ms) appended after key-up for the encoder's lookahead window; `0` disables (0-2000) |
 | `MIC_IDLE_TIMEOUT` | `300` | Seconds without a dictation before the mic is released (status-bar indicator off); next key-down re-arms it. `0` = always on |
 | `HISTORY` | `true` | Record every dictation (success, empty, or error) as one row in a local SQLite DB for later analysis |
 | `HISTORY_DB` | *(empty)* | Path to the history SQLite DB. Empty = `~/.justspeak/history.db` |
