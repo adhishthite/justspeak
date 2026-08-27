@@ -11,6 +11,7 @@ import Foundation
 import AVFoundation
 import AppKit
 import CoreGraphics
+import CoreAudio
 import ApplicationServices
 import Darwin
 import Network
