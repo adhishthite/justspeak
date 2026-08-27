@@ -134,25 +134,57 @@ final class AppleNotchAuraView: NSView {
             context.restoreGState()
         }
 
-        // 2. Bezel rim: a wide, low-alpha, heavily blurred band rather than a drawn line -
-        // the notch edge should read as lit, not outlined.
+        // 2. Bezel halo: light that falls off with distance from the bezel, not a band.
+        strokeHalo(context: context, path: path, tint: tint, energy: energy)
+    }
+
+    // The classic SwiftUI glow recipe (a crisp stroke plus two blurred copies of it,
+    // voice swelling both width and blur - the construction Talkify's edge glow uses),
+    // adapted to Core Graphics: CG cannot blur a stroke directly, so each blurred copy
+    // is drawn as a shadow - the source stroke lands two panel-widths off-canvas and
+    // only its gaussian shadow shows in view. Wide halo, tight glow, thin rim on top.
+    private func strokeHalo(context: CGContext, path: CGPath, tint: NSColor, energy: CGFloat) {
+        let shift = bounds.width * 2.0
+        var offscreen = CGAffineTransform(translationX: -shift, y: 0)
+        let source = path.copy(using: &offscreen) ?? path
+        let width = 6.0 + 6.0 * energy
+        let blur = 22.0 + 16.0 * energy
+
+        let passes: [(blur: CGFloat, alpha: CGFloat)] = [
+            (blur, 0.40 + 0.25 * energy),
+            (blur * 0.5, 0.50 + 0.25 * energy)
+        ]
+        for pass in passes {
+            context.saveGState()
+            context.setShadow(
+                offset: CGSize(width: shift, height: 0),
+                blur: pass.blur,
+                color: tint.withAlphaComponent(pass.alpha).cgColor
+            )
+            context.addPath(source)
+            context.setStrokeColor(tint.cgColor)
+            context.setLineWidth(width)
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+            context.strokePath()
+            context.restoreGState()
+        }
+
+        // The rim stays faint and thin - the halo carries the light; the line only
+        // keeps the edge defined underneath it.
         context.saveGState()
-        context.setShadow(
-            offset: CGSize(width: 0, height: -2),
-            blur: 12.0 + 8.0 * energy,
-            color: tint.withAlphaComponent(0.55).cgColor
-        )
         context.addPath(path)
-        context.setStrokeColor(tint.withAlphaComponent(0.28 + 0.22 * energy).cgColor)
-        context.setLineWidth(5.0)
+        context.setStrokeColor(tint.withAlphaComponent(0.25 + 0.15 * energy).cgColor)
+        context.setLineWidth(width * 0.35)
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.strokePath()
         context.restoreGState()
     }
 
-    // No-notch displays: the aura rings the pill capsule instead. Even-odd clipping
-    // keeps every photon outside the capsule so the pill face stays hardware-black.
+    // No-notch displays: the halo wraps the pill capsule instead. Even-odd clipping
+    // keeps every photon outside the capsule so the pill face stays hardware-black -
+    // the clip applies to the shadow passes too.
     private func drawPillAura(context: CGContext, tint: NSColor, energy: CGFloat) {
         let w = pillSize.width
         let h = pillSize.height
@@ -167,15 +199,7 @@ final class AppleNotchAuraView: NSView {
         context.addPath(mask)
         context.clip(using: .evenOdd)
 
-        context.setShadow(
-            offset: .zero,
-            blur: 14.0 + 10.0 * energy,
-            color: tint.withAlphaComponent(0.55 + 0.25 * energy).cgColor
-        )
-        context.addPath(capsule)
-        context.setStrokeColor(tint.withAlphaComponent(0.30 + 0.25 * energy).cgColor)
-        context.setLineWidth(5.0)
-        context.strokePath()
+        strokeHalo(context: context, path: capsule, tint: tint, energy: energy)
         context.restoreGState()
     }
 }

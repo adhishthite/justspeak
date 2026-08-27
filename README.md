@@ -26,6 +26,7 @@ Hold [⌥ Right] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemin
 - **Zero Clipping at Either End**: A 400ms always-on pre-roll ring buffer captures the syllable spoken *before* key-down, and an adaptive post-roll keeps streaming after release while speech energy persists (250ms continuous-quiet window, 1.5s hard cap) — releasing the key mid-syllable never clips the last word.
 - **Apple HIG & Dynamic Island UI**:
   - **Notch Light Spill**: a soft pool of light beneath the notch that breathes with your voice — one Google color at a time, slowly cycling blue → red → yellow → green → white; success settles on green, errors on red.
+  - **Halo Falloff**: the bezel (or, on notch-less displays, the pill capsule) is wrapped in a layered halo — a thin rim under two gaussian glows of different radii — so the light genuinely fades out with distance instead of ending at a stroke edge; speech swells both its width and its blur.
   - **Siri Orb & Living Equalizer**: Pulsing Apple Intelligence gradient orb with 4-bar dynamic audio visualizer.
   - **Dynamic Island Capsule**: Hardware-black floating HUD that reads as the notch extruding, rendered with Display P3 colors.
 - **Apple System Earcons**: Pre-cached native macOS audio feedback on key-down and text commit (`begin_record.caf`, `jbl_confirm.caf`, `jbl_cancel.caf`).
@@ -224,6 +225,19 @@ cooper netties => Kubernetes
 
 `wrong` and `right` are trimmed independently; either side being empty drops the rule. These rules are enforced client-side, deterministically, right after transcription — unlike plain boost terms, which only bias what the recognizer *might* hear, a replacement rule guarantees the wrong form never reaches your document. The `right` side is also added to the boost vocabulary automatically (never the `wrong` form — that would just teach the recognizer to keep mishearing it the same way).
 
+### Vocabulary Mining (`make analyze`)
+
+Instead of noticing misrecognitions one by one, let the model read your history:
+
+```bash
+make analyze                      # last 30 days
+./justspeak --analyze --days 7    # custom window
+```
+
+The analyzer pulls your successful dictations from the local history DB (newest first, capped at 500 turns), sends them **once** to the REST model (`GEMINI_MODEL`, flash-lite by default) and asks it for two things: domain terms you say repeatedly that a recognizer is likely to mangle (→ boost terms), and the same intended word showing up in recurring garbled forms (→ `wrong => right` rules). Suggestions already covered by your vocabulary are filtered out, each comes with its evidence, and the reported token cost is printed. Nothing is written unless you answer `y` to the final prompt, which appends the suggestions to your vocabulary file under a dated `# Added by --analyze` comment — they take effect on the next launch.
+
+This is strictly on-demand: the dictation pipeline never runs it, and your transcripts go exactly where they already went to be transcribed — the same Gemini API, same key.
+
 ---
 
 ## 🌐 Multilingual & Bilingual Support
@@ -358,6 +372,7 @@ sqlite3 ~/.justspeak/history.db \
 | `make check-permissions` | Validate Accessibility, Microphone & Input Monitoring permissions |
 | `make test-api` | Verify Gemini API connectivity, model reachability & latency |
 | `make test-audio` | Record a 3-second audio sample from the mic and verify AI transcription |
+| `make analyze` | Mine your dictation history for vocabulary suggestions (interactive) |
 | `make setup` | Initialize local `.env` configuration from `.env.example` |
 | `make lint` | Lint `src/*.swift` with Apple's `swift format` (Xcode 16+; read-only) |
 | `make format` | Rewrite `src/*.swift` in place with Apple's `swift format` |

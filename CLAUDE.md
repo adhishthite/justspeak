@@ -42,9 +42,11 @@ This repo is usually edited on a **Linux VM with no Swift toolchain**. Consequen
 - `10-validation-gate` / `11-rest-client` — REST fallback (`gemini-3.5-flash-lite`, prompted): validation gate rejects model-voice output (precision-first — patterns must never reject dictations like "Sure, sounds good" or "As an AI engineer…"); 429 retry-delay honoring; one re-send on empty transcript.
 - `12-hotkey` — CGEventTap on the **main run loop** (so key handlers run on main; NSWorkspace reads there are safe).
 - `14-secure-input` — `IsSecureEventInputEnabled()` + IOKit holder lookup; dictation refuses at key-down, downgrades to copy-only at paste time.
+- `17-hud-aura` — `strokeHalo` (crisp rim + two offset-shadow gaussian passes, Talkify's glow construction) serves both geometries: the dilated notch path and, in `pillMode`, the even-odd-clipped pill capsule; the pill panel margin in `21-hud` must exceed the halo's worst-case spread (~44px) or the fade gets a panel-edge cutoff. Design reference for notch HUD treatments: https://github.com/tornikegomareli/Talkify (SwiftUI — `HUDEdgeGlowView` has the glow recipe: crisp stroke at w/2 + two blurred copies at blur r and r/2, voice level swelling width and blur; also open-silhouette stroking that never draws the hidden top edge, and sweep/particle ideas we haven't ported).
 - `21-hud` — notch-anchored pill; truncation is controlled by the attributed string's NSParagraphStyle (cell `lineBreakMode` is ignored for attributed values).
 - `22-app` — `JustSpeakApp` orchestrator; see invariants below.
 - `24-network-monitor` — `NWPathMonitor` singleton behind an NSLock; the key-down offline gate reads `isOnline` (optimistic until the first path update so a slow monitor never blocks a healthy network).
+- `25-analyzer` — `--analyze` / `make analyze`: mines the history DB (success rows, newest-first, 300k-char payload cap) for vocab suggestions via one REST call (`responseMimeType: application/json`); suggestions are rendered in vocabulary-file syntax so the interactive append is a plain string concat `parseVocabulary` already reads; strictly user-run — never wired into the dictation path.
 
 ## Invariants that past bugs were made of
 

@@ -152,10 +152,12 @@ final class FloatingHUD {
             notchGlowView.notchRect = notchInfo.rect
             notchGlowView.pillMode = false
         } else {
-            // No hardware notch: the aura rings the pill. The panel is sized to the pill's
+            // No hardware notch: the halo wraps the pill. The panel is sized to the pill's
             // MAXIMUM footprint so width animations never need a panel reframe - the view
-            // redraws the capsule at pillSize every animation tick anyway.
-            let margin: CGFloat = 44.0
+            // redraws the capsule at pillSize every animation tick anyway. Margin must
+            // exceed the halo's worst-case spread (blur 38 + half stroke width at full
+            // energy, ~44px) or the fade-out gets a hard panel-edge cutoff.
+            let margin: CGFloat = 64.0
             let auraWidth = maxPillWidth + margin * 2
             let auraHeight = pillHeight + margin * 2
             let auraX = screenFrame.midX - auraWidth / 2.0
