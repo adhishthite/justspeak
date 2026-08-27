@@ -133,6 +133,9 @@ final class JustSpeakApp {
 
         let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         sigterm.setEventHandler {
+            // Same as SIGINT: a service-manager kill or shutdown mid-recording must not
+            // leave the system output stuck at the ducked volume.
+            AudioDucker.shared.restore()
             exit(0)
         }
         sigterm.resume()

@@ -7,11 +7,18 @@
 final class AudioDucker {
     static let shared = AudioDucker()
 
+    // Per-element levels: a device without a master volume has independent left/right
+    // channels, and collapsing them to one average would permanently flatten the user's
+    // stereo balance on the first ducking cycle.
+    private struct ElementLevel {
+        let element: AudioObjectPropertyElement
+        let original: Float32
+        let applied: Float32
+    }
+
     private struct DuckedState {
         let deviceID: AudioDeviceID
-        let elements: [AudioObjectPropertyElement]
-        let originalVolume: Float32
-        let appliedVolume: Float32
+        let levels: [ElementLevel]
     }
 
     private let lock = NSLock()
@@ -35,23 +42,28 @@ final class AudioDucker {
             Logger.debug("DUCK", "Output device exposes no settable volume - skipping duck.")
             return
         }
-        guard let current = Self.readVolume(deviceID: deviceID, elements: elements) else {
+        var levels: [ElementLevel] = []
+        for element in elements {
+            guard let current = Self.readVolume(deviceID: deviceID, element: element) else { continue }
+            let target = min(max(current * fraction, 0), 1)
+            var applied = current
+            if target < current, Self.writeVolume(deviceID: deviceID, element: element, value: target) {
+                applied = target
+            }
+            levels.append(ElementLevel(element: element, original: current, applied: applied))
+        }
+        guard !levels.isEmpty else {
             Logger.debug("DUCK", "Could not read output volume - skipping duck.")
             return
         }
 
-        let target = min(max(current * fraction, 0), 1)
-        var applied = current
-        if target < current {
-            applied = Self.writeVolume(deviceID: deviceID, elements: elements, value: target) ? target : current
-        }
-
         lock.lock()
-        state = DuckedState(deviceID: deviceID, elements: elements, originalVolume: current, appliedVolume: applied)
+        state = DuckedState(deviceID: deviceID, levels: levels)
         lock.unlock()
 
-        if applied < current {
-            Logger.debug("DUCK", String(format: "Output ducked %.2f -> %.2f", current, applied))
+        if levels.contains(where: { $0.applied < $0.original }) {
+            let detail = levels.map { String(format: "%.2f -> %.2f", $0.original, $0.applied) }.joined(separator: ", ")
+            Logger.debug("DUCK", "Output ducked \(detail)")
         }
     }
 
@@ -64,18 +76,27 @@ final class AudioDucker {
         state = nil
         lock.unlock()
 
-        guard let current = Self.readVolume(deviceID: saved.deviceID, elements: saved.elements) else {
-            return
+        // User-wins is judged whole-device: the volume keys move every channel together, so
+        // any one element off its applied value means the user adjusted - leave all of them.
+        var currents: [Float32] = []
+        for level in saved.levels {
+            guard let current = Self.readVolume(deviceID: saved.deviceID, element: level.element) else { return }
+            currents.append(current)
         }
-
-        if abs(current - saved.appliedVolume) > 0.001 {
+        for (i, level) in saved.levels.enumerated() where abs(currents[i] - level.applied) > 0.001 {
             Logger.debug("DUCK", "Volume changed by user mid-turn - leaving as-is.")
             return
         }
 
-        guard saved.appliedVolume != saved.originalVolume else { return }
-        if Self.writeVolume(deviceID: saved.deviceID, elements: saved.elements, value: saved.originalVolume) {
-            Logger.debug("DUCK", String(format: "Output restored -> %.2f", saved.originalVolume))
+        var restoredAny = false
+        for level in saved.levels where level.applied != level.original {
+            if Self.writeVolume(deviceID: saved.deviceID, element: level.element, value: level.original) {
+                restoredAny = true
+            }
+        }
+        if restoredAny {
+            let detail = saved.levels.map { String(format: "%.2f", $0.original) }.joined(separator: ", ")
+            Logger.debug("DUCK", "Output restored -> \(detail)")
         }
     }
 
@@ -121,42 +142,29 @@ final class AudioDucker {
         return status == noErr && settable.boolValue
     }
 
-    private static func readVolume(deviceID: AudioDeviceID, elements: [AudioObjectPropertyElement]) -> Float32? {
-        var total: Float32 = 0
-        var count = 0
-        for element in elements {
-            var address = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyVolumeScalar,
-                mScope: kAudioDevicePropertyScopeOutput,
-                mElement: element
-            )
-            var value: Float32 = 0
-            var size = UInt32(MemoryLayout<Float32>.size)
-            let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
-            guard status == noErr else { continue }
-            total += value
-            count += 1
-        }
-        guard count > 0 else { return nil }
-        return total / Float32(count)
+    private static func readVolume(deviceID: AudioDeviceID, element: AudioObjectPropertyElement) -> Float32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        var value: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        guard status == noErr else { return nil }
+        return value
     }
 
-    @discardableResult
     private static func writeVolume(
-        deviceID: AudioDeviceID, elements: [AudioObjectPropertyElement], value: Float32
+        deviceID: AudioDeviceID, element: AudioObjectPropertyElement, value: Float32
     ) -> Bool {
-        var wroteAny = false
-        for element in elements {
-            var address = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyVolumeScalar,
-                mScope: kAudioDevicePropertyScopeOutput,
-                mElement: element
-            )
-            var mutableValue = value
-            let size = UInt32(MemoryLayout<Float32>.size)
-            let status = AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &mutableValue)
-            if status == noErr { wroteAny = true }
-        }
-        return wroteAny
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: element
+        )
+        var mutableValue = value
+        let size = UInt32(MemoryLayout<Float32>.size)
+        return AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &mutableValue) == noErr
     }
 }
