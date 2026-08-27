@@ -67,6 +67,12 @@ final class JustSpeakApp {
     // re-armed whenever a turn finishes.
     private var micIdleWorkItem: DispatchWorkItem?
 
+    // Main-thread-only: the delayed duck for the current turn. Ducking waits ~350ms so the
+    // begin earcon plays at full volume (an immediate duck swallowed it - "my sounds
+    // disappeared"); the item itself checks captureActive so a micro-click turn that already
+    // restored can never leave the output stuck ducked.
+    private var pendingDuckItem: DispatchWorkItem?
+
     /// Main-thread-only. Schedules the mic to be released after the configured idle window so
     /// the macOS mic indicator turns off between dictation sessions; 0 disables the timeout.
     private func scheduleMicIdleRelease() {
@@ -106,6 +112,8 @@ final class JustSpeakApp {
         if config.showHUD {
             self.hud = FloatingHUD()
             self.hud?.revealStyle = config.hudRevealStyle
+            self.hud?.particlesEnabled = config.hudParticles
+            self.hud?.privacyMode = config.privacyMode
         }
         self.history = config.historyEnabled ? TranscriptionHistoryStore(config: config) : nil
     }
@@ -332,10 +340,17 @@ final class JustSpeakApp {
         liveClient?.startNewTurn()
         audioCapture.startRecording()
 
-        // After the begin earcon: the cue plays at ducked volume (the whole output is ducked),
-        // but so does whatever was playing - relative salience is preserved.
+        // Duck AFTER the begin earcon has played, not with it - Talkify's ordering. The
+        // 350ms delay covers the cue; captureActive gates the item so it can't fire after
+        // a short turn has already restored.
         if config.duckAudio {
-            AudioDucker.shared.duck(toFraction: Float(config.duckFraction))
+            let duckItem = DispatchWorkItem { [weak self] in
+                guard let self = self, self.captureActive else { return }
+                self.pendingDuckItem = nil
+                AudioDucker.shared.duck(toFraction: Float(self.config.duckFraction))
+            }
+            pendingDuckItem = duckItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: duckItem)
         }
     }
 
@@ -350,9 +365,12 @@ final class JustSpeakApp {
         captureActive = false
 
         // Release acknowledged, before the settle race: on a slow REST fallback there are
-        // otherwise seconds of silence between letting go and the commit earcon.
+        // otherwise seconds of silence between letting go and the commit earcon. While the
+        // output is ducked the cue's own volume is boosted to compensate.
         if config.soundFeedback && config.releaseSound {
-            SoundManager.playReleaseSound()
+            let scale: Float =
+                AudioDucker.shared.isDucked ? Float(1.0 / max(0.15, config.duckFraction)) : 1.0
+            SoundManager.playReleaseSound(volumeScale: scale)
         }
 
         // The turn is busy from this instant, not from when the pipeline finishes draining:
@@ -382,8 +400,14 @@ final class JustSpeakApp {
         let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(
             gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
         // Mic capture for this turn is over and every pipeline exit path passes this point -
-        // one restore site instead of one per abandoned-turn/settle branch.
+        // one restore site instead of one per abandoned-turn/settle branch. The pending-duck
+        // cancel hops to main (its owning thread); the item's captureActive guard covers the
+        // window until the hop lands.
         if config.duckAudio {
+            DispatchQueue.main.async { [weak self] in
+                self?.pendingDuckItem?.cancel()
+                self?.pendingDuckItem = nil
+            }
             AudioDucker.shared.restore()
         }
         turnPeakDb = peakDb
@@ -847,9 +871,17 @@ final class JustSpeakApp {
         // Deterministic wrong->right enforcement (client-side guarantee on top of boost bias).
         let text = ReplacementEngine.apply(trimmed, compiled: config.compiledReplacementRules)
 
-        print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
-        print("\(ANSI.bold)\(text)\(ANSI.reset)")
-        print("\(ANSI.bold)\(ANSI.magenta)─────────────────────────────────────────────────────────────\(ANSI.reset)")
+        // Privacy mode keeps dictated words off the terminal too - a shared screen with a
+        // visible terminal leaks exactly like the pill would. Say "transcribed", not "pasted":
+        // delivery isn't known yet (secure input / lost accessibility / focus change all
+        // downgrade to copy-only below) - the Injection Latency line reports the real outcome.
+        if config.privacyMode {
+            print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed ───\(ANSI.reset) \(ANSI.gray)privacy mode: \(text.count) chars transcribed, not shown\(ANSI.reset)")
+        } else {
+            print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
+            print("\(ANSI.bold)\(text)\(ANSI.reset)")
+            print("\(ANSI.bold)\(ANSI.magenta)─────────────────────────────────────────────────────────────\(ANSI.reset)")
+        }
 
         // Active Window Injection: paste, unless secure input is held or the frontmost app
         // changed mid-turn - both downgrade to clipboard-only delivery instead of synthesizing
@@ -1026,6 +1058,7 @@ final class JustSpeakApp {
             Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")\(config.replacementRules.isEmpty ? "" : " \(ANSI.gray)(+ \(config.replacementRules.count) replacement rules)\(ANSI.reset)")
             Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
             Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+            Privacy Mode:      \(config.privacyMode ? "\(ANSI.yellow)On (HUD & terminal hide dictated text)\(ANSI.reset)" : "\(ANSI.gray)Off\(ANSI.reset)")
             """)
     }
 }

@@ -16,12 +16,19 @@ final class AppleNotchAuraView: NSView {
     var state: GlowState = .idle {
         didSet {
             needsDisplay = true
+            updateEmitter()
         }
     }
     // Displays without a hardware notch have no bezel to illuminate; the aura rings
     // the floating pill instead. pillSize tracks the pill's live width as it expands.
     var pillMode: Bool = false
     var pillSize: CGSize = .zero
+
+    // Ambient light-dust beneath the notch while listening: a CAEmitterLayer (GPU-composited,
+    // no per-frame CPU draw) whose birth rate breathes with the voice. The motes stay white
+    // on purpose - they read as dust catching whatever light the aura is currently casting.
+    var particlesEnabled: Bool = true
+    private var emitterLayer: CAEmitterLayer?
 
     private var phase: CGFloat = 0.0
 
@@ -37,15 +44,88 @@ final class AppleNotchAuraView: NSView {
         self.layer?.masksToBounds = false
     }
 
-    // Driven by FloatingHUD's single shared 30Hz display tick (the aura and orb used to run
-    // independent 60Hz timers). Per-tick increments are doubled from the old 60Hz values so
-    // the on-screen tempo is unchanged: one full 5-color loop stays ~14s while listening
+    // Driven per display frame by FloatingHUD's spring tick; speeds are per-second so any
+    // tick cadence renders the same tempo: one full 5-color loop stays ~14s while listening
     // (each hue holds ~1.7s, fades ~1.1s); processing triples the tempo so the wait reads
     // as activity.
-    func advanceFrame() {
-        let speed: CGFloat = (state == .processing) ? 0.0072 : 0.0024
-        phase = (phase + speed).truncatingRemainder(dividingBy: 1.0)
+    func advance(dt: CGFloat) {
+        let speed: CGFloat = (state == .processing) ? 0.216 : 0.072
+        phase = (phase + speed * dt).truncatingRemainder(dividingBy: 1.0)
         needsDisplay = true
+        updateEmitter()
+    }
+
+    // MARK: Particle motes
+
+    // CAEmitterCell needs a bitmap; build one soft 12px radial disc once.
+    private static let moteImage: CGImage? = {
+        let size = 12
+        guard
+            let ctx = CGContext(
+                data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        let colors = [NSColor.white.cgColor, NSColor.white.withAlphaComponent(0.0).cgColor] as CFArray
+        guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0.0, 1.0])
+        else { return nil }
+        let center = CGPoint(x: 6, y: 6)
+        ctx.drawRadialGradient(gradient, startCenter: center, startRadius: 0, endCenter: center, endRadius: 6, options: [])
+        return ctx.makeImage()
+    }()
+
+    private func ensureEmitter() -> CAEmitterLayer? {
+        if let existing = emitterLayer { return existing }
+        guard let hostLayer = layer, let image = Self.moteImage else { return nil }
+
+        let cell = CAEmitterCell()
+        cell.contents = image
+        cell.birthRate = 10.0
+        cell.lifetime = 1.4
+        cell.lifetimeRange = 0.4
+        cell.velocity = 26.0
+        cell.velocityRange = 12.0
+        cell.emissionLongitude = -.pi / 2.0  // straight down (layer coords are y-up)
+        cell.emissionRange = 0.35
+        cell.yAcceleration = -28.0
+        cell.scale = 0.30
+        cell.scaleRange = 0.15
+        cell.alphaSpeed = -0.8
+        cell.color = NSColor.white.withAlphaComponent(0.55).cgColor
+
+        let emitter = CAEmitterLayer()
+        emitter.frame = bounds
+        emitter.emitterShape = .line
+        emitter.emitterCells = [cell]
+        emitter.birthRate = 0.0
+        hostLayer.addSublayer(emitter)
+        emitterLayer = emitter
+        return emitter
+    }
+
+    // Runs on state changes and every display tick: re-derives geometry (screen layout can
+    // change under us) and breathes the birth rate with the voice. The layer-level birthRate
+    // multiplies the cell's, so 0 silences emission without tearing the layer down.
+    private func updateEmitter() {
+        let active =
+            particlesEnabled && state == .listening
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        guard active, let emitter = ensureEmitter() else {
+            emitterLayer?.birthRate = 0.0
+            return
+        }
+        emitter.frame = bounds
+        if pillMode {
+            guard pillSize.width > 0 else {
+                emitter.birthRate = 0.0
+                return
+            }
+            emitter.emitterPosition = CGPoint(x: bounds.midX, y: bounds.midY - pillSize.height / 2.0 - 4.0)
+            emitter.emitterSize = CGSize(width: pillSize.width * 0.7, height: 2.0)
+        } else {
+            emitter.emitterPosition = CGPoint(x: bounds.midX, y: bounds.height - notchRect.height - 4.0)
+            emitter.emitterSize = CGSize(width: notchRect.width * 0.8, height: 2.0)
+        }
+        emitter.birthRate = Float(0.35 + 0.65 * audioLevel)
     }
 
     // outset dilates the path beyond the hardware cutout: a stroke centered on the exact
