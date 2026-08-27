@@ -41,6 +41,25 @@ final class SoundManager {
         return fallback
     }()
 
+    // Key-release acknowledgment. Deliberately quieter and shorter than the commit earcon -
+    // it says "release registered, settling" while the commit sound still owns "text landed".
+    private static let releaseSoundPaths = [
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/navigation_pop.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/key_press_click.caf",
+    ]
+
+    private static var releaseSound: NSSound? = {
+        for path in releaseSoundPaths {
+            if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
+                sound.volume = 0.35
+                return sound
+            }
+        }
+        let fallback = NSSound(named: "Tink")
+        fallback?.volume = 0.2
+        return fallback
+    }()
+
     private static var errorSound: NSSound? = {
         for path in errorSoundPaths {
             if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
@@ -57,6 +76,13 @@ final class SoundManager {
         DispatchQueue.global(qos: .userInteractive).async {
             startSound?.stop()
             startSound?.play()
+        }
+    }
+
+    static func playReleaseSound() {
+        DispatchQueue.global(qos: .userInteractive).async {
+            releaseSound?.stop()
+            releaseSound?.play()
         }
     }
 

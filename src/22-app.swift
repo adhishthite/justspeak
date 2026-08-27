@@ -105,6 +105,7 @@ final class JustSpeakApp {
         }
         if config.showHUD {
             self.hud = FloatingHUD()
+            self.hud?.revealStyle = config.hudRevealStyle
         }
         self.history = config.historyEnabled ? TranscriptionHistoryStore(config: config) : nil
     }
@@ -120,6 +121,8 @@ final class JustSpeakApp {
 
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         sigint.setEventHandler { [weak self] in
+            // Ctrl+C mid-recording must not leave the system volume ducked (no-op if not ducked).
+            AudioDucker.shared.restore()
             self?.printSessionUsageSummary()
             self?.history?.close()
             print("\n\(ANSI.bold)Exiting JustSpeak. Goodbye!\(ANSI.reset)")
@@ -325,6 +328,12 @@ final class JustSpeakApp {
         captureActive = true
         liveClient?.startNewTurn()
         audioCapture.startRecording()
+
+        // After the begin earcon: the cue plays at ducked volume (the whole output is ducked),
+        // but so does whatever was playing - relative salience is preserved.
+        if config.duckAudio {
+            AudioDucker.shared.duck(toFraction: Float(config.duckFraction))
+        }
     }
 
     private func handleKeyUp() {
@@ -336,6 +345,12 @@ final class JustSpeakApp {
         // not run the pipeline - there is nothing to stop, only stale state to misread.
         guard captureActive else { return }
         captureActive = false
+
+        // Release acknowledged, before the settle race: on a slow REST fallback there are
+        // otherwise seconds of silence between letting go and the commit earcon.
+        if config.soundFeedback && config.releaseSound {
+            SoundManager.playReleaseSound()
+        }
 
         // The turn is busy from this instant, not from when the pipeline finishes draining:
         // stopRecording blocks sessionQueue for up to POST_ROLL_MAX_MS, and a re-press inside
@@ -363,6 +378,11 @@ final class JustSpeakApp {
         let pipelineStartTime = CFAbsoluteTimeGetCurrent()
         let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(
             gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
+        // Mic capture for this turn is over and every pipeline exit path passes this point -
+        // one restore site instead of one per abandoned-turn/settle branch.
+        if config.duckAudio {
+            AudioDucker.shared.restore()
+        }
         turnPeakDb = peakDb
         turnSpeechFrames = speechFrames
         turnSettlePath = nil
