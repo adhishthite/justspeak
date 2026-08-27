@@ -34,8 +34,9 @@ struct Config {
     // Ambient particle motes under the notch while listening (CAEmitterLayer, GPU-composited;
     // skipped under Reduce Motion).
     var hudParticles: Bool = true
-    // Screen-share privacy: HUD and terminal never render dictated text (paste still happens;
-    // the history DB still records locally).
+    // Screen-share privacy: the pill is hidden entirely (aura glow + earcons carry all
+    // state) and the terminal prints only a char count. Paste still happens; the history
+    // DB still records locally.
     var privacyMode: Bool = false
     // Duck the system output while recording so music/video on speakers doesn't bleed into
     // the mic (hurting accuracy and billing audio tokens for it). Opt-in: changing the output

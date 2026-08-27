@@ -456,7 +456,9 @@ final class FloatingHUD: NSObject {
         // Fade completes early in the travel, so arrival reads as motion, not opacity.
         pillWrapper.layer?.shadowOpacity = Float(0.55 * surfaceAlpha)
         if !reduceMotion {
-            hostView.alphaValue = surfaceAlpha
+            // Privacy mode is aura-only: the glow states and earcons carry everything; a
+            // pill showing placeholder text is pure noise on a shared screen.
+            hostView.alphaValue = privacyMode ? 0.0 : surfaceAlpha
             notchGlowView.alphaValue = surfaceAlpha
         }
         if !notchInfo.hasPhysicalNotch {
@@ -562,10 +564,14 @@ final class FloatingHUD: NSObject {
             hostView.alphaValue = 0.0
             notchGlowView.alphaValue = 0.0
             notchPanel.orderFrontRegardless()
-            hostPanel.orderFrontRegardless()
+            if !privacyMode {
+                hostPanel.orderFrontRegardless()
+            }
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.16
-                self.hostView.animator().alphaValue = 1.0
+                if !self.privacyMode {
+                    self.hostView.animator().alphaValue = 1.0
+                }
                 self.notchGlowView.animator().alphaValue = 1.0
             }
             return
@@ -573,7 +579,9 @@ final class FloatingHUD: NSObject {
 
         applyFrame()
         notchPanel.orderFrontRegardless()
-        hostPanel.orderFrontRegardless()
+        if !privacyMode {
+            hostPanel.orderFrontRegardless()
+        }
         startTick()
     }
 

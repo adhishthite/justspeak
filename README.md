@@ -154,7 +154,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `SHOW_HUD` | `true` | Native floating Dynamic Island capsule + notch light spill |
 | `HUD_REVEAL` | `slide` | Pill entrance animation: `slide`, `bloom` (inflate from the notch), `drift` (subtle fade-drift), `unfurl` (unroll with settle-back), `morph` (Dynamic Island membrane — stretches out of the notch itself and detaches; needs a physical notch, falls back to `slide` otherwise). Preview with `make hud-demo` |
 | `HUD_PARTICLES` | `true` | Ambient light-dust drifting down from the notch while listening, breathing with your voice (off under Reduce Motion) |
-| `PRIVACY_MODE` | `false` | Screen-share privacy: HUD shows only "Speaking…", success shows no text, terminal prints a char count. Paste unaffected; history DB still records locally |
+| `PRIVACY_MODE` | `false` | Screen-share privacy: the pill is hidden entirely — the notch aura and earcons carry all feedback — and the terminal prints only a char count. Paste unaffected; history DB still records locally |
 | `DUCK_AUDIO` | `false` | Duck the system output volume while recording so speaker audio doesn't bleed into the mic (restored afterwards; a mid-turn manual volume change wins) |
 | `DUCK_FRACTION` | `0.2` | Fraction of the current output volume kept while ducked (0.0-1.0) |
 | `ENABLE_LIVE_WEBSOCKET` | `true` | Stream audio chunks via Live WebSockets (`true`) or REST only (`false`) |
