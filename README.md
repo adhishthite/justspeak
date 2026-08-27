@@ -33,6 +33,7 @@ Hold [⌥ Right] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemin
 - **Bilingual & Code-Switching Support**: Built-in support for English (`en-IN`), Marathi (`mr-IN`), Hindi (`hi-IN`), and 80+ languages with automatic acoustic language detection.
 - **Zero Unsigned Binaries (gMac Enterprise Compliant)**: Pure Swift script executed directly through Apple's signed `/usr/bin/swift` interpreter with zero third-party binary dependencies.
 - **Resilient Fallback Routing**: Automatic, transparent failover to Gemini REST API (`gemini-3.5-flash-lite` / `gemini-3.5-transcribe`) on WebSocket disconnection or timeouts. Because the fallback *prompts* a general-purpose model to transcribe rather than calling a dedicated transcription model, its results pass through a validation gate first — an LLM asked to transcribe audio can answer or chat about it instead, and a rejected result is discarded rather than pasted. Silent clips never reach any API: a local frame-RMS scan counts 20ms speech-energy frames (immune to the hotkey's own click transient, which defeats simple peak detection), and when the Live model itself reports no speech in a low-energy clip, that verdict is trusted and the turn settles as empty instead of handing silence to the REST model to hallucinate over. Empty transcripts on real audio get one re-send (model nondeterminism), and 429 responses honor the server's `retryDelay`/`Retry-After` hint for a single retry before failing.
+- **Edge-Case Aware**: Offline? Dictation refuses instantly at key-down ("No internet connection") instead of timing out 10s later. Invalid API key and wrong model names fail with the fix in the message. The mic engine rebuilds itself when the input device changes (AirPods in/out), the WebSocket reconnects after system wake, permissions revoked mid-session downgrade to clipboard-only with a pointer to the right Settings pane, and a lockfile prevents a second instance from double-pasting.
 
 ---
 
@@ -358,6 +359,8 @@ sqlite3 ~/.justspeak/history.db \
 | `make test-api` | Verify Gemini API connectivity, model reachability & latency |
 | `make test-audio` | Record a 3-second audio sample from the mic and verify AI transcription |
 | `make setup` | Initialize local `.env` configuration from `.env.example` |
+| `make lint` | Lint `src/*.swift` with Apple's `swift format` (Xcode 16+; read-only) |
+| `make format` | Rewrite `src/*.swift` in place with Apple's `swift format` |
 | `make clean` | Clean temporary files and caches |
 | `make help` | Display all available Makefile targets |
 

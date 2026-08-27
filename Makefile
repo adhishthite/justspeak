@@ -3,7 +3,7 @@
 
 RUNNER = ./justspeak
 
-.PHONY: all run start check-permissions test-api test-audio setup install clean check help
+.PHONY: all run start check-permissions test-api test-audio setup install clean check lint format help
 
 all: run
 
@@ -38,6 +38,17 @@ install: setup
 
 ## check: Run system permission diagnostics and API connectivity check
 check: check-permissions test-api
+
+# swift-format ships inside the Apple toolchain (Xcode 16+ / matching CLT) as a
+# `swift format` subcommand - Apple-signed, so Santa-safe. SwiftLint is a third-party
+# compiled binary and is NOT usable in this environment.
+## lint: Lint src/*.swift with Apple's swift-format (Xcode 16+; read-only)
+lint:
+	@swift format lint --strict --recursive src
+
+## format: Rewrite src/*.swift in place with Apple's swift-format (Xcode 16+)
+format:
+	@swift format --in-place --recursive src
 
 ## clean: Remove temporary files and caches
 clean:

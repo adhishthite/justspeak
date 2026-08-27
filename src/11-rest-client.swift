@@ -134,6 +134,32 @@ struct GeminiRestClient {
                 return
             }
 
+            // Other non-2xx statuses get named failures instead of a JSON-parse error whose
+            // text buries the cause. 400/401/403 are key problems (an invalid API key comes
+            // back as 400 API_KEY_INVALID), 404 is a wrong/retired model name - none of them
+            // is retryable, so fail immediately with the fix in the message.
+            if let status = (response as? HTTPURLResponse)?.statusCode, !(200...299).contains(status) {
+                var apiReason = ""
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let apiError = json["error"] as? [String: Any],
+                   let msg = apiError["message"] as? String {
+                    apiReason = " (\(msg.prefix(140)))"
+                }
+                let message: String
+                switch status {
+                case 400, 401, 403:
+                    message = "Gemini rejected the request (HTTP \(status))\(apiReason) - check GEMINI_API_KEY in .env."
+                case 404:
+                    message = "Model not found: \(model) (HTTP 404)\(apiReason) - check GEMINI_MODEL in .env."
+                case 500...599:
+                    message = "Gemini server error (HTTP \(status))\(apiReason) - transient, try again."
+                default:
+                    message = "Gemini REST error (HTTP \(status))\(apiReason)."
+                }
+                completion(.failure(NSError(domain: "GeminiAPI", code: status, userInfo: [NSLocalizedDescriptionKey: message])))
+                return
+            }
+
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 let rawStr = String(data: data, encoding: .utf8) ?? "Unknown"
                 completion(.failure(NSError(domain: "JustSpeak", code: -5, userInfo: [NSLocalizedDescriptionKey: "Invalid JSON response: \(rawStr)"])))

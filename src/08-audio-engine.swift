@@ -58,22 +58,17 @@ final class AudioCaptureEngine {
         }
         self.audioConverter = converter
         
-        // Tap callback: ONLY copies incoming buffer and pushes to serial audio queue (0 blocking operations on render thread)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] (buffer, when) in
-            guard let self = self else { return }
-            let bufferCopy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity)!
-            bufferCopy.frameLength = buffer.frameLength
-            for i in 0..<Int(buffer.format.channelCount) {
-                if let src = buffer.floatChannelData?[i], let dst = bufferCopy.floatChannelData?[i] {
-                    memcpy(dst, src, Int(buffer.frameLength) * MemoryLayout<Float>.size)
-                }
-            }
-            
-            self.audioProcessingQueue.async {
-                self.processIncomingBufferOnQueue(bufferCopy)
-            }
+        installTap(on: inputNode, format: inputFormat)
+
+        // Device changes (AirPods connect/disconnect, default-input switch) invalidate both
+        // the tap's captured format and the converter; AVAudioEngine posts this after
+        // reconfiguring itself. Handled on main - isEngineRunning is main-thread-only.
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: audioEngine, queue: .main
+        ) { [weak self] _ in
+            self?.handleConfigurationChange()
         }
-        
+
         do {
             audioEngine.prepare()
             try audioEngine.start()
@@ -83,6 +78,67 @@ final class AudioCaptureEngine {
         } catch {
             Logger.error("MIC", "Could not start AVAudioEngine: \(error.localizedDescription)")
             return false
+        }
+    }
+
+    // Tap callback: ONLY copies incoming buffer and pushes to serial audio queue (0 blocking operations on render thread)
+    private func installTap(on inputNode: AVAudioInputNode, format: AVAudioFormat) {
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] (buffer, when) in
+            guard let self = self else { return }
+            let bufferCopy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity)!
+            bufferCopy.frameLength = buffer.frameLength
+            for i in 0..<Int(buffer.format.channelCount) {
+                if let src = buffer.floatChannelData?[i], let dst = bufferCopy.floatChannelData?[i] {
+                    memcpy(dst, src, Int(buffer.frameLength) * MemoryLayout<Float>.size)
+                }
+            }
+
+            self.audioProcessingQueue.async {
+                self.processIncomingBufferOnQueue(bufferCopy)
+            }
+        }
+    }
+
+    // Main-thread-only (observer queue is .main). Rebuilds the tap and converter around the
+    // new input device's format, then restarts the engine only if it was meant to be running
+    // (an idle-suspended mic stays suspended; the next key-down re-arms it as usual).
+    private func handleConfigurationChange() {
+        let wasRunning = isEngineRunning
+        let inputNode = audioEngine.inputNode
+        inputNode.removeTap(onBus: 0)
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+
+        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+            Logger.error("MIC", "Input device changed but converter rebuild failed (\(inputFormat)) - dictation disabled until restart.")
+            isEngineRunning = false
+            return
+        }
+        // audioConverter is read on audioProcessingQueue; hop onto it so the swap can't
+        // tear a conversion in progress. (A stale-format buffer already queued just fails
+        // its convert and is dropped - one buffer, ~64ms, at worst.)
+        audioProcessingQueue.sync { self.audioConverter = converter }
+
+        installTap(on: inputNode, format: inputFormat)
+
+        lock.lock()
+        let recording = isRecording
+        lock.unlock()
+        if recording {
+            Logger.warn("MIC", "Input device changed mid-dictation - this turn may be truncated.")
+        }
+
+        if wasRunning {
+            audioEngine.prepare()
+            do {
+                try audioEngine.start()
+                isEngineRunning = true
+                Logger.info("MIC", "Input device changed - engine rebuilt (\(Int(inputFormat.sampleRate)) Hz, \(inputFormat.channelCount) ch).")
+            } catch {
+                isEngineRunning = false
+                Logger.error("MIC", "Input device changed and engine restart failed: \(error.localizedDescription) - next key-down will retry.")
+            }
+        } else {
+            Logger.info("MIC", "Input device changed while mic idle - tap rebuilt for the new device.")
         }
     }
 

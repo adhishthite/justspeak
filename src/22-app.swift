@@ -13,6 +13,16 @@ final class JustSpeakApp {
     private var isProcessing: Bool = false
     private let processingLock = NSLock()
 
+    // Main-thread-only: true iff the LAST key-down actually started a capture. A key-down
+    // refused by a gate (isProcessing, secure input, offline) still delivers its matching
+    // key-up, and stopRecording without a matching start would resurrect the PREVIOUS
+    // turn's buffer - re-billing the API and re-pasting a stale transcript.
+    private var captureActive: Bool = false
+
+    // sessionQueue-only: consecutive turns that ended with no speech detected. Three in a row
+    // is the signature of a dead input (mic permission revoked, wrong device) - worth a hint.
+    private var consecutiveNoSpeechTurns = 0
+
     // Peak level, in dBFS, below which a captured clip is treated as room tone rather than
     // speech - below this peak no speech exists in the clip, so don't bill an API call for it.
     private let silentClipPeakDb: Double = -55.0
@@ -117,6 +127,20 @@ final class JustSpeakApp {
         sigterm.resume()
         self.sigtermSource = sigterm
         
+        // 0. Single-instance guard: two JustSpeak processes would double-paste every dictation.
+        // flock is released by the kernel on ANY exit (crash included); the fd stays open for
+        // the process lifetime on purpose - the lock lives on it.
+        let lockDir = NSString(string: "~/.justspeak").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: lockDir, withIntermediateDirectories: true)
+        let lockFd = open(lockDir + "/justspeak.lock", O_CREAT | O_RDWR, 0o600)
+        if lockFd >= 0, flock(lockFd, LOCK_EX | LOCK_NB) != 0 {
+            Logger.error("STARTUP", "Another JustSpeak instance is already running - exiting to avoid double-pasting.")
+            exit(1)
+        }
+
+        // Connectivity truth for the key-down offline gate.
+        NetworkMonitor.shared.start()
+
         // 1. Verify Permissions
         let (ax, mic) = PermissionChecker.verifyAll()
         if !ax || !mic {
@@ -193,6 +217,26 @@ final class JustSpeakApp {
             self?.handleKeyUp()
         }
         
+        // Sleep/wake hygiene: release the mic before sleep (suspendEngine refuses mid-dictation),
+        // and force a fresh WS connection on wake - the socket often survives sleep in a
+        // half-dead state where sends succeed but no server responses ever arrive.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.audioCapture.suspendEngine()
+            Logger.info("POWER", "System sleeping - mic released.")
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            Logger.info("POWER", "System woke - refreshing Live WebSocket connection.")
+            if self.config.enableLiveWebSocket {
+                self.liveClient?.disconnect()
+                self.liveClient?.connect()
+            }
+        }
+
         guard hotkey.start() else {
             Logger.error("HOTKEY", "Failed to initialize global CGEventTap. Please grant Accessibility permissions to this terminal.")
             PermissionChecker.printDetailedStatus()
@@ -232,6 +276,17 @@ final class JustSpeakApp {
             return
         }
 
+        // Offline fast-fail: say so in 0ms instead of recording a clip whose WS and REST
+        // routes will both time out ~10s later.
+        if !NetworkMonitor.shared.isOnline {
+            Logger.warn("NET", "No internet connection - dictation blocked.")
+            if config.soundFeedback {
+                SoundManager.playErrorSound()
+            }
+            hud?.showError(message: "No internet connection")
+            return
+        }
+
         // Frontmost app at key-down, compared again right before paste in handleTranscribedText.
         let front = NSWorkspace.shared.frontmostApplication
         turnFrontmostPID = front?.processIdentifier
@@ -259,14 +314,28 @@ final class JustSpeakApp {
             self?.hud?.showListening()
         }
 
+        captureActive = true
         liveClient?.startNewTurn()
         audioCapture.startRecording()
     }
-    
+
     private func handleKeyUp() {
         // Capture the physical release instant before anything else - this becomes the true
         // start of "Total Key-Up -> Paste" latency measurement.
         let keyUpTime = CFAbsoluteTimeGetCurrent()
+
+        // A release whose press never started a capture (refused by a key-down gate) must
+        // not run the pipeline - there is nothing to stop, only stale state to misread.
+        guard captureActive else { return }
+        captureActive = false
+
+        // The turn is busy from this instant, not from when the pipeline finishes draining:
+        // stopRecording blocks sessionQueue for up to POST_ROLL_MAX_MS, and a re-press inside
+        // that window must be refused by handleKeyDown's isProcessing guard, or it would
+        // clear/reuse the very buffers being finalized. Every pipeline exit path clears this.
+        processingLock.lock()
+        isProcessing = true
+        processingLock.unlock()
 
         // Flip the HUD to "processing" immediately on the main queue. The tap thread must not
         // block on stopRecording's post-roll sleep + queue drain, so the rest of the turn is
@@ -339,24 +408,29 @@ final class JustSpeakApp {
         let (pcmData, duration, chunks, capturedBytes) = audioCapture.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
 
         // Discard accidental micro-clicks (< 150ms or < 2KB of real captured audio, ignoring
-        // the fixed pre-roll/silence-flush padding that stopRecording always appends)
+        // the fixed pre-roll/silence-flush padding that stopRecording always appends).
+        // isProcessing was set at key-up, so every abandoned-turn exit clears it.
         guard duration >= 0.15 && capturedBytes > 2000 else {
             Logger.warn("INPUT", "Ignored short click (\(String(format: "%.0f", duration * 1000.0))ms). Hold key while speaking.")
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.hide()
                 self?.scheduleMicIdleRelease()
             }
+            processingLock.lock()
+            isProcessing = false
+            processingLock.unlock()
             return
         }
 
         // Silent-clip gate: scan the captured audio before spending an API call on it. Runs
         // on sessionQueue, ahead of both the WS and REST routes, so room tone never leaves the
         // machine. Abandons the turn the same way the micro-click guard above does (isProcessing
-        // is never set, the WS turn is never committed). Two tests: absolute peak (dead room),
-        // and speech-frame count (room tone whose peak is spiked by the hotkey's own click).
+        // cleared, the WS turn never committed). Two tests: absolute peak (dead room), and
+        // speech-frame count (room tone whose peak is spiked by the hotkey's own click).
         let speechFrames = Self.speechFrameCount(of: pcmData, thresholdDb: config.trailSilenceDb)
         if let peakDb = Self.peakDbFS(of: pcmData), peakDb < silentClipPeakDb || speechFrames <= silentClipMaxSpeechFrames {
             Logger.warn("INPUT", "No speech detected in clip (peak \(String(format: "%.1f", peakDb)) dBFS, \(speechFrames) speech frames) - skipping API call.")
+            noteNoSpeechTurn()
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: "No speech detected")
                 self?.scheduleMicIdleRelease()
@@ -388,17 +462,14 @@ final class JustSpeakApp {
                 appBundleId: turnFrontmostBundleId,
                 appName: turnFrontmostName
             ))
-            return
-        }
-
-        processingLock.lock()
-        guard !isProcessing else {
+            processingLock.lock()
+            isProcessing = false
             processingLock.unlock()
             return
         }
-        isProcessing = true
-        processingLock.unlock()
 
+        // isProcessing was already set at key-up (before the post-roll drain, so a re-press
+        // during the drain can't start a capture over these buffers).
         currentTurnId += 1
         let turnId = currentTurnId
         turnSettled = false
@@ -558,6 +629,50 @@ final class JustSpeakApp {
         }
     }
 
+    /// sessionQueue-only. Tracks consecutive no-speech turns; three in a row with the mic
+    /// permission missing is a revoked-permission signature, not a quiet room.
+    private func noteNoSpeechTurn() {
+        consecutiveNoSpeechTurns += 1
+        guard consecutiveNoSpeechTurns == 3 else { return }
+        if AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
+            Logger.error("MIC", "3 consecutive no-speech turns and microphone permission is not granted - re-enable this terminal under System Settings > Privacy & Security > Microphone.")
+            DispatchQueue.main.async { [weak self] in
+                self?.hud?.showError(message: "Microphone access lost — check System Settings")
+            }
+        } else {
+            Logger.warn("MIC", "3 consecutive no-speech turns - if you were speaking, check the selected input device (System Settings > Sound > Input).")
+        }
+    }
+
+    /// Short, human error text for the HUD; falls back to nil for errors with no better
+    /// wording than their own description.
+    private static func friendlyFailureMessage(_ error: Error) -> String? {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorDataNotAllowed:
+                return "No internet connection — nothing pasted"
+            case NSURLErrorTimedOut:
+                return "Network timeout — nothing pasted"
+            case NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost, NSURLErrorDNSLookupFailed:
+                return "Can't reach Gemini — nothing pasted"
+            case NSURLErrorSecureConnectionFailed:
+                return "Secure connection failed — nothing pasted"
+            default:
+                return nil
+            }
+        }
+        if ns.domain == "GeminiAPI" {
+            switch ns.code {
+            case 400, 401, 403: return "API key rejected — check GEMINI_API_KEY in .env"
+            case 404: return "Model not found — check model names in .env"
+            case 429: return "Rate limited — try again shortly"
+            default: return nil
+            }
+        }
+        return nil
+    }
+
     /// The sole place a live turn's result reaches handleTranscribedText or the error path.
     /// Runs only on sessionQueue. A result for a turnId that isn't current, or one that arrives
     /// after the turn already settled, is a loser of the WS/REST hedge race and is dropped.
@@ -572,6 +687,7 @@ final class JustSpeakApp {
 
         switch outcome {
         case .success(let text, let transport, let firstTokenMs, let roundtripMs, let audioDuration, let keyUpTime, let captureFinalizeMs, let fallbackReason, let isLiveRoute, let inputTokens, let outputTokens):
+            consecutiveNoSpeechTurns = 0
             handleTranscribedText(
                 text,
                 transport: transport,
@@ -587,6 +703,7 @@ final class JustSpeakApp {
             )
 
         case .empty(let audioDuration):
+            noteNoSpeechTurn()
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: "No speech detected")
             }
@@ -624,8 +741,9 @@ final class JustSpeakApp {
         case .failure(let error):
             Logger.error("REST", "Transcription failed: \(error.localizedDescription)")
             if config.soundFeedback { SoundManager.playErrorSound() }
+            let hudMessage = Self.friendlyFailureMessage(error) ?? "Transcription failed — nothing pasted"
             DispatchQueue.main.async { [weak self] in
-                self?.hud?.showError(message: "Transcription failed — nothing pasted")
+                self?.hud?.showError(message: hudMessage)
             }
             history?.record(TranscriptionHistoryStore.TurnRecord(
                 outcome: "error",
@@ -742,6 +860,15 @@ final class JustSpeakApp {
             let holder = SecureInputMonitor.holderName()
             Logger.warn("INJECT", "Secure input is held by \(holder ?? "another app") - copied, not pasted.")
             copyOnlyReason = "secure input"
+        } else if !AXIsProcessTrusted() {
+            // Accessibility revoked while running: the synthesized Cmd+V would be silently
+            // dropped by the system, losing the dictation. Copy instead and say why.
+            let copyStart = CFAbsoluteTimeGetCurrent()
+            _ = TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace)
+            injectMs = (CFAbsoluteTimeGetCurrent() - copyStart) * 1000.0
+            injected = false
+            Logger.warn("INJECT", "Accessibility permission revoked - copied, not pasted. Re-enable this terminal under System Settings > Privacy & Security > Accessibility.")
+            copyOnlyReason = "accessibility revoked"
         } else {
             var frontNow: NSRunningApplication?
             DispatchQueue.main.sync { frontNow = NSWorkspace.shared.frontmostApplication }
@@ -774,9 +901,12 @@ final class JustSpeakApp {
 
         DispatchQueue.main.async { [weak self] in
             if let reason = copyOnlyReason {
-                let message = reason == "secure input"
-                    ? "Secure input active — copied, press ⌘V after leaving the password field"
-                    : "Focus changed — copied, press ⌘V"
+                let message: String
+                switch reason {
+                case "secure input": message = "Secure input active — copied, press ⌘V after leaving the password field"
+                case "accessibility revoked": message = "Accessibility revoked — copied, press ⌘V"
+                default: message = "Focus changed — copied, press ⌘V"
+                }
                 self?.hud?.showError(message: message)
             } else {
                 self?.hud?.showSuccess(text: text)

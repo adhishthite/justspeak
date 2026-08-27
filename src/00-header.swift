@@ -13,6 +13,7 @@ import AppKit
 import CoreGraphics
 import ApplicationServices
 import Darwin
+import Network
 import SQLite3
 import Carbon
 import IOKit
