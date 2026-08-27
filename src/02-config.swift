@@ -24,7 +24,18 @@ struct Config {
     var hotkey: String = "right_option"
     var hotkeyMode: String = "push_to_talk"  // "push_to_talk" or "toggle"
     var soundFeedback: Bool = true
+    // Soft tick at key release - acknowledges the hold ended while the transcript settles
+    // (there can be seconds of silence before the commit earcon on a slow REST fallback).
+    var releaseSound: Bool = true
     var showHUD: Bool = true
+    // HUD pill entrance animation: "slide" (shipped default), "bloom", "drift", "unfurl".
+    var hudRevealStyle: String = "slide"
+    // Duck the system output while recording so music/video on speakers doesn't bleed into
+    // the mic (hurting accuracy and billing audio tokens for it). Opt-in: changing the output
+    // volume uninvited is surprising.
+    var duckAudio: Bool = false
+    // Fraction of the current output volume kept while ducked (0.2 = drop to 20%).
+    var duckFraction: Double = 0.2
     var enableLiveWebSocket: Bool = true
     var restFallbackTimeout: Double = 4.0
     var preRollMs: Int = 400
@@ -195,7 +206,11 @@ struct Config {
                         case "HOTKEY": config.hotkey = value.lowercased()
                         case "HOTKEY_MODE": config.hotkeyMode = value.lowercased()
                         case "SOUND_FEEDBACK": config.soundFeedback = (value.lowercased() == "true" || value == "1")
+                        case "RELEASE_SOUND": config.releaseSound = (value.lowercased() == "true" || value == "1")
                         case "SHOW_HUD": config.showHUD = (value.lowercased() == "true" || value == "1")
+                        case "HUD_REVEAL": if ["slide", "bloom", "drift", "unfurl"].contains(value.lowercased()) { config.hudRevealStyle = value.lowercased() }
+                        case "DUCK_AUDIO": config.duckAudio = (value.lowercased() == "true" || value == "1")
+                        case "DUCK_FRACTION": if let f = Double(value) { config.duckFraction = min(1.0, max(0.0, f)) }
                         case "ENABLE_LIVE_WEBSOCKET": config.enableLiveWebSocket = (value.lowercased() == "true" || value == "1")
                         case "RESTORE_CLIPBOARD": config.restoreClipboard = (value.lowercased() == "true" || value == "1")
                         case "TRAILING_SPACE": config.trailingSpace = (value.lowercased() == "true" || value == "1")
@@ -236,7 +251,11 @@ struct Config {
         if let hk = env["HOTKEY"], !hk.isEmpty { config.hotkey = hk.lowercased() }
         if let mode = env["HOTKEY_MODE"], !mode.isEmpty { config.hotkeyMode = mode.lowercased() }
         if let sound = env["SOUND_FEEDBACK"] { config.soundFeedback = (sound.lowercased() == "true" || sound == "1") }
+        if let rel = env["RELEASE_SOUND"] { config.releaseSound = (rel.lowercased() == "true" || rel == "1") }
         if let hud = env["SHOW_HUD"] { config.showHUD = (hud.lowercased() == "true" || hud == "1") }
+        if let reveal = env["HUD_REVEAL"], ["slide", "bloom", "drift", "unfurl"].contains(reveal.lowercased()) { config.hudRevealStyle = reveal.lowercased() }
+        if let duck = env["DUCK_AUDIO"] { config.duckAudio = (duck.lowercased() == "true" || duck == "1") }
+        if let frac = env["DUCK_FRACTION"], let f = Double(frac) { config.duckFraction = min(1.0, max(0.0, f)) }
         if let ws = env["ENABLE_LIVE_WEBSOCKET"] { config.enableLiveWebSocket = (ws.lowercased() == "true" || ws == "1") }
         if let r = env["RESTORE_CLIPBOARD"] { config.restoreClipboard = (r.lowercased() == "true" || r == "1") }
         if let ts = env["TRAILING_SPACE"] { config.trailingSpace = (ts.lowercased() == "true" || ts == "1") }
