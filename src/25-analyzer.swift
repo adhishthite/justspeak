@@ -229,17 +229,20 @@ struct VocabularyAnalyzer {
 
         // Cap the pair block: pairs duplicate transcript text, and 20 is already far more
         // correction evidence than one session needs.
-        let pairBlock = pairs.isEmpty
+        let pairBlock =
+            pairs.isEmpty
             ? "(none)"
             : pairs.prefix(20).map { p in
                 "A [\(df.string(from: Date(timeIntervalSince1970: p.older.ts)))]: \(p.older.text)\nB [\(df.string(from: Date(timeIntervalSince1970: p.newer.ts)))]: \(p.newer.text)"
             }.joined(separator: "\n---\n")
 
-        let contextBlock = config.analyzeContext.isEmpty
+        let contextBlock =
+            config.analyzeContext.isEmpty
             ? ""
             : "\nABOUT THE USER (use this to judge what a garbled phrase plausibly meant):\n\(config.analyzeContext)\n"
 
-        let observedBlock = observed.isEmpty
+        let observedBlock =
+            observed.isEmpty
             ? "(none)"
             : observed.map { c in
                 let app = c.app.isEmpty ? "?" : c.app

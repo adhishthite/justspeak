@@ -258,7 +258,8 @@ final class AudioCaptureEngine {
         }
 
         if let unit = unit, let activeID = activeDevice(of: unit) {
-            currentInput = devices.first(where: { $0.id == activeID })
+            currentInput =
+                devices.first(where: { $0.id == activeID })
                 ?? InputDeviceCatalog.describe(activeID, isDefault: activeID == InputDeviceCatalog.defaultInputDevice())
         } else {
             currentInput = devices.first(where: { $0.isDefault })
