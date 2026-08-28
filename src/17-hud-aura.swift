@@ -326,6 +326,19 @@ final class AppleNotchAuraView: NSView {
             context: context, source: spreadPath, shift: shift, width: 8.0 + 6.0 * energy,
             blur: 30.0 + 14.0 * energy, tint: tint, alpha: 0.28 + 0.22 * energy)
         context.restoreGState()
+
+        // Inner bleed: the same light, clipped to the capsule INTERIOR, so the pill's
+        // black edge dissolves into the glow over a few points instead of stepping from
+        // hardware-black to tint at the hairline. Tight blur keeps the face black.
+        context.saveGState()
+        context.addPath(capsule)
+        context.clip()
+        var inward = CGAffineTransform(translationX: -shift, y: 0)
+        let inwardPath = capsule.copy(using: &inward) ?? capsule
+        blurredStroke(
+            context: context, source: inwardPath, shift: shift, width: 2.0,
+            blur: 5.0, tint: tint, alpha: 0.22 + 0.18 * energy)
+        context.restoreGState()
     }
 
     // One-shot success punctuation: a stroked copy of the halo path expands outward and fades.

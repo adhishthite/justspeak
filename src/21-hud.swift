@@ -315,6 +315,8 @@ final class FloatingHUD: NSObject {
             pillClip.layer?.cornerCurve = curve
             backplateView.layer?.cornerCurve = curve
         }
+        backplateView.specularRim = notchInfo.hasPhysicalNotch
+        backplateView.needsDisplay = true
         notchGlowView.needsDisplay = true
         applyFrame()
     }
@@ -475,7 +477,11 @@ final class FloatingHUD: NSObject {
             roundedRect: pillWrapper.bounds, cornerWidth: radius, cornerHeight: radius, transform: nil)
 
         // Fade completes early in the travel, so arrival reads as motion, not opacity.
-        pillWrapper.layer?.shadowOpacity = Float(0.55 * surfaceAlpha)
+        // The drop shadow grounds the pill against the bezel on notch displays; on a
+        // no-notch wallpaper it reads as a black ring between the pill and the aura's
+        // light, so the aura alone carries the grounding there.
+        let shadowStrength: CGFloat = notchInfo.hasPhysicalNotch ? 0.55 : 0.0
+        pillWrapper.layer?.shadowOpacity = Float(shadowStrength * surfaceAlpha)
         if !reduceMotion {
             // Privacy mode is aura-only: the glow states and earcons carry everything; a
             // pill showing placeholder text is pure noise on a shared screen.
