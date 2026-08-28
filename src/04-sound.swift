@@ -1,9 +1,12 @@
 // MARK: - Audio Feedback Sound Manager (Apple System Earcons)
 
 final class SoundManager {
+    // jbl_begin (Siri's rising "listening" chime) leads: begin_record is a low-energy mono
+    // click that vanishes on built-in speakers below ~50% volume. Only the chime's attack
+    // needs to land before the 350ms duck; the tail riding under the duck is fine.
     private static let startSoundPaths = [
-        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/begin_record.caf",
         "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/siri/jbl_begin.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/begin_record.caf",
     ]
 
     // acknowledgment_sent (the soft "message sent" swoosh) leads: jbl_confirm reads loud and
@@ -22,7 +25,7 @@ final class SoundManager {
     private static var startSound: NSSound? = {
         for path in startSoundPaths {
             if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
-                sound.volume = 0.55
+                sound.volume = 0.50
                 return sound
             }
         }
@@ -43,14 +46,16 @@ final class SoundManager {
         return fallback
     }()
 
-    // Key-release acknowledgment. Deliberately quieter and shorter than the commit earcon -
-    // it says "release registered, settling" while the commit sound still owns "text landed".
-    // end_record is macOS's own "recording stopped" earcon; no collision with the commit
-    // sound, which resolves to jbl_confirm first. No named-sound fallback on purpose: the
-    // legacy alert names read as the system error beep - silence beats a wrong-meaning cue.
+    // Key-release acknowledgment. Deliberately shorter than the commit earcon - it says
+    // "release registered, settling" while the commit sound still owns "text landed".
+    // This cue (and the lock cue) fires while the output device is DUCKED, and NSSound gain
+    // caps at 1.0, so nothing played here can exceed DUCK_FRACTION of the system volume: it
+    // has to be a file with real transient energy. Pop is a short low thud - deep enough
+    // not to read as an alert, punchy enough to survive 20%. end_record (macOS's own
+    // "recording stopped" click) is too quiet for that and stays only as a fallback.
     private static let releaseSoundPaths = [
+        "/System/Library/Sounds/Pop.aiff",
         "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/end_record.caf",
-        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/acknowledgment_received.caf",
     ]
 
     private static var releaseSound: NSSound? = {
@@ -65,13 +70,12 @@ final class SoundManager {
 
     // Hold-to-lock earcon: the release that follows is deliberately silent (a non-event),
     // so this cue must carry "you can let go" on its own - a warm two-note confirmation, not
-    // a click. payment_success is Apple Pay's chime (the system's own "locked in" sound);
-    // lock.caf is the mechanical lock click as a thematic second; Glass is the softest of
-    // the named chimes. All distinct from end_record (release) and acknowledgment_sent
-    // (commit), so the three moments of a locked turn never sound alike.
+    // a click. payment_success is Apple Pay's chime (the system's own "locked in" sound;
+    // it ships as .aif, not .caf); Glass is the softest of the named chimes. Both distinct
+    // from Pop (release) and acknowledgment_sent (commit), so the three moments of a
+    // locked turn never sound alike. Fires ducked - see the release note above.
     private static let lockSoundPaths = [
-        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/payment_success.caf",
-        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/lock.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/payment_success.aif",
     ]
 
     private static var lockSound: NSSound? = {

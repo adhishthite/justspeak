@@ -30,7 +30,7 @@ Hold [fn 🌐] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemini 
   - **Halo Falloff**: the bezel (or, on notch-less displays, the pill capsule) is wrapped in a layered halo — a thin rim under two gaussian glows of different radii — so the light genuinely fades out with distance instead of ending at a stroke edge; speech swells both its width and its blur.
   - **Siri Orb & Living Equalizer**: Pulsing Apple Intelligence gradient orb with 4-bar dynamic audio visualizer.
   - **Dynamic Island Capsule**: Hardware-black floating HUD that reads as the notch extruding, rendered with Display P3 colors.
-- **Apple System Earcons**: Pre-cached native macOS audio feedback on key-down and text commit (`begin_record.caf`, `jbl_confirm.caf`, `jbl_cancel.caf`).
+- **Apple System Earcons**: Pre-cached native macOS audio feedback on key-down, key-release, lock and text commit (`jbl_begin.caf`, `Pop.aiff`, `payment_success.aif`, `acknowledgment_sent.caf`); the release and lock cues are picked for enough transient energy to stay audible while the output is ducked.
 - **Custom Vocabulary**: Domain terms, acronyms, team names, and tech stack jargon loaded from [`vocabulary.txt`](vocabulary.txt) or `.env`.
 - **Bilingual & Code-Switching Support**: Built-in support for English (`en-IN`), Marathi (`mr-IN`), Hindi (`hi-IN`), and 80+ languages with automatic acoustic language detection.
 - **Zero Unsigned Binaries (gMac Enterprise Compliant)**: Pure Swift script executed directly through Apple's signed `/usr/bin/swift` interpreter with zero third-party binary dependencies.
