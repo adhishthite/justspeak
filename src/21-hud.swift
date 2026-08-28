@@ -267,7 +267,7 @@ final class FloatingHUD: NSObject {
         lockRingLayer.zPosition = 10
         lockRingLayer.actions = [
             "path": NSNull(), "strokeEnd": NSNull(), "opacity": NSNull(), "lineWidth": NSNull(),
-            "bounds": NSNull(), "position": NSNull(),
+            "strokeColor": NSNull(), "bounds": NSNull(), "position": NSNull(),
         ]
         pillClip.layer?.addSublayer(lockRingLayer)
 
@@ -579,12 +579,15 @@ final class FloatingHUD: NSObject {
     // MARK: Hold-to-lock rim
 
     // Progress rides the wall clock, not a spring: the ring must close at the same instant
-    // the app's lock timer fires, whatever the tick cadence. The last 15% brightens so the
-    // closing moment reads as imminent rather than as loading.
+    // the app's lock timer fires, whatever the tick cadence. The hue walks the orb's own
+    // Siri spectrum as the sweep advances (cyan at the start, amber as it closes) so the
+    // colour itself tells time and hands off into the gold lock flare; the last 15%
+    // brightens so the closing moment reads as imminent rather than as loading.
     private func updateLockRing(now: CFTimeInterval, dt: CGFloat) {
         if locked {
             lockPulse.step(dt: dt)
             let pulse = max(0.0, min(1.0, lockPulse.value))
+            lockRingLayer.strokeColor = AppleDesign.appleGold.cgColor
             lockRingLayer.strokeEnd = 1.0
             lockRingLayer.lineWidth = 2.0 + 1.5 * pulse
             lockRingLayer.opacity = Float(0.18 + 0.82 * pulse)
@@ -597,8 +600,11 @@ final class FloatingHUD: NSObject {
         guard let lockAfter = lockAfter, lockAfter > 0 else { return }
         let progress = max(0.0, min(1.0, CGFloat((now - listenStart) / lockAfter)))
         let closing = max(0.0, min(1.0, (progress - 0.85) / 0.15))
+        // Spectrum runs cyan → indigo → magenta → amber over [0, 0.75]; stop short of the
+        // wrap back to cyan so the ring never cools off right before it locks.
+        lockRingLayer.strokeColor = AppleDesign.siriSpectrum(at: progress * 0.75).cgColor
         lockRingLayer.strokeEnd = progress
-        lockRingLayer.opacity = Float(0.30 + 0.55 * closing * closing)
+        lockRingLayer.opacity = Float(0.35 + 0.55 * closing * closing)
     }
 
     // Capsule outline starting at top-center, running clockwise (layer space is y-up, so
@@ -790,6 +796,7 @@ final class FloatingHUD: NSObject {
         lockPulse.velocity = 0.0
         lockPulse.target = 0.0
         lockRingLayer.strokeEnd = 1.0
+        lockRingLayer.strokeColor = AppleDesign.appleGold.cgColor
         if reduceMotion {
             lockRingLayer.lineWidth = 2.0
             lockRingLayer.opacity = 0.18
