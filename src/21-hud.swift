@@ -67,6 +67,60 @@ private final class HUDPanel: NSPanel {
     }
 }
 
+// Hold-to-lock rim. The shape IS the view's backing layer (makeBackingLayer): AppKit owns
+// a layer-backed view's sublayer list, so a shape layer hand-added to pillClip's layer can
+// end up ordered beneath the opaque backplate; a subview's backing layer is ordered by view
+// order and stays put. The stroke carries its own glow (layer shadow in the stroke colour),
+// the same construction as the orb's and checkmark's halos.
+final class HoldRingView: NSView {
+    override func makeBackingLayer() -> CALayer {
+        let shape = CAShapeLayer()
+        shape.fillColor = nil
+        shape.lineCap = .round
+        shape.strokeEnd = 0.0
+        shape.opacity = 0.0
+        shape.shadowOffset = .zero
+        shape.shadowRadius = 4.0
+        shape.shadowOpacity = 0.85
+        shape.actions = [
+            "path": NSNull(), "strokeEnd": NSNull(), "opacity": NSNull(), "lineWidth": NSNull(),
+            "strokeColor": NSNull(), "shadowColor": NSNull(), "bounds": NSNull(), "position": NSNull(),
+        ]
+        return shape
+    }
+
+    private var shape: CAShapeLayer? { layer as? CAShapeLayer }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+    }
+
+    var path: CGPath? {
+        didSet { shape?.path = path }
+    }
+    var progress: CGFloat = 0.0 {
+        didSet { shape?.strokeEnd = progress }
+    }
+    var lineWidth: CGFloat = 2.5 {
+        didSet { shape?.lineWidth = lineWidth }
+    }
+    var strength: Float = 0.0 {
+        didSet { shape?.opacity = strength }
+    }
+    var color: CGColor = NSColor.white.cgColor {
+        didSet {
+            shape?.strokeColor = color
+            shape?.shadowColor = color
+        }
+    }
+}
+
 final class FloatingHUD: NSObject {
     private let notchPanel: NSPanel
     private let notchGlowView: AppleNotchAuraView
@@ -86,9 +140,8 @@ final class FloatingHUD: NSObject {
     private let transcriptLabel: NSTextField
     private let waveformView: AppleSiriWaveformView
     // Hold-to-lock rim: a stroke tracing the capsule clockwise from 12 o'clock that closes
-    // at the instant the hold locks. Lives inside pillClip so the capsule mask trims it;
-    // implicit actions are nulled so per-frame writes land without CA's 0.25s animation.
-    private let lockRingLayer: CAShapeLayer
+    // at the instant the hold locks. Topmost subview of pillClip so the capsule mask trims it.
+    private let lockRingView: HoldRingView
 
     private var hideWorkItem: DispatchWorkItem?
 
@@ -257,19 +310,8 @@ final class FloatingHUD: NSObject {
         transcriptLabel.lineBreakMode = .byTruncatingTail
         pillClip.addSubview(transcriptLabel)
 
-        let lockRingLayer = CAShapeLayer()
-        lockRingLayer.fillColor = nil
-        lockRingLayer.strokeColor = NSColor.white.cgColor
-        lockRingLayer.lineWidth = 2.0
-        lockRingLayer.lineCap = .round
-        lockRingLayer.strokeEnd = 0.0
-        lockRingLayer.opacity = 0.0
-        lockRingLayer.zPosition = 10
-        lockRingLayer.actions = [
-            "path": NSNull(), "strokeEnd": NSNull(), "opacity": NSNull(), "lineWidth": NSNull(),
-            "strokeColor": NSNull(), "bounds": NSNull(), "position": NSNull(),
-        ]
-        pillClip.layer?.addSublayer(lockRingLayer)
+        let lockRingView = HoldRingView(frame: pillClip.bounds)
+        pillClip.addSubview(lockRingView)
 
         pillWrapper.addSubview(pillClip)
         hostView.addSubview(pillWrapper)
@@ -289,7 +331,7 @@ final class FloatingHUD: NSObject {
         self.headerLabel = headerLabel
         self.waveformView = waveformView
         self.transcriptLabel = transcriptLabel
-        self.lockRingLayer = lockRingLayer
+        self.lockRingView = lockRingView
 
         super.init()
 
@@ -539,10 +581,10 @@ final class FloatingHUD: NSObject {
         pillWrapper.frame = rect
         pillClip.frame = pillWrapper.bounds
         pillClip.layer?.cornerRadius = radius
-        lockRingLayer.frame = pillClip.bounds
+        lockRingView.frame = pillClip.bounds
         if lockRingSize != pillClip.bounds.size {
             lockRingSize = pillClip.bounds.size
-            lockRingLayer.path = Self.lockRingPath(in: pillClip.bounds, cornerRadius: radius, inset: 1.5)
+            lockRingView.path = Self.lockRingPath(in: pillClip.bounds, cornerRadius: radius, inset: 3.0)
         }
         materialView.frame = pillClip.bounds
         backplateView.frame = pillClip.bounds
@@ -581,16 +623,16 @@ final class FloatingHUD: NSObject {
     // Progress rides the wall clock, not a spring: the ring must close at the same instant
     // the app's lock timer fires, whatever the tick cadence. The hue walks the orb's own
     // Siri spectrum as the sweep advances (cyan at the start, amber as it closes) so the
-    // colour itself tells time and hands off into the gold lock flare; the last 15%
-    // brightens so the closing moment reads as imminent rather than as loading.
+    // colour itself tells time and hands off into the gold lock flare; the last 15% goes
+    // to full so the closing moment reads as imminent rather than as loading.
     private func updateLockRing(now: CFTimeInterval, dt: CGFloat) {
         if locked {
             lockPulse.step(dt: dt)
             let pulse = max(0.0, min(1.0, lockPulse.value))
-            lockRingLayer.strokeColor = AppleDesign.appleGold.cgColor
-            lockRingLayer.strokeEnd = 1.0
-            lockRingLayer.lineWidth = 2.0 + 1.5 * pulse
-            lockRingLayer.opacity = Float(0.18 + 0.82 * pulse)
+            lockRingView.color = AppleDesign.appleGold.cgColor
+            lockRingView.progress = 1.0
+            lockRingView.lineWidth = 2.5 + 2.0 * pulse
+            lockRingView.strength = Float(0.45 + 0.55 * pulse)
             if now >= lockHintUntil, let text = deferredLiveText {
                 deferredLiveText = nil
                 updateLiveText(text)
@@ -602,9 +644,9 @@ final class FloatingHUD: NSObject {
         let closing = max(0.0, min(1.0, (progress - 0.85) / 0.15))
         // Spectrum runs cyan → indigo → magenta → amber over [0, 0.75]; stop short of the
         // wrap back to cyan so the ring never cools off right before it locks.
-        lockRingLayer.strokeColor = AppleDesign.siriSpectrum(at: progress * 0.75).cgColor
-        lockRingLayer.strokeEnd = progress
-        lockRingLayer.opacity = Float(0.35 + 0.55 * closing * closing)
+        lockRingView.color = AppleDesign.siriSpectrum(at: progress * 0.75).cgColor
+        lockRingView.progress = progress
+        lockRingView.strength = Float(0.85 + 0.15 * closing)
     }
 
     // Capsule outline starting at top-center, running clockwise (layer space is y-up, so
@@ -630,9 +672,9 @@ final class FloatingHUD: NSObject {
         locked = false
         lockAfter = nil
         deferredLiveText = nil
-        lockRingLayer.strokeEnd = 0.0
-        lockRingLayer.lineWidth = 2.0
-        lockRingLayer.opacity = 0.0
+        lockRingView.progress = 0.0
+        lockRingView.lineWidth = 2.5
+        lockRingView.strength = 0.0
     }
 
     // MARK: State typography
@@ -795,11 +837,11 @@ final class FloatingHUD: NSObject {
         lockPulse.value = 1.0
         lockPulse.velocity = 0.0
         lockPulse.target = 0.0
-        lockRingLayer.strokeEnd = 1.0
-        lockRingLayer.strokeColor = AppleDesign.appleGold.cgColor
+        lockRingView.progress = 1.0
+        lockRingView.color = AppleDesign.appleGold.cgColor
         if reduceMotion {
-            lockRingLayer.lineWidth = 2.0
-            lockRingLayer.opacity = 0.18
+            lockRingView.lineWidth = 2.5
+            lockRingView.strength = 0.45
         }
         orbIcon.state = .locked
 
