@@ -80,6 +80,7 @@ final class FloatingHUD: NSObject {
     private let pillWrapper: NSView  // shadow carrier: masksToBounds off, shadowPath capsule
     private let pillClip: NSView  // continuous-corner capsule clip for the content
     private let backplateView: AppleIslandBackplateView
+    private let materialView: NSVisualEffectView  // pill-mode only: wallpaper shows through
     private let orbIcon: AppleIntelligenceOrbView
     private let headerLabel: NSTextField
     private let transcriptLabel: NSTextField
@@ -200,6 +201,18 @@ final class FloatingHUD: NSObject {
         }
         pillClip.layer?.masksToBounds = true
 
+        // No-notch displays have no bezel for a hardware-black slab to continue, and on a
+        // light wallpaper the slab reads as a hard-edged black block. There the pill is a
+        // dark translucent material with the wallpaper blurred through it; hidden on notch
+        // displays so the bezel illusion stays intact.
+        let materialView = NSVisualEffectView(frame: pillClip.bounds)
+        materialView.material = .hudWindow
+        materialView.blendingMode = .behindWindow
+        materialView.state = .active
+        materialView.appearance = NSAppearance(named: .darkAqua)
+        materialView.isHidden = true
+        pillClip.addSubview(materialView)
+
         let backplateView = AppleIslandBackplateView(frame: pillClip.bounds)
         pillClip.addSubview(backplateView)
 
@@ -237,6 +250,7 @@ final class FloatingHUD: NSObject {
         self.pillWrapper = pillWrapper
         self.pillClip = pillClip
         self.backplateView = backplateView
+        self.materialView = materialView
         self.orbIcon = orbIcon
         self.headerLabel = headerLabel
         self.waveformView = waveformView
@@ -316,7 +330,9 @@ final class FloatingHUD: NSObject {
             backplateView.layer?.cornerCurve = curve
         }
         backplateView.specularRim = notchInfo.hasPhysicalNotch
+        backplateView.baseAlpha = notchInfo.hasPhysicalNotch ? 0.97 : 0.58
         backplateView.needsDisplay = true
+        materialView.isHidden = notchInfo.hasPhysicalNotch
         notchGlowView.needsDisplay = true
         applyFrame()
     }
@@ -462,6 +478,7 @@ final class FloatingHUD: NSObject {
         pillWrapper.frame = rect
         pillClip.frame = pillWrapper.bounds
         pillClip.layer?.cornerRadius = radius
+        materialView.frame = pillClip.bounds
         backplateView.frame = pillClip.bounds
         // Content is top-anchored so unfurl and morph reveal it with the moving top edge.
         orbIcon.frame = NSRect(x: 16, y: ph - 25, width: 18, height: 18)
