@@ -579,7 +579,8 @@ final class JustSpeakApp {
                     inputDevice: turnInputDevice,
                     inputTransport: turnInputTransport,
                     peakDb: peakDb,
-                    speechFrames: speechFrames
+                    speechFrames: speechFrames,
+                    finishMode: turnFinishMode
                 ))
             processingLock.lock()
             isProcessing = false
