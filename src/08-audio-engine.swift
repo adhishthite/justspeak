@@ -524,8 +524,11 @@ final class AudioCaptureEngine {
             // after the speaker has already finished, and the old floor of a full window
             // after key-up was ~250ms of pure wait on those turns (history p50 capture
             // finalize 290ms, min 283ms). The trailing sub-threshold 20ms frames give the
-            // banked quiet without timestamps; the stats path lags real time by at most a
-            // buffer or so, which only under-credits.
+            // banked quiet without timestamps, PROVIDED the stats are current: drain the
+            // processing queue first, or a backlog (blocked meter write) would leave loud
+            // buffers unaccounted for while their frames get credited as quiet. After the
+            // drain the only lag is the in-flight hardware buffer, which under-credits.
+            audioProcessingQueue.sync {}
             lock.lock()
             var quietFrames = 0
             for db in frameDbValues.reversed() {
