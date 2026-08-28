@@ -40,6 +40,7 @@ final class AudioCaptureEngine {
     // exactly. All under `lock`; per-frame dB values are classified against the caller's
     // threshold at stopRecording time (the threshold is a stopRecording argument).
     private static let speechFrameSamples = 320  // 20ms of 16kHz mono
+    private static let minTrailSec: Double = 0.06
     private var turnMaxAbsSample: Int32 = 0
     private var frameSumSquares: Double = 0
     private var frameSampleCount: Int = 0
@@ -519,9 +520,21 @@ final class AudioCaptureEngine {
         } else {
             let graceSec = Double(gracePeriodMs) / 1000.0
             let maxTrailSec = Double(maxTrailMs) / 1000.0
-            var quietStart: CFAbsoluteTime? = nil
+            // Quiet banked BEFORE the release counts toward the window: most releases come
+            // after the speaker has already finished, and the old floor of a full window
+            // after key-up was ~250ms of pure wait on those turns (history p50 capture
+            // finalize 290ms, min 283ms). The trailing sub-threshold 20ms frames give the
+            // banked quiet without timestamps; the stats path lags real time by at most a
+            // buffer or so, which only under-credits.
+            lock.lock()
+            var quietFrames = 0
+            for db in frameDbValues.reversed() {
+                if db > silenceThresholdDb { break }
+                quietFrames += 1
+            }
+            lock.unlock()
+            var quietStart: CFAbsoluteTime? = quietFrames > 0 ? stopRequestTime - Double(quietFrames) * 0.02 : nil
             while true {
-                usleep(25_000)
                 let now = CFAbsoluteTimeGetCurrent()
                 lock.lock()
                 let levelDb = lastLevelDb
@@ -535,18 +548,24 @@ final class AudioCaptureEngine {
                     quietStart = now
                 }
 
+                // minTrailSec: even a fully banked window keeps a sliver of post-release
+                // capture - a soft final fricative can sit under the threshold and a hardware
+                // buffer's worth of it may still be in flight at key-up.
                 let elapsedSinceEntry = now - stopRequestTime
-                if let qs = quietStart, (now - qs) >= graceSec, elapsedSinceEntry >= graceSec {
+                if let qs = quietStart, (now - qs) >= graceSec, elapsedSinceEntry >= Self.minTrailSec {
                     break
                 }
                 if elapsedSinceEntry >= maxTrailSec {
                     break
                 }
+                usleep(25_000)
             }
 
             let totalWaitMs = (CFAbsoluteTimeGetCurrent() - stopRequestTime) * 1000.0
             if totalWaitMs > Double(gracePeriodMs) + 1.0 {
                 Logger.debug("AUDIO", "Trailing speech captured: +\(Int(totalWaitMs - Double(gracePeriodMs)))ms past post-roll")
+            } else if totalWaitMs < Double(gracePeriodMs) - 1.0 {
+                Logger.debug("AUDIO", "Post-roll shortened to \(Int(totalWaitMs))ms (\(quietFrames * 20)ms quiet banked before release)")
             }
         }
 
