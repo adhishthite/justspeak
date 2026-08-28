@@ -28,6 +28,10 @@ final class JustSpeakApp {
     private var turnLocked: Bool = false
     private var lockWorkItem: DispatchWorkItem?
     private var lockLimitWorkItem: DispatchWorkItem?
+    // How the current turn's hold ended (finish_mode in history): written on main in
+    // handleKeyUp before the pipeline is dispatched, read on sessionQueue like the
+    // turnFrontmost* fields.
+    private var turnFinishMode: String?
 
     // sessionQueue-only: consecutive turns that ended with no speech detected. Three in a row
     // is the signature of a dead input (mic permission revoked, wrong device) - worth a hint.
@@ -312,7 +316,7 @@ final class JustSpeakApp {
         // ignored. The physical key-up that follows finds captureActive false and is dropped.
         if turnLocked {
             turnLocked = false
-            handleKeyUp()
+            handleKeyUp(finish: "lock_press")
             return
         }
 
@@ -410,7 +414,7 @@ final class JustSpeakApp {
         }
     }
 
-    private func handleKeyUp() {
+    private func handleKeyUp(finish: String = "release") {
         // Capture the physical release instant before anything else - this becomes the true
         // start of "Total Key-Up -> Paste" latency measurement.
         let keyUpTime = CFAbsoluteTimeGetCurrent()
@@ -421,6 +425,7 @@ final class JustSpeakApp {
         // Locked: letting go is the whole point. Nothing happens until the next press.
         if turnLocked { return }
         captureActive = false
+        turnFinishMode = finish
         lockWorkItem?.cancel()
         lockWorkItem = nil
         lockLimitWorkItem?.cancel()
@@ -489,7 +494,7 @@ final class JustSpeakApp {
             self.lockLimitWorkItem = nil
             Logger.warn("LOCK", "Locked turn reached LOCK_LIMIT (\(String(format: "%g", self.config.lockLimitSec))s) - finishing it now.")
             self.turnLocked = false
-            self.handleKeyUp()
+            self.handleKeyUp(finish: "lock_limit")
         }
         lockLimitWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + config.lockLimitSec, execute: item)
@@ -861,7 +866,8 @@ final class JustSpeakApp {
                     inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
-                    settlePath: turnSettlePath
+                    settlePath: turnSettlePath,
+                    finishMode: turnFinishMode
                 ))
             processingLock.lock()
             isProcessing = false
@@ -905,7 +911,8 @@ final class JustSpeakApp {
                     inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
-                    settlePath: turnSettlePath
+                    settlePath: turnSettlePath,
+                    finishMode: turnFinishMode
                 ))
             processingLock.lock()
             isProcessing = false
@@ -970,7 +977,8 @@ final class JustSpeakApp {
                     inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
-                    settlePath: turnSettlePath
+                    settlePath: turnSettlePath,
+                    finishMode: turnFinishMode
                 ))
             processingLock.lock()
             isProcessing = false
@@ -1138,7 +1146,8 @@ final class JustSpeakApp {
                 appName: turnFrontmostName,
                 peakDb: turnPeakDb,
                 speechFrames: turnSpeechFrames,
-                settlePath: turnSettlePath
+                settlePath: turnSettlePath,
+                finishMode: turnFinishMode
             ))
 
         print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")

@@ -25,7 +25,7 @@ struct Config {
     var hotkeyMode: String = "push_to_talk"  // "push_to_talk" or "toggle"
     // Hold-to-lock: a hold this long (seconds) locks the turn - the release becomes a
     // non-event and the next press finishes. 0 disables; ignored in toggle mode.
-    var holdToLockSec: Double = 8.0
+    var holdToLockSec: Double = 12.0
     // Seconds a locked turn may run before it finishes on its own (a forgotten open mic).
     var lockLimitSec: Double = 120.0
     var soundFeedback: Bool = true
