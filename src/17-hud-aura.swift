@@ -225,39 +225,61 @@ final class AppleNotchAuraView: NSView {
     // adapted to Core Graphics: CG cannot blur a stroke directly, so each blurred copy
     // is drawn as a shadow - the source stroke lands two panel-widths off-canvas and
     // only its gaussian shadow shows in view. Wide halo, tight glow, thin rim on top.
-    private func strokeHalo(context: CGContext, path: CGPath, tint: NSColor, energy: CGFloat) {
+    //
+    // rim/rimWidth: the notch path is already dilated so a stroke centered on it lands
+    // fully on wallpaper; the pill capsule is not (the even-odd clip amputates the inner
+    // half of anything centered on it), so pill mode passes a hairline on a half-width-
+    // outset path plus a tight feather so the edge reads as light meeting glass, not a
+    // flat band.
+    private func strokeHalo(
+        context: CGContext, path: CGPath, tint: NSColor, energy: CGFloat,
+        rim: CGPath? = nil, rimWidth: CGFloat? = nil
+    ) {
         let shift = bounds.width * 2.0
         var offscreen = CGAffineTransform(translationX: -shift, y: 0)
         let source = path.copy(using: &offscreen) ?? path
         let width = 6.0 + 6.0 * energy
         let blur = 22.0 + 16.0 * energy
 
-        let passes: [(blur: CGFloat, alpha: CGFloat)] = [
+        var passes: [(blur: CGFloat, alpha: CGFloat)] = [
             (blur, 0.40 + 0.25 * energy),
             (blur * 0.5, 0.50 + 0.25 * energy),
         ]
+        if rim != nil {
+            passes.append((3.0, 0.30 + 0.25 * energy))
+        }
         for pass in passes {
-            context.saveGState()
-            context.setShadow(
-                offset: CGSize(width: shift, height: 0),
-                blur: pass.blur,
-                color: tint.withAlphaComponent(pass.alpha).cgColor
-            )
-            context.addPath(source)
-            context.setStrokeColor(tint.cgColor)
-            context.setLineWidth(width)
-            context.setLineCap(.round)
-            context.setLineJoin(.round)
-            context.strokePath()
-            context.restoreGState()
+            blurredStroke(context: context, source: source, shift: shift, width: width, blur: pass.blur, tint: tint, alpha: pass.alpha)
         }
 
         // The rim stays faint and thin - the halo carries the light; the line only
-        // keeps the edge defined underneath it.
+        // keeps the edge defined underneath it. A hairline needs more alpha than a
+        // band to register at all.
+        let rimPath = rim ?? path
+        let lineWidth = rimWidth ?? width * 0.35
+        let rimAlpha: CGFloat = rim == nil ? 0.25 + 0.15 * energy : 0.55 + 0.30 * energy
         context.saveGState()
-        context.addPath(path)
-        context.setStrokeColor(tint.withAlphaComponent(0.25 + 0.15 * energy).cgColor)
-        context.setLineWidth(width * 0.35)
+        context.addPath(rimPath)
+        context.setStrokeColor(tint.withAlphaComponent(rimAlpha).cgColor)
+        context.setLineWidth(lineWidth)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    private func blurredStroke(
+        context: CGContext, source: CGPath, shift: CGFloat, width: CGFloat, blur: CGFloat, tint: NSColor, alpha: CGFloat
+    ) {
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: shift, height: 0),
+            blur: blur,
+            color: tint.withAlphaComponent(alpha).cgColor
+        )
+        context.addPath(source)
+        context.setStrokeColor(tint.cgColor)
+        context.setLineWidth(width)
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.strokePath()
@@ -281,7 +303,41 @@ final class AppleNotchAuraView: NSView {
         context.addPath(mask)
         context.clip(using: .evenOdd)
 
-        strokeHalo(context: context, path: capsule, tint: tint, energy: energy)
+        // Hairline centered 0.5pt outside the capsule: its full 1pt width survives the
+        // clip and sits flush against the pill's edge.
+        let rimRect = rect.insetBy(dx: -0.5, dy: -0.5)
+        let rimRadius = h / 2.0 + 0.5
+        let rim = CGPath(roundedRect: rimRect, cornerWidth: rimRadius, cornerHeight: rimRadius, transform: nil)
+        strokeHalo(context: context, path: capsule, tint: tint, energy: energy, rim: rim, rimWidth: 1.0)
+
+        // Flank-and-underside spread: a wider, softer pass on a capsule dilated sideways
+        // and dropped a few points, so the light pools out to the sides and beneath the
+        // pill while the top edge keeps the tighter halo. Worst-case reach (dilation +
+        // drop + stroke half-width + blur) must stay under the aura panel margin in 21-hud.
+        let spread = 10.0 + 6.0 * energy
+        let drop: CGFloat = 8.0
+        let shift = bounds.width * 2.0
+        var spreadTransform = CGAffineTransform(translationX: -shift, y: -drop)
+        let spreadRect = rect.insetBy(dx: -spread, dy: -spread * 0.4)
+        let spreadRadius = spreadRect.height / 2.0
+        let spreadPath = CGPath(
+            roundedRect: spreadRect, cornerWidth: spreadRadius, cornerHeight: spreadRadius, transform: &spreadTransform)
+        blurredStroke(
+            context: context, source: spreadPath, shift: shift, width: 8.0 + 6.0 * energy,
+            blur: 30.0 + 14.0 * energy, tint: tint, alpha: 0.28 + 0.22 * energy)
+        context.restoreGState()
+
+        // Inner bleed: the same light, clipped to the capsule INTERIOR, so the pill's
+        // black edge dissolves into the glow over a few points instead of stepping from
+        // hardware-black to tint at the hairline. Tight blur keeps the face black.
+        context.saveGState()
+        context.addPath(capsule)
+        context.clip()
+        var inward = CGAffineTransform(translationX: -shift, y: 0)
+        let inwardPath = capsule.copy(using: &inward) ?? capsule
+        blurredStroke(
+            context: context, source: inwardPath, shift: shift, width: 2.0,
+            blur: 5.0, tint: tint, alpha: 0.22 + 0.18 * energy)
         context.restoreGState()
     }
 

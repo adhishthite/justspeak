@@ -1,6 +1,12 @@
 // MARK: - Apple Dynamic Island Obsidian Acrylic Backplate View
 
 final class AppleIslandBackplateView: NSView {
+    // The specular rim sells the pill as glass beside the bezel; wrapped in the pill-mode
+    // aura it is a second, white outline fighting the tinted hairline, so it's off there.
+    var specularRim: Bool = true
+    // Near-opaque beside the bezel; lowered in pill mode so the material underneath shows.
+    var baseAlpha: CGFloat = 0.97
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         self.wantsLayer = true
@@ -26,9 +32,11 @@ final class AppleIslandBackplateView: NSView {
         // 1. Deep Obsidian Base - near-opaque so the pill matches the notch's hardware black
         context.saveGState()
         context.addPath(pillPath)
-        context.setFillColor(NSColor(calibratedRed: 0.043, green: 0.043, blue: 0.059, alpha: 0.97).cgColor)
+        context.setFillColor(NSColor(calibratedRed: 0.043, green: 0.043, blue: 0.059, alpha: baseAlpha).cgColor)
         context.fillPath()
         context.restoreGState()
+
+        guard specularRim else { return }
 
         // 2. Continuous Dual-Stage Specular Rim Light Gradient
         let borderPath = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), cornerWidth: cornerRadius - 0.5, cornerHeight: cornerRadius - 0.5, transform: nil)

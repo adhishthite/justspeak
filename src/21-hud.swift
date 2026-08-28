@@ -56,6 +56,17 @@ private enum HUDMetrics {
     }
 }
 
+// AppKit's default constrainFrameRect keeps any window below .mainMenu level (the host is
+// .floating) from overlapping the menu bar: setFrame silently shoves it down by the menu-bar
+// height. The host must span to the screen top (morph starts inside the notch cutout), so
+// the identity override is required - otherwise the pill lands a menu bar below the aura,
+// which stays put because .screenSaver is above the clamp.
+private final class HUDPanel: NSPanel {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+}
+
 final class FloatingHUD: NSObject {
     private let notchPanel: NSPanel
     private let notchGlowView: AppleNotchAuraView
@@ -69,6 +80,7 @@ final class FloatingHUD: NSObject {
     private let pillWrapper: NSView  // shadow carrier: masksToBounds off, shadowPath capsule
     private let pillClip: NSView  // continuous-corner capsule clip for the content
     private let backplateView: AppleIslandBackplateView
+    private let materialView: NSVisualEffectView  // pill-mode only: wallpaper shows through
     private let orbIcon: AppleIntelligenceOrbView
     private let headerLabel: NSTextField
     private let transcriptLabel: NSTextField
@@ -121,9 +133,9 @@ final class FloatingHUD: NSObject {
         let glowWidth = notchInfo.rect.width + padding * 2
         let glowHeight = notchInfo.rect.height + padding + 44.0
         let glowX = notchInfo.rect.minX - padding
-        let glowY = screenFrame.height - glowHeight
+        let glowY = screenFrame.maxY - glowHeight
 
-        let notchPanel = NSPanel(
+        let notchPanel = HUDPanel(
             contentRect: NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -144,10 +156,10 @@ final class FloatingHUD: NSObject {
 
         // 2. Static host panel for the pill, at maximum footprint, top edge at screen top.
         let host = HUDMetrics.hostSize(notchHeight: notchInfo.rect.height)
-        let hostPanel = NSPanel(
+        let hostPanel = HUDPanel(
             contentRect: NSRect(
                 x: screenFrame.midX - host.width / 2.0,
-                y: screenFrame.height - host.height,
+                y: screenFrame.maxY - host.height,
                 width: host.width, height: host.height),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -189,6 +201,18 @@ final class FloatingHUD: NSObject {
         }
         pillClip.layer?.masksToBounds = true
 
+        // No-notch displays have no bezel for a hardware-black slab to continue, and on a
+        // light wallpaper the slab reads as a hard-edged black block. There the pill is a
+        // dark translucent material with the wallpaper blurred through it; hidden on notch
+        // displays so the bezel illusion stays intact.
+        let materialView = NSVisualEffectView(frame: pillClip.bounds)
+        materialView.material = .hudWindow
+        materialView.blendingMode = .behindWindow
+        materialView.state = .active
+        materialView.appearance = NSAppearance(named: .darkAqua)
+        materialView.isHidden = true
+        pillClip.addSubview(materialView)
+
         let backplateView = AppleIslandBackplateView(frame: pillClip.bounds)
         pillClip.addSubview(backplateView)
 
@@ -226,6 +250,7 @@ final class FloatingHUD: NSObject {
         self.pillWrapper = pillWrapper
         self.pillClip = pillClip
         self.backplateView = backplateView
+        self.materialView = materialView
         self.orbIcon = orbIcon
         self.headerLabel = headerLabel
         self.waveformView = waveformView
@@ -261,11 +286,11 @@ final class FloatingHUD: NSObject {
         self.notchInfo = NotchGeometry.detect(screen: screen)
 
         let host = HUDMetrics.hostSize(notchHeight: notchInfo.rect.height)
-        let pillTopScreen = screenFrame.height - notchInfo.rect.height - HUDMetrics.pillGap
+        let pillTopScreen = screenFrame.maxY - notchInfo.rect.height - HUDMetrics.pillGap
         hostPanel.setFrame(
             NSRect(
                 x: screenFrame.midX - host.width / 2.0,
-                y: screenFrame.height - host.height,
+                y: screenFrame.maxY - host.height,
                 width: host.width, height: host.height),
             display: true)
         hostView.frame = NSRect(x: 0, y: 0, width: host.width, height: host.height)
@@ -276,7 +301,7 @@ final class FloatingHUD: NSObject {
             let glowWidth = notchInfo.rect.width + padding * 2
             let glowHeight = notchInfo.rect.height + padding + 44.0
             let glowX = notchInfo.rect.minX - padding
-            let glowY = screenFrame.height - glowHeight
+            let glowY = screenFrame.maxY - glowHeight
             notchPanel.setFrame(NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight), display: true)
             notchGlowView.frame = NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight)
             notchGlowView.notchRect = notchInfo.rect
@@ -284,8 +309,10 @@ final class FloatingHUD: NSObject {
         } else {
             // No hardware notch: the halo wraps the pill. The panel is sized to the pill's
             // MAXIMUM footprint so width changes never need a panel reframe. Margin must
-            // exceed the halo's worst-case spread (~44px) or the fade gets a hard cutoff.
-            let margin: CGFloat = 64.0
+            // exceed the halo's worst-case reach (the flank spread pass in drawPillAura:
+            // ~16 dilation + 8 drop + 7 half-stroke + 44 blur = ~75px) or the fade gets a
+            // hard cutoff.
+            let margin: CGFloat = 88.0
             let auraWidth = HUDMetrics.maxPillWidth + margin * 2
             let auraHeight = HUDMetrics.pillHeight + margin * 2
             let auraX = screenFrame.midX - auraWidth / 2.0
@@ -294,6 +321,18 @@ final class FloatingHUD: NSObject {
             notchGlowView.frame = NSRect(x: 0, y: 0, width: auraWidth, height: auraHeight)
             notchGlowView.pillMode = true
         }
+        // The aura's capsule is a circular CGPath; a continuous-curve clip on the pill
+        // diverges from it along the end caps and the rim visibly parts from the edge.
+        // Match geometries in pill mode; the notch keeps Apple's continuous corners.
+        if #available(macOS 10.15, *) {
+            let curve: CALayerCornerCurve = notchInfo.hasPhysicalNotch ? .continuous : .circular
+            pillClip.layer?.cornerCurve = curve
+            backplateView.layer?.cornerCurve = curve
+        }
+        backplateView.specularRim = notchInfo.hasPhysicalNotch
+        backplateView.baseAlpha = notchInfo.hasPhysicalNotch ? 0.97 : 0.58
+        backplateView.needsDisplay = true
+        materialView.isHidden = notchInfo.hasPhysicalNotch
         notchGlowView.needsDisplay = true
         applyFrame()
     }
@@ -439,6 +478,7 @@ final class FloatingHUD: NSObject {
         pillWrapper.frame = rect
         pillClip.frame = pillWrapper.bounds
         pillClip.layer?.cornerRadius = radius
+        materialView.frame = pillClip.bounds
         backplateView.frame = pillClip.bounds
         // Content is top-anchored so unfurl and morph reveal it with the moving top edge.
         orbIcon.frame = NSRect(x: 16, y: ph - 25, width: 18, height: 18)
@@ -454,7 +494,11 @@ final class FloatingHUD: NSObject {
             roundedRect: pillWrapper.bounds, cornerWidth: radius, cornerHeight: radius, transform: nil)
 
         // Fade completes early in the travel, so arrival reads as motion, not opacity.
-        pillWrapper.layer?.shadowOpacity = Float(0.55 * surfaceAlpha)
+        // The drop shadow grounds the pill against the bezel on notch displays; on a
+        // no-notch wallpaper it reads as a black ring between the pill and the aura's
+        // light, so the aura alone carries the grounding there.
+        let shadowStrength: CGFloat = notchInfo.hasPhysicalNotch ? 0.55 : 0.0
+        pillWrapper.layer?.shadowOpacity = Float(shadowStrength * surfaceAlpha)
         if !reduceMotion {
             // Privacy mode is aura-only: the glow states and earcons carry everything; a
             // pill showing placeholder text is pure noise on a shared screen.
