@@ -35,6 +35,9 @@ final class TranscriptionHistoryStore {
         // App that was frontmost at key-down - where the dictation was aimed.
         var appBundleId: String?
         var appName: String?
+        // Capture device at key-down (CoreAudio name + transport: builtin/usb/bluetooth/...).
+        var inputDevice: String?
+        var inputTransport: String?
         // Silence-gate evidence for the clip (tunes TRAIL_SILENCE_DB / SILENCE_FLUSH_MS
         // against real dictations) and which settlement rule ended a WS turn (the thing
         // WS_ENDPOINT_ALIGNED changes). Defaulted so rows without the data store NULL.
@@ -137,7 +140,9 @@ final class TranscriptionHistoryStore {
               endpoint_aligned INTEGER,
               chunk_ms INTEGER,
               silence_flush_ms INTEGER,
-              build_id TEXT
+              build_id TEXT,
+              input_device TEXT,
+              input_transport TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_transcriptions_ts ON transcriptions(ts_epoch);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id);
@@ -175,6 +180,8 @@ final class TranscriptionHistoryStore {
             "ALTER TABLE transcriptions ADD COLUMN silence_flush_ms INTEGER",
             "ALTER TABLE transcriptions ADD COLUMN build_id TEXT",
             "ALTER TABLE corrections ADD COLUMN build_id TEXT",
+            "ALTER TABLE transcriptions ADD COLUMN input_device TEXT",
+            "ALTER TABLE transcriptions ADD COLUMN input_transport TEXT",
         ] {
             sqlite3_exec(opened, migration, nil, nil, nil)
         }
@@ -228,8 +235,8 @@ final class TranscriptionHistoryStore {
                   injected, input_tokens, output_tokens, tokens_metered, cost_usd,
                   language_codes, smart_mode, vad_mode, error, app_bundle_id, app_name,
                   peak_db, speech_frames, settle_path, endpoint_aligned, chunk_ms, silence_flush_ms,
-                  build_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  build_id, input_device, input_transport
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
             var stmt: OpaquePointer?
@@ -276,6 +283,8 @@ final class TranscriptionHistoryStore {
             self.bindInt(stmt, 33, self.chunkMs)
             self.bindInt(stmt, 34, self.silenceFlushMs)
             self.bindText(stmt, 35, self.buildId)
+            self.bindText(stmt, 36, r.inputDevice)
+            self.bindText(stmt, 37, r.inputTransport)
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 self.failed = true

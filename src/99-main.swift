@@ -13,6 +13,11 @@ if args.contains("--test-api") {
     exit(0)
 }
 
+if args.contains("--list-inputs") {
+    Diagnostics.listInputDevices()
+    exit(0)
+}
+
 if args.contains("--test-audio") {
     Diagnostics.runAudioTest(config: config)
     exit(0)
@@ -43,6 +48,7 @@ if args.contains("--help") || args.contains("-h") {
         Options:
           --check-permissions, -p   Run diagnostic permissions checker
           --test-audio              Test 3-second mic capture and AI transcription
+          --list-inputs             List capture devices (names/UIDs for INPUT_DEVICE)
           --test-api                Test Gemini API connection and latency
           --analyze [--days N]      Mine dictation history for vocabulary suggestions (default 30 days)
           --hud-demo                Loop the HUD through its states with synthetic data (no mic, no API)

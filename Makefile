@@ -3,7 +3,7 @@
 
 RUNNER = ./justspeak
 
-.PHONY: all run start check-permissions test-api test-audio analyze hud-demo setup install clean check lint format help
+.PHONY: all run start check-permissions test-api test-audio list-inputs analyze hud-demo setup install clean check lint format help
 
 all: run
 
@@ -25,6 +25,10 @@ test-api: setup
 ## test-audio: Record a 3-second audio sample from the microphone and transcribe via Gemini
 test-audio: setup
 	@$(RUNNER) --test-audio
+
+## list-inputs: List capture devices with the names/UIDs INPUT_DEVICE accepts
+list-inputs:
+	@$(RUNNER) --list-inputs
 
 ## analyze: Mine dictation history for vocabulary suggestions (Gemini-powered, interactive)
 analyze: setup

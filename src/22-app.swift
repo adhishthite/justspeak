@@ -46,6 +46,10 @@ final class JustSpeakApp {
     private var turnFrontmostPID: pid_t?
     private var turnFrontmostName: String?
     private var turnFrontmostBundleId: String?
+    // Capture device at key-down (main-thread read of the engine's current input), stamped on
+    // the row so a bad transcript can be traced to the display mic vs the built-in one.
+    private var turnInputDevice: String?
+    private var turnInputTransport: String?
 
     // sessionQueue-only, set once per turn: the clip's silence-gate evidence (from
     // stopRecording's accumulators) and, for WS turns, which settlement rule fired -
@@ -97,7 +101,7 @@ final class JustSpeakApp {
 
     init(config: Config) {
         self.config = config
-        self.audioCapture = AudioCaptureEngine(preRollMs: config.preRollMs, chunkMs: config.chunkMs, silenceFlushMs: config.silenceFlushMs)
+        self.audioCapture = AudioCaptureEngine(preRollMs: config.preRollMs, chunkMs: config.chunkMs, silenceFlushMs: config.silenceFlushMs, inputDevice: config.inputDevice)
         if config.enableLiveWebSocket && !config.geminiApiKey.isEmpty {
             self.liveClient = GeminiLiveClient(
                 apiKey: config.geminiApiKey,
@@ -321,6 +325,8 @@ final class JustSpeakApp {
         turnFrontmostPID = front?.processIdentifier
         turnFrontmostName = front?.localizedName
         turnFrontmostBundleId = front?.bundleIdentifier
+        turnInputDevice = audioCapture.currentInput?.name
+        turnInputTransport = audioCapture.currentInput?.transport
 
         micIdleWorkItem?.cancel()
         micIdleWorkItem = nil
@@ -339,8 +345,16 @@ final class JustSpeakApp {
             SoundManager.playStartSound()
         }
 
+        // The screen lookup (one AX call) rides in this async hop so it runs after
+        // startRecording below has already opened the capture, off the key-down critical path.
+        let followFocus = config.hudFollowFocus
+        let focusPID = turnFrontmostPID
         DispatchQueue.main.async { [weak self] in
-            self?.hud?.showListening()
+            guard let self = self, let hud = self.hud else { return }
+            if followFocus, let screen = FocusScreenResolver.resolve(frontmostPID: focusPID) {
+                hud.retarget(to: screen)
+            }
+            hud.showListening()
         }
 
         // A new capture invalidates any pending post-paste read-back: the upcoming paste
@@ -480,6 +494,8 @@ final class JustSpeakApp {
                     error: nil,
                     appBundleId: turnFrontmostBundleId,
                     appName: turnFrontmostName,
+                    inputDevice: turnInputDevice,
+                    inputTransport: turnInputTransport,
                     peakDb: peakDb,
                     speechFrames: speechFrames
                 ))
@@ -764,6 +780,8 @@ final class JustSpeakApp {
                     error: nil,
                     appBundleId: turnFrontmostBundleId,
                     appName: turnFrontmostName,
+                    inputDevice: turnInputDevice,
+                    inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
                     settlePath: turnSettlePath
@@ -806,6 +824,8 @@ final class JustSpeakApp {
                     error: error.localizedDescription,
                     appBundleId: turnFrontmostBundleId,
                     appName: turnFrontmostName,
+                    inputDevice: turnInputDevice,
+                    inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
                     settlePath: turnSettlePath
@@ -869,6 +889,8 @@ final class JustSpeakApp {
                     error: nil,
                     appBundleId: turnFrontmostBundleId,
                     appName: turnFrontmostName,
+                    inputDevice: turnInputDevice,
+                    inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
                     settlePath: turnSettlePath
@@ -1077,7 +1099,8 @@ final class JustSpeakApp {
             History DB:        \(config.historyEnabled ? "\(ANSI.green)\(history?.path ?? "Disabled")\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
             Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")\(config.replacementRules.isEmpty ? "" : " \(ANSI.gray)(+ \(config.replacementRules.count) replacement rules)\(ANSI.reset)")
             Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
-            Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+            Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)\(config.hudFollowFocus ? " \(ANSI.gray)(follows the focused window's display)\(ANSI.reset)" : "")" : "\(ANSI.gray)Disabled\(ANSI.reset)")
+            Input Device:      \(config.inputDevice.isEmpty ? "\(ANSI.gray)System default\(ANSI.reset)" : "\(ANSI.green)\(config.inputDevice)\(ANSI.reset) \(ANSI.gray)(INPUT_DEVICE match)\(ANSI.reset)")
             Privacy Mode:      \(config.privacyMode ? "\(ANSI.yellow)On (HUD & terminal hide dictated text)\(ANSI.reset)" : "\(ANSI.gray)Off\(ANSI.reset)")
             """)
     }

@@ -49,7 +49,14 @@ final class AudioCaptureEngine {
     var onAudioChunk: ((Data) -> Void)?
     var onAudioLevel: ((Double) -> Void)?
 
-    init(preRollMs: Int = 400, chunkMs: Int = 150, silenceFlushMs: Int = 700) {
+    // Main-thread-only (written in setup and the configuration-change handler, read at
+    // key-down): the device the engine is actually capturing from, for the log and the
+    // history row. Never assume the system default - an external display's mic often is.
+    private(set) var currentInput: InputDeviceCatalog.Device?
+    private let preferredInputDevice: String
+
+    init(preRollMs: Int = 400, chunkMs: Int = 150, silenceFlushMs: Int = 700, inputDevice: String = "") {
+        self.preferredInputDevice = inputDevice
         // Standard 16kHz 16-bit Mono Linear PCM for speech AI models
         self.targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -65,8 +72,10 @@ final class AudioCaptureEngine {
 
     func setup() -> Bool {
         let inputNode = audioEngine.inputNode
+        applyInputDeviceSelection()
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
+        Logger.info("MIC", "Input device: \(currentInputLabel)")
         Logger.info("MIC", "Hardware format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch, \(inputFormat.formatDescription)")
         Logger.info("MIC", "Target format: 16000 Hz, 1 ch, 16-bit Linear PCM")
 
@@ -124,6 +133,9 @@ final class AudioCaptureEngine {
         let wasRunning = isEngineRunning
         let inputNode = audioEngine.inputNode
         inputNode.removeTap(onBus: 0)
+        // A pinned INPUT_DEVICE must survive the default-input flip that usually triggers
+        // this; if it was the pinned device that vanished, the HAL has already fallen back.
+        applyInputDeviceSelection()
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
         guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
@@ -150,14 +162,62 @@ final class AudioCaptureEngine {
             do {
                 try audioEngine.start()
                 isEngineRunning = true
-                Logger.info("MIC", "Input device changed - engine rebuilt (\(Int(inputFormat.sampleRate)) Hz, \(inputFormat.channelCount) ch).")
+                Logger.info("MIC", "Input device changed - engine rebuilt on \(currentInputLabel) (\(Int(inputFormat.sampleRate)) Hz, \(inputFormat.channelCount) ch).")
             } catch {
                 isEngineRunning = false
                 Logger.error("MIC", "Input device changed and engine restart failed: \(error.localizedDescription) - next key-down will retry.")
             }
         } else {
-            Logger.info("MIC", "Input device changed while mic idle - tap rebuilt for the new device.")
+            Logger.info("MIC", "Input device changed while mic idle - tap rebuilt for \(currentInputLabel).")
         }
+    }
+
+    var currentInputLabel: String {
+        guard let d = currentInput else { return "unknown input" }
+        return d.label + (d.isDefault ? " (system default)" : "")
+    }
+
+    // Pins the AUHAL behind inputNode to the configured device (the property must be set
+    // before the engine initializes the unit, which prepare()/start() does), then records
+    // whichever device the unit ended up on - pinned, or the default when nothing matched.
+    private func applyInputDeviceSelection() {
+        let devices = InputDeviceCatalog.inputDevices()
+        let unit = audioEngine.inputNode.audioUnit
+
+        if !preferredInputDevice.isEmpty {
+            if let match = InputDeviceCatalog.match(preferredInputDevice, in: devices) {
+                // Skip the write when already on the device: on a configuration change the
+                // unit is initialized and the property write would fail, but the pin holds.
+                if let unit = unit, activeDevice(of: unit) != match.id {
+                    var deviceID = match.id
+                    let status = AudioUnitSetProperty(
+                        unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                        &deviceID, UInt32(MemoryLayout<AudioDeviceID>.size))
+                    if status != noErr {
+                        Logger.warn("MIC", "Could not pin input to \(match.label) (OSStatus \(status)) - using whatever the engine has.")
+                    }
+                }
+            } else {
+                let available = devices.map { $0.name }.joined(separator: ", ")
+                Logger.warn("MIC", "INPUT_DEVICE \"\(preferredInputDevice)\" matched no input device - using the system default. Available: \(available)")
+            }
+        }
+
+        if let unit = unit, let activeID = activeDevice(of: unit) {
+            currentInput = devices.first(where: { $0.id == activeID })
+                ?? InputDeviceCatalog.describe(activeID, isDefault: activeID == InputDeviceCatalog.defaultInputDevice())
+        } else {
+            currentInput = devices.first(where: { $0.isDefault })
+        }
+    }
+
+    private func activeDevice(of unit: AudioUnit) -> AudioDeviceID? {
+        var activeID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitGetProperty(
+            unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &activeID, &size)
+        guard status == noErr, activeID != 0 else { return nil }
+        return activeID
     }
 
     // Releases the microphone (the macOS status-bar mic indicator turns off) while keeping the

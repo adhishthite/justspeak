@@ -12,6 +12,7 @@ import AVFoundation
 import AppKit
 import CoreGraphics
 import CoreAudio
+import AudioToolbox
 import ApplicationServices
 import Darwin
 import Network

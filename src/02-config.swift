@@ -28,6 +28,9 @@ struct Config {
     // (there can be seconds of silence before the commit earcon on a slow REST fallback).
     var releaseSound: Bool = true
     var showHUD: Bool = true
+    // Put the HUD on the display holding the frontmost app's focused window (pointer as
+    // fallback) rather than always on the menu-bar/notch display. Resolved once per key-down.
+    var hudFollowFocus: Bool = true
     // HUD pill entrance animation: "slide" (shipped default), "bloom", "drift", "unfurl",
     // "morph" (Dynamic Island membrane; needs a physical notch, else falls back to slide).
     var hudRevealStyle: String = "slide"
@@ -47,6 +50,10 @@ struct Config {
     var enableLiveWebSocket: Bool = true
     var restFallbackTimeout: Double = 4.0
     var preRollMs: Int = 400
+    // Capture device: empty = system default input. Otherwise an exact CoreAudio UID or a
+    // case-insensitive name substring ("studio" -> "Studio Display Microphone"); see
+    // --list-inputs. Unmatched falls back to the default with a warning.
+    var inputDevice: String = ""
     // 250ms default: people release the key while the last word is still leaving their mouth;
     // audio keeps streaming during the grace period, so the only cost is commit latency.
     var postRollMs: Int = 250
@@ -240,6 +247,8 @@ struct Config {
                         case "SOUND_FEEDBACK": config.soundFeedback = (value.lowercased() == "true" || value == "1")
                         case "RELEASE_SOUND": config.releaseSound = (value.lowercased() == "true" || value == "1")
                         case "SHOW_HUD": config.showHUD = (value.lowercased() == "true" || value == "1")
+                        case "HUD_FOLLOW_FOCUS": config.hudFollowFocus = (value.lowercased() == "true" || value == "1")
+                        case "INPUT_DEVICE": config.inputDevice = value
                         case "HUD_REVEAL": if ["slide", "bloom", "drift", "unfurl", "morph"].contains(value.lowercased()) { config.hudRevealStyle = value.lowercased() }
                         case "HUD_PARTICLES": config.hudParticles = (value.lowercased() == "true" || value == "1")
                         case "PRIVACY_MODE": config.privacyMode = (value.lowercased() == "true" || value == "1")
@@ -291,6 +300,8 @@ struct Config {
         if let sound = env["SOUND_FEEDBACK"] { config.soundFeedback = (sound.lowercased() == "true" || sound == "1") }
         if let rel = env["RELEASE_SOUND"] { config.releaseSound = (rel.lowercased() == "true" || rel == "1") }
         if let hud = env["SHOW_HUD"] { config.showHUD = (hud.lowercased() == "true" || hud == "1") }
+        if let follow = env["HUD_FOLLOW_FOCUS"] { config.hudFollowFocus = (follow.lowercased() == "true" || follow == "1") }
+        if let dev = env["INPUT_DEVICE"] { config.inputDevice = dev }
         if let reveal = env["HUD_REVEAL"], ["slide", "bloom", "drift", "unfurl", "morph"].contains(reveal.lowercased()) { config.hudRevealStyle = reveal.lowercased() }
         if let motes = env["HUD_PARTICLES"] { config.hudParticles = (motes.lowercased() == "true" || motes == "1") }
         if let priv = env["PRIVACY_MODE"] { config.privacyMode = (priv.lowercased() == "true" || priv == "1") }
