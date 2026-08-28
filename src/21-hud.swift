@@ -85,8 +85,26 @@ final class FloatingHUD: NSObject {
     private let headerLabel: NSTextField
     private let transcriptLabel: NSTextField
     private let waveformView: AppleSiriWaveformView
+    // Hold-to-lock rim: a stroke tracing the capsule clockwise from 12 o'clock that closes
+    // at the instant the hold locks. Lives inside pillClip so the capsule mask trims it;
+    // implicit actions are nulled so per-frame writes land without CA's 0.25s animation.
+    private let lockRingLayer: CAShapeLayer
 
     private var hideWorkItem: DispatchWorkItem?
+
+    // Main-thread-only lock state. lockAfter is the hold length that locks (nil = no ring);
+    // listenStart anchors the ring's clock. On lock, lockPulse runs 1→0: the closed rim
+    // flares, then decays to a faint resting ring that persists for as long as the lock does.
+    private var lockAfter: TimeInterval?
+    private var listenStart: CFTimeInterval = 0
+    private var locked = false
+    private var lockPulse = SpringChannel(value: 0.0, target: 0.0, stiffness: 90, dampingRatio: 1.0)
+    // The lock hint owns the transcript line briefly; live words arriving inside that window
+    // are held and rendered once it lapses, so the hint is never wiped mid-read.
+    private var lockHintUntil: CFTimeInterval = 0
+    private var deferredLiveText: String?
+    private var lockRingSize: CGSize = .zero
+    private static let lockHint = "Release the key. Press again to finish."
 
     private var notchInfo: NotchGeometry
     private var screenFrame: NSRect
@@ -239,6 +257,20 @@ final class FloatingHUD: NSObject {
         transcriptLabel.lineBreakMode = .byTruncatingTail
         pillClip.addSubview(transcriptLabel)
 
+        let lockRingLayer = CAShapeLayer()
+        lockRingLayer.fillColor = nil
+        lockRingLayer.strokeColor = NSColor.white.cgColor
+        lockRingLayer.lineWidth = 2.0
+        lockRingLayer.lineCap = .round
+        lockRingLayer.strokeEnd = 0.0
+        lockRingLayer.opacity = 0.0
+        lockRingLayer.zPosition = 10
+        lockRingLayer.actions = [
+            "path": NSNull(), "strokeEnd": NSNull(), "opacity": NSNull(), "lineWidth": NSNull(),
+            "bounds": NSNull(), "position": NSNull(),
+        ]
+        pillClip.layer?.addSublayer(lockRingLayer)
+
         pillWrapper.addSubview(pillClip)
         hostView.addSubview(pillWrapper)
         hostPanel.contentView = hostView
@@ -257,6 +289,7 @@ final class FloatingHUD: NSObject {
         self.headerLabel = headerLabel
         self.waveformView = waveformView
         self.transcriptLabel = transcriptLabel
+        self.lockRingLayer = lockRingLayer
 
         super.init()
 
@@ -404,6 +437,7 @@ final class FloatingHUD: NSObject {
         presence.step(dt: dt)
         widthSpring.step(dt: dt)
         applyFrame()
+        updateLockRing(now: now, dt: dt)
 
         // Continuous glow/orb phases only while those states actually animate; success and
         // error are static frames whose one redraw came from their state didSets.
@@ -505,6 +539,11 @@ final class FloatingHUD: NSObject {
         pillWrapper.frame = rect
         pillClip.frame = pillWrapper.bounds
         pillClip.layer?.cornerRadius = radius
+        lockRingLayer.frame = pillClip.bounds
+        if lockRingSize != pillClip.bounds.size {
+            lockRingSize = pillClip.bounds.size
+            lockRingLayer.path = Self.lockRingPath(in: pillClip.bounds, cornerRadius: radius, inset: 1.5)
+        }
         materialView.frame = pillClip.bounds
         backplateView.frame = pillClip.bounds
         // Content is top-anchored so unfurl and morph reveal it with the moving top edge.
@@ -535,6 +574,59 @@ final class FloatingHUD: NSObject {
         if !notchInfo.hasPhysicalNotch {
             notchGlowView.pillSize = CGSize(width: pw, height: ph)
         }
+    }
+
+    // MARK: Hold-to-lock rim
+
+    // Progress rides the wall clock, not a spring: the ring must close at the same instant
+    // the app's lock timer fires, whatever the tick cadence. The last 15% brightens so the
+    // closing moment reads as imminent rather than as loading.
+    private func updateLockRing(now: CFTimeInterval, dt: CGFloat) {
+        if locked {
+            lockPulse.step(dt: dt)
+            let pulse = max(0.0, min(1.0, lockPulse.value))
+            lockRingLayer.strokeEnd = 1.0
+            lockRingLayer.lineWidth = 2.0 + 1.5 * pulse
+            lockRingLayer.opacity = Float(0.18 + 0.82 * pulse)
+            if now >= lockHintUntil, let text = deferredLiveText {
+                deferredLiveText = nil
+                updateLiveText(text)
+            }
+            return
+        }
+        guard let lockAfter = lockAfter, lockAfter > 0 else { return }
+        let progress = max(0.0, min(1.0, CGFloat((now - listenStart) / lockAfter)))
+        let closing = max(0.0, min(1.0, (progress - 0.85) / 0.15))
+        lockRingLayer.strokeEnd = progress
+        lockRingLayer.opacity = Float(0.30 + 0.55 * closing * closing)
+    }
+
+    // Capsule outline starting at top-center, running clockwise (layer space is y-up, so
+    // clockwise is decreasing angle). Inset keeps the whole stroke inside the clip.
+    private static func lockRingPath(in bounds: CGRect, cornerRadius: CGFloat, inset: CGFloat) -> CGPath {
+        let rect = bounds.insetBy(dx: inset, dy: inset)
+        let r = max(0.0, min(cornerRadius - inset, min(rect.width, rect.height) / 2.0))
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: rect.midX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.maxX - r, y: rect.maxY))
+        path.addArc(center: CGPoint(x: rect.maxX - r, y: rect.maxY - r), radius: r, startAngle: .pi / 2, endAngle: 0, clockwise: true)
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + r))
+        path.addArc(center: CGPoint(x: rect.maxX - r, y: rect.minY + r), radius: r, startAngle: 0, endAngle: -.pi / 2, clockwise: true)
+        path.addLine(to: CGPoint(x: rect.minX + r, y: rect.minY))
+        path.addArc(center: CGPoint(x: rect.minX + r, y: rect.minY + r), radius: r, startAngle: -.pi / 2, endAngle: -.pi, clockwise: true)
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - r))
+        path.addArc(center: CGPoint(x: rect.minX + r, y: rect.maxY - r), radius: r, startAngle: .pi, endAngle: .pi / 2, clockwise: true)
+        path.closeSubpath()
+        return path
+    }
+
+    private func clearLockRing() {
+        locked = false
+        lockAfter = nil
+        deferredLiveText = nil
+        lockRingLayer.strokeEnd = 0.0
+        lockRingLayer.lineWidth = 2.0
+        lockRingLayer.opacity = 0.0
     }
 
     // MARK: State typography
@@ -602,9 +694,22 @@ final class FloatingHUD: NSObject {
 
     // MARK: States
 
-    func showListening() {
+    // lockAfter: seconds of holding after which the app locks the turn; the rim ring sweeps
+    // over exactly that span. nil = hold-to-lock off, no ring.
+    func showListening(lockAfter: TimeInterval? = nil) {
         hideWorkItem?.cancel()
         shownTarget = true
+
+        clearLockRing()
+        lockPulse.value = 0.0
+        lockPulse.velocity = 0.0
+        lockPulse.target = 0.0
+        lockHintUntil = 0
+        listenStart = CACurrentMediaTime()
+        // The ring needs the display tick, which reduced motion never starts while listening.
+        if !reduceMotion, let lockAfter = lockAfter, lockAfter > 0 {
+            self.lockAfter = lockAfter
+        }
 
         notchGlowView.state = .listening
         notchGlowView.audioLevel = 0.0
@@ -674,7 +779,53 @@ final class FloatingHUD: NSObject {
         waveformView.updateLevel(db: db)
     }
 
+    // The hold has locked: the closed rim flares and settles to a faint resting ring, the
+    // orb becomes a padlock, and the copy says the two things that matter now. The mic is
+    // still open, so the aura and waveform keep their listening behaviour.
+    func showLocked() {
+        guard shownTarget else { return }
+        locked = true
+        lockAfter = nil
+        lockPulse.value = 1.0
+        lockPulse.velocity = 0.0
+        lockPulse.target = 0.0
+        lockRingLayer.strokeEnd = 1.0
+        if reduceMotion {
+            lockRingLayer.lineWidth = 2.0
+            lockRingLayer.opacity = 0.18
+        }
+        orbIcon.state = .locked
+
+        crossfadeTextChange()
+        setHeader("Locked", color: AppleDesign.appleGold)
+        setTranscript(Self.lockHint, color: NSColor(white: 1.0, alpha: 0.70), caret: false)
+        // Hold the hint long enough to read; streamed words queue behind it (tick flushes
+        // them). Reduced motion has no tick to flush with, so it skips the hold.
+        lockHintUntil = reduceMotion ? 0 : CACurrentMediaTime() + 1.8
+        let needed = neededWidth(forText: Self.lockHint)
+        if needed > widthSpring.target + 8.0 {
+            widthSpring.target = needed
+            if reduceMotion {
+                widthSpring.snap()
+                applyFrame()
+            } else {
+                startTick()
+            }
+        }
+    }
+
+    private func neededWidth(forText text: String) -> CGFloat {
+        let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 13.5)
+        let textWidth = (text as NSString).size(withAttributes: [.font: font]).width
+        return max(HUDMetrics.minPillWidth, min(HUDMetrics.maxPillWidth, textWidth + 64.0))
+    }
+
     func updateLiveText(_ text: String) {
+        if locked && CACurrentMediaTime() < lockHintUntil {
+            deferredLiveText = text
+            return
+        }
+
         // Privacy mode: acknowledge that speech is landing without rendering a word of it.
         // The pill also stays at minimum width - nothing to read, nothing to grow for.
         if privacyMode {
@@ -693,9 +844,7 @@ final class FloatingHUD: NSObject {
         // only stay there until the next showListening resets it, so stop paying the
         // full-transcript measurement on every interim update.
         if widthSpring.target < HUDMetrics.maxPillWidth {
-            let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 13.5)
-            let textWidth = (clean as NSString).size(withAttributes: [.font: font]).width
-            let needed = max(HUDMetrics.minPillWidth, min(HUDMetrics.maxPillWidth, textWidth + 64.0))
+            let needed = neededWidth(forText: clean)
             if abs(needed - widthSpring.target) > 8.0 {
                 widthSpring.target = needed
                 if reduceMotion {
@@ -710,6 +859,9 @@ final class FloatingHUD: NSObject {
 
     func showProcessing() {
         hideWorkItem?.cancel()
+        // Words still queued behind the lock hint are the freshest transcript there is.
+        let deferred = deferredLiveText
+        clearLockRing()
         notchGlowView.state = .processing
         orbIcon.state = .processing
 
@@ -717,8 +869,8 @@ final class FloatingHUD: NSObject {
         setHeader("Polishing", color: AppleDesign.siriCyan)
         // Keep the user's words on screen, just dimmed - wiping them for a status message
         // makes the pill feel like it lost the dictation.
-        let existing = currentTranscriptText
-        if privacyMode || existing.isEmpty || existing == "Speak, then release to paste" {
+        let existing = deferred?.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces) ?? currentTranscriptText
+        if privacyMode || existing.isEmpty || existing == "Speak, then release to paste" || existing == Self.lockHint {
             setTranscript("Polishing…", color: NSColor(white: 1.0, alpha: 0.70), caret: false)
         } else {
             setTranscript(existing, color: NSColor(white: 1.0, alpha: 0.70), caret: false)
@@ -728,6 +880,7 @@ final class FloatingHUD: NSObject {
 
     func showSuccess(text: String) {
         hideWorkItem?.cancel()
+        clearLockRing()
         notchGlowView.state = .success
         orbIcon.state = .success
         notchGlowView.emitSuccessRipple()
@@ -747,6 +900,7 @@ final class FloatingHUD: NSObject {
 
     func showError(message: String) {
         hideWorkItem?.cancel()
+        clearLockRing()
         notchGlowView.state = .error
         orbIcon.state = .error
 
@@ -764,6 +918,7 @@ final class FloatingHUD: NSObject {
 
     func hide() {
         shownTarget = false
+        clearLockRing()
         // Exits are brisker than entrances: stiffer spring, critically damped, retracing the
         // entrance mapping in reverse (each style exits the way it arrived).
         presence.stiffness = 700

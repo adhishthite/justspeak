@@ -12,16 +12,17 @@
 
 **JustSpeak** is an ultra-fast, native macOS voice dictation tool engineered for zero-friction productivity. 
 
-Hold down your global push-to-talk key (default: **Right Option ⌥**), speak naturally in English, Marathi, Hindi, or mixed code-switched speech, and release. JustSpeak streams 16kHz Linear PCM audio in real time directly to **Google Gemini 3.5 Transcribe Live** (`gemini-3.5-transcribe-live`) over bidirectional WebSockets, removes filler words (*um, uh, like*), normalizes numbers and dates, and injects polished text instantly into your active window via synthesized paste (`Cmd+V`) in **< 500ms**.
+Hold down your global push-to-talk key (default: **fn 🌐**), speak naturally in English, Marathi, Hindi, or mixed code-switched speech, and release. JustSpeak streams 16kHz Linear PCM audio in real time directly to **Google Gemini 3.5 Transcribe Live** (`gemini-3.5-transcribe-live`) over bidirectional WebSockets, removes filler words (*um, uh, like*), normalizes numbers and dates, and injects polished text instantly into your active window via synthesized paste (`Cmd+V`) in **< 500ms**.
 
 ```
-Hold [⌥ Right] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemini Live STT ──► 📋 Cmd+V Paste (<500ms)
+Hold [fn 🌐] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemini Live STT ──► 📋 Cmd+V Paste (<500ms)
 ```
 
 ---
 
 ## ✨ Key Features
 
+- **Hold to Lock**: For long dictations, keep holding — a ring traces the pill's rim and closes after `HOLD_TO_LOCK` seconds (default 8). The pill shows a padlock with *Release the key. Press again to finish.*: let go, keep talking, press the hotkey once more to paste. `LOCK_LIMIT` (default 120s) finishes a locked turn on its own so a forgotten mic never stays open.
 - **Sub-500ms End-to-End Latency**: Audio chunks are streamed over persistent WebSockets while you speak, so Gemini receives and transcribes speech before you even release the hotkey.
 - **Zero Clipping at Either End**: A 400ms always-on pre-roll ring buffer captures the syllable spoken *before* key-down, and an adaptive post-roll keeps streaming after release while speech energy persists (250ms continuous-quiet window, 1.5s hard cap) — releasing the key mid-syllable never clips the last word.
 - **Apple HIG & Dynamic Island UI**:
@@ -63,7 +64,7 @@ sequenceDiagram
     participant ActiveApp as Active Window (NSPasteboard + CGEvent)
 
     Note over Mic,GeminiWS: Pre-warmed background connection (<0ms wake-up)
-    User->>Hotkey: Key Down (Hold Right Option ⌥)
+    User->>Hotkey: Key Down (Hold fn 🌐)
     Hotkey->>Mic: Open Audio Gate (Start Recording)
     Hotkey->>HUD: Show Listening Pill + Notch Bezel Aura
     loop Every 150ms while speaking
@@ -147,8 +148,10 @@ All settings can be configured in `.env` or set as environment variables:
 | `LANGUAGE_CODES` | `en-IN,mr-IN` | Region-qualified BCP-47 codes from the live-transcribe language table (e.g. `en-IN,mr-IN`, `en-US`, or `auto` for unrestricted) |
 | `CUSTOM_VOCABULARY` | *(empty)* | Comma-separated list of words/phrases to boost |
 | `CUSTOM_VOCABULARY_FILE` | `vocabulary.txt` | File containing one word/phrase per line (`#` comments allowed) |
-| `HOTKEY` | `right_option` | Trigger key (`right_option`, `left_option`, `right_control`, `left_control`, `right_cmd`, `left_cmd`, `fn`, `f13`–`f20`, or a raw numeric keyCode) |
+| `HOTKEY` | `fn` | Trigger key (`fn`, `right_option`, `left_option`, `right_control`, `left_control`, `right_cmd`, `left_cmd`, `f13`–`f20`, or a raw numeric keyCode) |
 | `HOTKEY_MODE` | `push_to_talk` | `push_to_talk` (hold to speak) or `toggle` (press to start, press to stop) |
+| `HOLD_TO_LOCK` | `8` | Seconds of holding after which the turn locks (rim ring closes, padlock shows): release freely, press the hotkey again to finish. `0` disables; ignored in `toggle` mode (0-60) |
+| `LOCK_LIMIT` | `120` | Seconds a locked turn may run before it finishes on its own (0-600, `0` = no limit) |
 | `SOUND_FEEDBACK` | `true` | Subtle Apple system earcons on start / commit |
 | `RELEASE_SOUND` | `true` | Soft tick at key release acknowledging the hold ended while the transcript settles (needs `SOUND_FEEDBACK`) |
 | `SHOW_HUD` | `true` | Native floating Dynamic Island capsule + notch light spill |
@@ -280,13 +283,13 @@ JustSpeak supports over 80 languages with native code-switching support:
 
 | Key Alias | Target Hardware Key | macOS KeyCode |
 | :--- | :--- | :--- |
-| `right_option` | **Right Option / Alt (⌥ Right)** *(Default)* | `61` |
+| `fn` | **Function / Globe Key (🌐)** *(Default)* | `63` |
+| `right_option` | Right Option / Alt (⌥ Right) | `61` |
 | `left_option` | Left Option / Alt (⌥ Left) | `58` |
 | `right_control` | Right Control (⌃ Right) | `62` |
 | `left_control` | Left Control (⌃ Left) | `59` |
 | `right_cmd` | Right Command (⌘ Right) | `54` |
 | `left_cmd` | Left Command (⌘ Left) | `55` |
-| `fn` | Function / Globe Key (🌐) | `63` |
 | `f13` … `f20` | F13–F20 Keys | `0x69`, `0x6B`, `0x71`, `0x6A`, `0x40`, `0x4F`, `0x50`, `0x5A` |
 | *(any number)* | Raw macOS keyCode | *(as given)* |
 

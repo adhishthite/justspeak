@@ -63,6 +63,26 @@ final class SoundManager {
         return nil
     }()
 
+    // Hold-to-lock earcon: the release that follows is deliberately silent (a non-event),
+    // so this cue must carry "you can let go" on its own. Distinct from end_record (release
+    // tick) and acknowledgment_sent (commit). Tink is a soft named fallback, kept quiet.
+    private static let lockSoundPaths = [
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/lock.caf",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/acknowledgment_received.caf",
+    ]
+
+    private static var lockSound: NSSound? = {
+        for path in lockSoundPaths {
+            if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
+                sound.volume = 0.35
+                return sound
+            }
+        }
+        let fallback = NSSound(named: "Tink")
+        fallback?.volume = 0.25
+        return fallback
+    }()
+
     private static var errorSound: NSSound? = {
         for path in errorSoundPaths {
             if FileManager.default.fileExists(atPath: path), let sound = NSSound(contentsOfFile: path, byReference: true) {
@@ -89,6 +109,14 @@ final class SoundManager {
             releaseSound?.volume = min(1.0, 0.35 * volumeScale)
             releaseSound?.stop()
             releaseSound?.play()
+        }
+    }
+
+    static func playLockSound(volumeScale: Float = 1.0) {
+        DispatchQueue.global(qos: .userInteractive).async {
+            lockSound?.volume = min(1.0, 0.35 * volumeScale)
+            lockSound?.stop()
+            lockSound?.play()
         }
     }
 

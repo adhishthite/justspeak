@@ -69,10 +69,14 @@ final class HudDemo {
         }
     }
 
-    // Feeds a synthetic speech envelope + progressive transcript for ~4.5s of "listening".
+    // Feeds a synthetic speech envelope + progressive transcript for ~4.5s of "listening";
+    // the hold-to-lock ring closes at 2.5s so the lock beat previews without an 8s hold.
     private func runListeningTurn(text: String) {
-        hud.showListening()
+        hud.showListening(lockAfter: 2.5)
         startLevelTimer()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.hud.showLocked()
+        }
 
         let words = text.split(separator: " ").map(String.init)
         var revealed = ""
