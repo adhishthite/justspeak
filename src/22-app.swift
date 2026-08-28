@@ -1067,6 +1067,7 @@ final class JustSpeakApp {
 
             Live WS Model:     \(ANSI.bold)\(config.geminiLiveModel)\(ANSI.reset)
             REST Fallback:     \(ANSI.bold)\(config.geminiModel)\(ANSI.reset)
+            Build:             \(config.buildId.isEmpty ? "\(ANSI.gray)unknown\(ANSI.reset)" : "\(ANSI.bold)\(config.buildId)\(ANSI.reset)")
             Language Support:  \(langDisplay)
             Configured Hotkey: \(ANSI.bold)\(config.hotkey)\(ANSI.reset) (\(config.hotkeyMode))
             Live WebSockets:   \(config.enableLiveWebSocket ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.yellow)Disabled (REST Only)\(ANSI.reset)")

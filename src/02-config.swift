@@ -91,6 +91,9 @@ struct Config {
     // so usage/latency/cost can be analyzed later. Plaintext on disk; disable with HISTORY=false.
     var historyEnabled: Bool = true
     var historyDbPath: String = ""  // empty = ~/.justspeak/history.db
+    // Git commit id (short SHA, or "-dirty" suffixed) stamped by the `justspeak` runner via
+    // JUSTSPEAK_BUILD — not a .env knob, so it's read only from the process environment below.
+    var buildId: String = ""
     // Analyzer-only knobs (--analyze / make analyze). Analysis is rare and offline, so it
     // can afford a stronger model than the REST fallback; empty falls back to GEMINI_MODEL.
     var analyzeModel: String = "gemini-3.7-flash"
@@ -318,6 +321,7 @@ struct Config {
         if let p = env["REST_INPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.restInputPricePer1M = v }
         if let p = env["REST_OUTPUT_PRICE_PER_1M"], let v = Double(p), v >= 0 { config.restOutputPricePer1M = v }
         if let log = env["LOG_LEVEL"] { config.logLevel = log.lowercased() }
+        config.buildId = (env["JUSTSPEAK_BUILD"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let raw = rawLanguages {
             let parsedLangs = raw.components(separatedBy: ",")

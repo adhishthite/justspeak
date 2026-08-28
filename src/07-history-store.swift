@@ -51,10 +51,12 @@ final class TranscriptionHistoryStore {
     private static let isoFormatter = ISO8601DateFormatter()
 
     // A/B knob values, constant per process, stamped onto every row so experiment eras are
-    // separable by config rather than by timestamp archaeology.
+    // separable by config rather than by timestamp archaeology; buildId adds the git commit
+    // for slicing bug reports by exactly which code produced a row.
     private let endpointAligned: Bool
     private let chunkMs: Int
     private let silenceFlushMs: Int
+    private let buildId: String?
 
     var path: String { dbPath }
 
@@ -64,6 +66,7 @@ final class TranscriptionHistoryStore {
         self.endpointAligned = config.wsEndpointAligned
         self.chunkMs = config.chunkMs
         self.silenceFlushMs = config.silenceFlushMs
+        self.buildId = config.buildId.isEmpty ? nil : config.buildId
     }
 
     // Called on-queue from record(). No-ops once already open or once opening has failed.
@@ -133,7 +136,8 @@ final class TranscriptionHistoryStore {
               settle_path TEXT,
               endpoint_aligned INTEGER,
               chunk_ms INTEGER,
-              silence_flush_ms INTEGER
+              silence_flush_ms INTEGER,
+              build_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_transcriptions_ts ON transcriptions(ts_epoch);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id);
@@ -145,7 +149,8 @@ final class TranscriptionHistoryStore {
               wrong_text TEXT NOT NULL,
               right_text TEXT NOT NULL,
               app_name TEXT,
-              source TEXT NOT NULL DEFAULT 'ax_readback'
+              source TEXT NOT NULL DEFAULT 'ax_readback',
+              build_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_corrections_ts ON corrections(ts_epoch);
             """
@@ -168,6 +173,8 @@ final class TranscriptionHistoryStore {
             "ALTER TABLE transcriptions ADD COLUMN endpoint_aligned INTEGER",
             "ALTER TABLE transcriptions ADD COLUMN chunk_ms INTEGER",
             "ALTER TABLE transcriptions ADD COLUMN silence_flush_ms INTEGER",
+            "ALTER TABLE transcriptions ADD COLUMN build_id TEXT",
+            "ALTER TABLE corrections ADD COLUMN build_id TEXT",
         ] {
             sqlite3_exec(opened, migration, nil, nil, nil)
         }
@@ -220,8 +227,9 @@ final class TranscriptionHistoryStore {
                   first_token_ms, roundtrip_ms, capture_finalize_ms, inject_ms, total_ms,
                   injected, input_tokens, output_tokens, tokens_metered, cost_usd,
                   language_codes, smart_mode, vad_mode, error, app_bundle_id, app_name,
-                  peak_db, speech_frames, settle_path, endpoint_aligned, chunk_ms, silence_flush_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  peak_db, speech_frames, settle_path, endpoint_aligned, chunk_ms, silence_flush_ms,
+                  build_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
             var stmt: OpaquePointer?
@@ -267,6 +275,7 @@ final class TranscriptionHistoryStore {
             self.bindBool(stmt, 32, self.endpointAligned)
             self.bindInt(stmt, 33, self.chunkMs)
             self.bindInt(stmt, 34, self.silenceFlushMs)
+            self.bindText(stmt, 35, self.buildId)
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 self.failed = true
@@ -285,8 +294,8 @@ final class TranscriptionHistoryStore {
             guard !self.failed, let db = self.db else { return }
 
             let sql = """
-                INSERT INTO corrections (ts_utc, ts_epoch, session_id, wrong_text, right_text, app_name, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO corrections (ts_utc, ts_epoch, session_id, wrong_text, right_text, app_name, source, build_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -302,6 +311,7 @@ final class TranscriptionHistoryStore {
             self.bindText(stmt, 5, right)
             self.bindText(stmt, 6, appName.isEmpty ? nil : appName)
             self.bindText(stmt, 7, "ax_readback")
+            self.bindText(stmt, 8, self.buildId)
             if sqlite3_step(stmt) != SQLITE_DONE {
                 Logger.warn("HISTORY", "Failed to insert correction row: \(String(cString: sqlite3_errmsg(db)))")
             }
