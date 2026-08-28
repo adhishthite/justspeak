@@ -90,6 +90,8 @@ final class FloatingHUD: NSObject {
 
     private var notchInfo: NotchGeometry
     private var screenFrame: NSRect
+    // Display the HUD is laid out on; nil = wherever NSScreen.main says. Main-thread-only.
+    private var currentDisplayID: CGDirectDisplayID?
 
     // Presence 0→1 drives travel, alpha and shadow; width is in points. Main-thread-only,
     // like every other HUD member. Exit retunes presence stiffer (700) for a brisk retreat;
@@ -280,8 +282,33 @@ final class FloatingHUD: NSObject {
 
     // Recomputes screenFrame, notchInfo, and repositions the panels - the same geometry
     // math used to place them in init().
+    // Re-anchors both panels on `screen` if it differs from the current one. Called at
+    // key-down before showListening; a change mid-exit (quick re-press after moving to the
+    // other display) relayouts while the pill is near-collapsed, so no visible jump.
+    func retarget(to screen: NSScreen) {
+        let id = FocusScreenResolver.displayID(of: screen)
+        guard id != currentDisplayID else { return }
+        currentDisplayID = id
+        applyScreenLayout()
+        if #available(macOS 10.15, *) {
+            Logger.info("HUD", "Following focus to \(screen.localizedName)\(notchInfo.hasPhysicalNotch ? " (notch)" : " (pill)").")
+        }
+    }
+
+    // The display picked by retarget while it's still attached; the display-config
+    // notification drops back to NSScreen.main when it has been unplugged.
+    private func layoutScreen() -> NSScreen {
+        if let id = currentDisplayID,
+            let s = NSScreen.screens.first(where: { FocusScreenResolver.displayID(of: $0) == id })
+        {
+            return s
+        }
+        currentDisplayID = nil
+        return NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
+    }
+
     private func applyScreenLayout() {
-        let screen = NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
+        let screen = layoutScreen()
         self.screenFrame = screen.frame
         self.notchInfo = NotchGeometry.detect(screen: screen)
 

@@ -34,10 +34,28 @@ struct Diagnostics {
         _ = semaphore.wait(timeout: .now() + 10.0)
     }
 
+    static func listInputDevices() {
+        let devices = InputDeviceCatalog.inputDevices()
+        print("\n\(ANSI.bold)Input devices\(ANSI.reset) (INPUT_DEVICE accepts the UID or any part of the name)\n")
+        if devices.isEmpty {
+            print("  \(ANSI.yellow)No capture-capable devices reported by CoreAudio.\(ANSI.reset)")
+        }
+        for d in devices {
+            let marker = d.isDefault ? "\(ANSI.green)*\(ANSI.reset)" : " "
+            print("  \(marker) \(ANSI.bold)\(d.name)\(ANSI.reset)  \(ANSI.gray)[\(d.transport)]  uid=\(d.uid)\(ANSI.reset)")
+        }
+        let lid = InputDeviceCatalog.lidClosed().map { $0 ? "closed" : "open" } ?? "n/a (no clamshell)"
+        print("\n  \(ANSI.green)*\(ANSI.reset) = current system default input   lid: \(lid)")
+        if let auto = InputDeviceCatalog.autoSelection(in: devices, lidClosed: InputDeviceCatalog.lidClosed() ?? false) {
+            print("  INPUT_DEVICE=auto would pick: \(ANSI.bold)\(auto.name)\(ANSI.reset)")
+        }
+        print("")
+    }
+
     static func runAudioTest(config: Config) {
         print("\n\(ANSI.bold)Testing 3-Second Microphone Capture & Transcription... Speak into your mic now!\(ANSI.reset)")
 
-        let engine = AudioCaptureEngine()
+        let engine = AudioCaptureEngine(inputDevice: config.inputDevice)
         guard engine.setup() else {
             Logger.error("TEST", "Failed to start AudioCaptureEngine.")
             return
