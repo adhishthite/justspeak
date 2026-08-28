@@ -295,8 +295,10 @@ final class FloatingHUD: NSObject {
         } else {
             // No hardware notch: the halo wraps the pill. The panel is sized to the pill's
             // MAXIMUM footprint so width changes never need a panel reframe. Margin must
-            // exceed the halo's worst-case spread (~44px) or the fade gets a hard cutoff.
-            let margin: CGFloat = 64.0
+            // exceed the halo's worst-case reach (the flank spread pass in drawPillAura:
+            // ~16 dilation + 8 drop + 7 half-stroke + 44 blur = ~75px) or the fade gets a
+            // hard cutoff.
+            let margin: CGFloat = 88.0
             let auraWidth = HUDMetrics.maxPillWidth + margin * 2
             let auraHeight = HUDMetrics.pillHeight + margin * 2
             let auraX = screenFrame.midX - auraWidth / 2.0

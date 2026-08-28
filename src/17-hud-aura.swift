@@ -249,19 +249,7 @@ final class AppleNotchAuraView: NSView {
             passes.append((3.0, 0.30 + 0.25 * energy))
         }
         for pass in passes {
-            context.saveGState()
-            context.setShadow(
-                offset: CGSize(width: shift, height: 0),
-                blur: pass.blur,
-                color: tint.withAlphaComponent(pass.alpha).cgColor
-            )
-            context.addPath(source)
-            context.setStrokeColor(tint.cgColor)
-            context.setLineWidth(width)
-            context.setLineCap(.round)
-            context.setLineJoin(.round)
-            context.strokePath()
-            context.restoreGState()
+            blurredStroke(context: context, source: source, shift: shift, width: width, blur: pass.blur, tint: tint, alpha: pass.alpha)
         }
 
         // The rim stays faint and thin - the halo carries the light; the line only
@@ -274,6 +262,24 @@ final class AppleNotchAuraView: NSView {
         context.addPath(rimPath)
         context.setStrokeColor(tint.withAlphaComponent(rimAlpha).cgColor)
         context.setLineWidth(lineWidth)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    private func blurredStroke(
+        context: CGContext, source: CGPath, shift: CGFloat, width: CGFloat, blur: CGFloat, tint: NSColor, alpha: CGFloat
+    ) {
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: shift, height: 0),
+            blur: blur,
+            color: tint.withAlphaComponent(alpha).cgColor
+        )
+        context.addPath(source)
+        context.setStrokeColor(tint.cgColor)
+        context.setLineWidth(width)
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.strokePath()
@@ -303,6 +309,22 @@ final class AppleNotchAuraView: NSView {
         let rimRadius = h / 2.0 + 0.5
         let rim = CGPath(roundedRect: rimRect, cornerWidth: rimRadius, cornerHeight: rimRadius, transform: nil)
         strokeHalo(context: context, path: capsule, tint: tint, energy: energy, rim: rim, rimWidth: 1.0)
+
+        // Flank-and-underside spread: a wider, softer pass on a capsule dilated sideways
+        // and dropped a few points, so the light pools out to the sides and beneath the
+        // pill while the top edge keeps the tighter halo. Worst-case reach (dilation +
+        // drop + stroke half-width + blur) must stay under the aura panel margin in 21-hud.
+        let spread = 10.0 + 6.0 * energy
+        let drop: CGFloat = 8.0
+        let shift = bounds.width * 2.0
+        var spreadTransform = CGAffineTransform(translationX: -shift, y: -drop)
+        let spreadRect = rect.insetBy(dx: -spread, dy: -spread * 0.4)
+        let spreadRadius = spreadRect.height / 2.0
+        let spreadPath = CGPath(
+            roundedRect: spreadRect, cornerWidth: spreadRadius, cornerHeight: spreadRadius, transform: &spreadTransform)
+        blurredStroke(
+            context: context, source: spreadPath, shift: shift, width: 8.0 + 6.0 * energy,
+            blur: 30.0 + 14.0 * energy, tint: tint, alpha: 0.28 + 0.22 * energy)
         context.restoreGState()
     }
 
