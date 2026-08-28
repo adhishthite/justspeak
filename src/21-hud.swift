@@ -305,6 +305,14 @@ final class FloatingHUD: NSObject {
             notchGlowView.frame = NSRect(x: 0, y: 0, width: auraWidth, height: auraHeight)
             notchGlowView.pillMode = true
         }
+        // The aura's capsule is a circular CGPath; a continuous-curve clip on the pill
+        // diverges from it along the end caps and the rim visibly parts from the edge.
+        // Match geometries in pill mode; the notch keeps Apple's continuous corners.
+        if #available(macOS 10.15, *) {
+            let curve: CALayerCornerCurve = notchInfo.hasPhysicalNotch ? .continuous : .circular
+            pillClip.layer?.cornerCurve = curve
+            backplateView.layer?.cornerCurve = curve
+        }
         notchGlowView.needsDisplay = true
         applyFrame()
     }

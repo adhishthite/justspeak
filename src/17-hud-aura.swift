@@ -225,17 +225,29 @@ final class AppleNotchAuraView: NSView {
     // adapted to Core Graphics: CG cannot blur a stroke directly, so each blurred copy
     // is drawn as a shadow - the source stroke lands two panel-widths off-canvas and
     // only its gaussian shadow shows in view. Wide halo, tight glow, thin rim on top.
-    private func strokeHalo(context: CGContext, path: CGPath, tint: NSColor, energy: CGFloat) {
+    //
+    // rim/rimWidth: the notch path is already dilated so a stroke centered on it lands
+    // fully on wallpaper; the pill capsule is not (the even-odd clip amputates the inner
+    // half of anything centered on it), so pill mode passes a hairline on a half-width-
+    // outset path plus a tight feather so the edge reads as light meeting glass, not a
+    // flat band.
+    private func strokeHalo(
+        context: CGContext, path: CGPath, tint: NSColor, energy: CGFloat,
+        rim: CGPath? = nil, rimWidth: CGFloat? = nil
+    ) {
         let shift = bounds.width * 2.0
         var offscreen = CGAffineTransform(translationX: -shift, y: 0)
         let source = path.copy(using: &offscreen) ?? path
         let width = 6.0 + 6.0 * energy
         let blur = 22.0 + 16.0 * energy
 
-        let passes: [(blur: CGFloat, alpha: CGFloat)] = [
+        var passes: [(blur: CGFloat, alpha: CGFloat)] = [
             (blur, 0.40 + 0.25 * energy),
             (blur * 0.5, 0.50 + 0.25 * energy),
         ]
+        if rim != nil {
+            passes.append((3.0, 0.30 + 0.25 * energy))
+        }
         for pass in passes {
             context.saveGState()
             context.setShadow(
@@ -253,11 +265,15 @@ final class AppleNotchAuraView: NSView {
         }
 
         // The rim stays faint and thin - the halo carries the light; the line only
-        // keeps the edge defined underneath it.
+        // keeps the edge defined underneath it. A hairline needs more alpha than a
+        // band to register at all.
+        let rimPath = rim ?? path
+        let lineWidth = rimWidth ?? width * 0.35
+        let rimAlpha: CGFloat = rim == nil ? 0.25 + 0.15 * energy : 0.55 + 0.30 * energy
         context.saveGState()
-        context.addPath(path)
-        context.setStrokeColor(tint.withAlphaComponent(0.25 + 0.15 * energy).cgColor)
-        context.setLineWidth(width * 0.35)
+        context.addPath(rimPath)
+        context.setStrokeColor(tint.withAlphaComponent(rimAlpha).cgColor)
+        context.setLineWidth(lineWidth)
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.strokePath()
@@ -281,7 +297,12 @@ final class AppleNotchAuraView: NSView {
         context.addPath(mask)
         context.clip(using: .evenOdd)
 
-        strokeHalo(context: context, path: capsule, tint: tint, energy: energy)
+        // Hairline centered 0.5pt outside the capsule: its full 1pt width survives the
+        // clip and sits flush against the pill's edge.
+        let rimRect = rect.insetBy(dx: -0.5, dy: -0.5)
+        let rimRadius = h / 2.0 + 0.5
+        let rim = CGPath(roundedRect: rimRect, cornerWidth: rimRadius, cornerHeight: rimRadius, transform: nil)
+        strokeHalo(context: context, path: capsule, tint: tint, energy: energy, rim: rim, rimWidth: 1.0)
         context.restoreGState()
     }
 
