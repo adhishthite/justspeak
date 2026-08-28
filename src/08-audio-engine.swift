@@ -54,6 +54,9 @@ final class AudioCaptureEngine {
     // history row. Never assume the system default - an external display's mic often is.
     private(set) var currentInput: InputDeviceCatalog.Device?
     private let preferredInputDevice: String
+    private var autoInput: Bool { preferredInputDevice.lowercased() == "auto" }
+    // Main-thread-only: a lid flip arrived mid-dictation; re-pin once the turn is over.
+    private var pendingReselect = false
 
     init(preRollMs: Int = 400, chunkMs: Int = 150, silenceFlushMs: Int = 700, inputDevice: String = "") {
         self.preferredInputDevice = inputDevice
@@ -95,6 +98,15 @@ final class AudioCaptureEngine {
         ) { [weak self] _ in
             self?.handleConfigurationChange()
         }
+        // A lid open/close with an external display attached always reshuffles the screen
+        // list; that's the trigger for INPUT_DEVICE=auto (the HAL itself often stays quiet).
+        if autoInput {
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                self?.reselectForLidState()
+            }
+        }
 
         do {
             audioEngine.prepare()
@@ -130,16 +142,51 @@ final class AudioCaptureEngine {
     // new input device's format, then restarts the engine only if it was meant to be running
     // (an idle-suspended mic stays suspended; the next key-down re-arms it as usual).
     private func handleConfigurationChange() {
+        // The engine has already stopped itself; a pinned INPUT_DEVICE must survive the
+        // default-input flip that usually triggers this (if the pinned device vanished, the
+        // HAL has already fallen back).
+        rebuildInput(wasRunning: isEngineRunning, reason: "Input device changed")
+    }
+
+    // INPUT_DEVICE=auto, main-thread-only. No-op unless the lid state now wants a different
+    // device than the unit is on; deferred to the end of the turn while recording (the
+    // rebuild would drop the buffers mid-dictation).
+    func reselectForLidState() {
+        guard autoInput else { return }
+        let devices = InputDeviceCatalog.inputDevices()
+        guard let target = targetInput(in: devices), let unit = audioEngine.inputNode.audioUnit,
+            activeDevice(of: unit) != target.id
+        else { return }
+
+        lock.lock()
+        let recording = isRecording
+        lock.unlock()
+        if recording {
+            pendingReselect = true
+            return
+        }
+        pendingReselect = false
         let wasRunning = isEngineRunning
+        if wasRunning { audioEngine.stop() }
+        rebuildInput(wasRunning: wasRunning, reason: "Lid \(InputDeviceCatalog.lidClosed() == true ? "closed" : "open")")
+    }
+
+    // Main-thread-only, called after each turn settles.
+    func applyPendingReselect() {
+        guard pendingReselect else { return }
+        reselectForLidState()
+    }
+
+    // Engine must already be stopped (or never started). Pins/records the input device,
+    // rebuilds the tap and converter around its format, restarts only if it was running.
+    private func rebuildInput(wasRunning: Bool, reason: String) {
         let inputNode = audioEngine.inputNode
         inputNode.removeTap(onBus: 0)
-        // A pinned INPUT_DEVICE must survive the default-input flip that usually triggers
-        // this; if it was the pinned device that vanished, the HAL has already fallen back.
         applyInputDeviceSelection()
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
         guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            Logger.error("MIC", "Input device changed but converter rebuild failed (\(inputFormat)) - dictation disabled until restart.")
+            Logger.error("MIC", "\(reason) but converter rebuild failed (\(inputFormat)) - dictation disabled until restart.")
             isEngineRunning = false
             return
         }
@@ -162,14 +209,21 @@ final class AudioCaptureEngine {
             do {
                 try audioEngine.start()
                 isEngineRunning = true
-                Logger.info("MIC", "Input device changed - engine rebuilt on \(currentInputLabel) (\(Int(inputFormat.sampleRate)) Hz, \(inputFormat.channelCount) ch).")
+                Logger.info("MIC", "\(reason) - engine rebuilt on \(currentInputLabel) (\(Int(inputFormat.sampleRate)) Hz, \(inputFormat.channelCount) ch).")
             } catch {
                 isEngineRunning = false
-                Logger.error("MIC", "Input device changed and engine restart failed: \(error.localizedDescription) - next key-down will retry.")
+                Logger.error("MIC", "\(reason) and engine restart failed: \(error.localizedDescription) - next key-down will retry.")
             }
         } else {
-            Logger.info("MIC", "Input device changed while mic idle - tap rebuilt for \(currentInputLabel).")
+            Logger.info("MIC", "\(reason) while mic idle - tap rebuilt for \(currentInputLabel).")
         }
+    }
+
+    private func targetInput(in devices: [InputDeviceCatalog.Device]) -> InputDeviceCatalog.Device? {
+        if autoInput {
+            return InputDeviceCatalog.autoSelection(in: devices, lidClosed: InputDeviceCatalog.lidClosed() ?? false)
+        }
+        return InputDeviceCatalog.match(preferredInputDevice, in: devices)
     }
 
     var currentInputLabel: String {
@@ -185,7 +239,7 @@ final class AudioCaptureEngine {
         let unit = audioEngine.inputNode.audioUnit
 
         if !preferredInputDevice.isEmpty {
-            if let match = InputDeviceCatalog.match(preferredInputDevice, in: devices) {
+            if let match = targetInput(in: devices) {
                 // Skip the write when already on the device: on a configuration change the
                 // unit is initialized and the property write would fail, but the pin holds.
                 if let unit = unit, activeDevice(of: unit) != match.id {
@@ -197,7 +251,7 @@ final class AudioCaptureEngine {
                         Logger.warn("MIC", "Could not pin input to \(match.label) (OSStatus \(status)) - using whatever the engine has.")
                     }
                 }
-            } else {
+            } else if !autoInput {
                 let available = devices.map { $0.name }.joined(separator: ", ")
                 Logger.warn("MIC", "INPUT_DEVICE \"\(preferredInputDevice)\" matched no input device - using the system default. Available: \(available)")
             }

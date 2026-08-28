@@ -44,7 +44,12 @@ struct Diagnostics {
             let marker = d.isDefault ? "\(ANSI.green)*\(ANSI.reset)" : " "
             print("  \(marker) \(ANSI.bold)\(d.name)\(ANSI.reset)  \(ANSI.gray)[\(d.transport)]  uid=\(d.uid)\(ANSI.reset)")
         }
-        print("\n  \(ANSI.green)*\(ANSI.reset) = current system default input\n")
+        let lid = InputDeviceCatalog.lidClosed().map { $0 ? "closed" : "open" } ?? "n/a (no clamshell)"
+        print("\n  \(ANSI.green)*\(ANSI.reset) = current system default input   lid: \(lid)")
+        if let auto = InputDeviceCatalog.autoSelection(in: devices, lidClosed: InputDeviceCatalog.lidClosed() ?? false) {
+            print("  INPUT_DEVICE=auto would pick: \(ANSI.bold)\(auto.name)\(ANSI.reset)")
+        }
+        print("")
     }
 
     static func runAudioTest(config: Config) {

@@ -81,6 +81,8 @@ final class JustSpeakApp {
     /// Main-thread-only. Schedules the mic to be released after the configured idle window so
     /// the macOS mic indicator turns off between dictation sessions; 0 disables the timeout.
     private func scheduleMicIdleRelease() {
+        // Every turn ends here on main - the spot to apply a lid flip that arrived mid-turn.
+        audioCapture.applyPendingReselect()
         micIdleWorkItem?.cancel()
         micIdleWorkItem = nil
         guard config.micIdleTimeoutSec > 0 else { return }
@@ -1100,7 +1102,7 @@ final class JustSpeakApp {
             Custom Vocabulary: \(config.customVocabulary.isEmpty ? "\(ANSI.gray)None configured\(ANSI.reset)" : "\(ANSI.green)\(config.customVocabulary.count) terms active\(ANSI.reset) \(ANSI.gray)(\(config.customVocabulary.prefix(3).joined(separator: ", "))\(config.customVocabulary.count > 3 ? ", ..." : ""))\(ANSI.reset)")\(config.replacementRules.isEmpty ? "" : " \(ANSI.gray)(+ \(config.replacementRules.count) replacement rules)\(ANSI.reset)")
             Sound Feedback:    \(config.soundFeedback ? "\(ANSI.green)Enabled\(ANSI.reset)" : "\(ANSI.gray)Disabled\(ANSI.reset)")
             Floating HUD:      \(config.showHUD ? "\(ANSI.green)Enabled (Dynamic Island Pill)\(ANSI.reset)\(config.hudFollowFocus ? " \(ANSI.gray)(follows the focused window's display)\(ANSI.reset)" : "")" : "\(ANSI.gray)Disabled\(ANSI.reset)")
-            Input Device:      \(config.inputDevice.isEmpty ? "\(ANSI.gray)System default\(ANSI.reset)" : "\(ANSI.green)\(config.inputDevice)\(ANSI.reset) \(ANSI.gray)(INPUT_DEVICE match)\(ANSI.reset)")
+            Input Device:      \(config.inputDevice.isEmpty ? "\(ANSI.gray)System default\(ANSI.reset)" : config.inputDevice.lowercased() == "auto" ? "\(ANSI.green)Auto\(ANSI.reset) \(ANSI.gray)(lid open: built-in, lid closed: external)\(ANSI.reset)" : "\(ANSI.green)\(config.inputDevice)\(ANSI.reset) \(ANSI.gray)(INPUT_DEVICE match)\(ANSI.reset)")
             Privacy Mode:      \(config.privacyMode ? "\(ANSI.yellow)On (HUD & terminal hide dictated text)\(ANSI.reset)" : "\(ANSI.gray)Off\(ANSI.reset)")
             """)
     }

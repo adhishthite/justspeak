@@ -156,7 +156,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `HUD_FOLLOW_FOCUS` | `true` | Show the HUD on the display holding the frontmost app's focused window (pointer as fallback); `false` pins it to the menu-bar/notch display |
 | `HUD_PARTICLES` | `true` | Ambient light-dust drifting down from the notch while listening, breathing with your voice (off under Reduce Motion) |
 | `PRIVACY_MODE` | `false` | Screen-share privacy: the pill is hidden entirely — the notch aura and earcons carry all feedback — and the terminal prints only a char count. Paste unaffected; history DB still records locally |
-| `INPUT_DEVICE` | *(empty)* | Microphone to capture from: CoreAudio UID or case-insensitive name substring (`studio`); empty = system default. `make list-inputs` shows candidates; the active device is logged at startup and stored per row (`input_device`, `input_transport`) |
+| `INPUT_DEVICE` | *(empty)* | Microphone to capture from: `auto` (built-in while the lid is open, external while closed), a CoreAudio UID, or a case-insensitive name substring (`studio`); empty = system default. `make list-inputs` shows candidates; the active device is logged at startup and stored per row (`input_device`, `input_transport`) |
 | `DUCK_AUDIO` | `false` | Duck the system output volume while recording so speaker audio doesn't bleed into the mic (restored afterwards; a mid-turn manual volume change wins) |
 | `DUCK_FRACTION` | `0.2` | Fraction of the current output volume kept while ducked (0.0-1.0) |
 | `ENABLE_LIVE_WEBSOCKET` | `true` | Stream audio chunks via Live WebSockets (`true`) or REST only (`false`) |

@@ -50,9 +50,10 @@ struct Config {
     var enableLiveWebSocket: Bool = true
     var restFallbackTimeout: Double = 4.0
     var preRollMs: Int = 400
-    // Capture device: empty = system default input. Otherwise an exact CoreAudio UID or a
-    // case-insensitive name substring ("studio" -> "Studio Display Microphone"); see
-    // --list-inputs. Unmatched falls back to the default with a warning.
+    // Capture device: empty = system default input; "auto" = built-in mic while the lid is
+    // open, an external one while closed (re-evaluated on lid flips); otherwise an exact
+    // CoreAudio UID or a case-insensitive name substring ("studio" -> "Studio Display
+    // Microphone"); see --list-inputs. Unmatched falls back to the default with a warning.
     var inputDevice: String = ""
     // 250ms default: people release the key while the last word is still leaving their mouth;
     // audio keeps streaming during the grace period, so the only cost is commit latency.
