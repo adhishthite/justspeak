@@ -33,7 +33,7 @@ final class HotkeyManager {
                 if let code = UInt16(string) {
                     return .custom(CGKeyCode(code))
                 }
-                return .rightOption
+                return .fn
             }
         }
 

@@ -20,6 +20,19 @@ final class JustSpeakApp {
     // turn's buffer - re-billing the API and re-pasting a stale transcript.
     private var captureActive: Bool = false
 
+    // Main-thread-only hold-to-lock state. turnLocked: the hold outlasted HOLD_TO_LOCK, so
+    // the physical release is a non-event and the NEXT key-down finishes the turn.
+    // lockWorkItem fires the lock; lockLimitWorkItem finishes a locked turn nobody came back
+    // for. Any key-up that really finishes the turn cancels both, and the lock item re-checks
+    // captureActive so a release a few ms before it fires can never lock a turn that ended.
+    private var turnLocked: Bool = false
+    private var lockWorkItem: DispatchWorkItem?
+    private var lockLimitWorkItem: DispatchWorkItem?
+    // How the current turn's hold ended (finish_mode in history): written on main in
+    // handleKeyUp before the pipeline is dispatched, read on sessionQueue like the
+    // turnFrontmost* fields.
+    private var turnFinishMode: String?
+
     // sessionQueue-only: consecutive turns that ended with no speech detected. Three in a row
     // is the signature of a dead input (mic permission revoked, wrong device) - worth a hint.
     private var consecutiveNoSpeechTurns = 0
@@ -280,6 +293,9 @@ final class JustSpeakApp {
         self.hotkeyManager = hotkey
 
         Logger.success("READY", "JustSpeak active! Hold \(ANSI.bold)\(binding.name)\(ANSI.reset) to speak, release to paste.")
+        if let lockAfter = holdToLockInterval {
+            Logger.info("LOCK", "Hold-to-lock: keep holding \(String(format: "%g", lockAfter))s and the turn locks - release freely, press the key again to finish.")
+        }
         print("\(ANSI.gray)Press Ctrl+C to quit at any time.\(ANSI.reset)\n")
 
         // Run AppKit RunLoop with Accessory activation policy (no Dock icon, full window support)
@@ -288,7 +304,22 @@ final class JustSpeakApp {
         app.run()
     }
 
+    // Hold length that locks a turn, or nil when the feature is off. Toggle mode already
+    // maps press/press to start/stop, so a lock would only swallow its own stop press.
+    private var holdToLockInterval: TimeInterval? {
+        guard config.holdToLockSec > 0, config.hotkeyMode != "toggle" else { return nil }
+        return config.holdToLockSec
+    }
+
     private func handleKeyDown() {
+        // A press while locked is the finish gesture, standing in for the release that was
+        // ignored. The physical key-up that follows finds captureActive false and is dropped.
+        if turnLocked {
+            turnLocked = false
+            handleKeyUp(finish: "lock_press")
+            return
+        }
+
         processingLock.lock()
         // Protect re-entrancy / double-tap race
         guard !isProcessing else {
@@ -351,12 +382,13 @@ final class JustSpeakApp {
         // startRecording below has already opened the capture, off the key-down critical path.
         let followFocus = config.hudFollowFocus
         let focusPID = turnFrontmostPID
+        let lockAfter = holdToLockInterval
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let hud = self.hud else { return }
             if followFocus, let screen = FocusScreenResolver.resolve(frontmostPID: focusPID) {
                 hud.retarget(to: screen)
             }
-            hud.showListening()
+            hud.showListening(lockAfter: lockAfter)
         }
 
         // A new capture invalidates any pending post-paste read-back: the upcoming paste
@@ -366,6 +398,7 @@ final class JustSpeakApp {
         captureActive = true
         liveClient?.startNewTurn()
         audioCapture.startRecording()
+        armHoldToLock()
 
         // Duck AFTER the begin earcon has played, not with it - Talkify's ordering. The
         // 350ms delay covers the cue; captureActive gates the item so it can't fire after
@@ -381,7 +414,7 @@ final class JustSpeakApp {
         }
     }
 
-    private func handleKeyUp() {
+    private func handleKeyUp(finish: String = "release") {
         // Capture the physical release instant before anything else - this becomes the true
         // start of "Total Key-Up -> Paste" latency measurement.
         let keyUpTime = CFAbsoluteTimeGetCurrent()
@@ -389,7 +422,14 @@ final class JustSpeakApp {
         // A release whose press never started a capture (refused by a key-down gate) must
         // not run the pipeline - there is nothing to stop, only stale state to misread.
         guard captureActive else { return }
+        // Locked: letting go is the whole point. Nothing happens until the next press.
+        if turnLocked { return }
         captureActive = false
+        turnFinishMode = finish
+        lockWorkItem?.cancel()
+        lockWorkItem = nil
+        lockLimitWorkItem?.cancel()
+        lockLimitWorkItem = nil
 
         // Release acknowledged, before the settle race: on a slow REST fallback there are
         // otherwise seconds of silence between letting go and the commit earcon. While the
@@ -418,6 +458,46 @@ final class JustSpeakApp {
         sessionQueue.async { [weak self] in
             self?.runTurnPipeline(keyUpTime: keyUpTime)
         }
+    }
+
+    // Main thread. Scheduled at key-down; a normal release cancels it. Firing means the user
+    // is still holding HOLD_TO_LOCK seconds in: lock the turn so they can let go.
+    private func armHoldToLock() {
+        lockWorkItem?.cancel()
+        lockWorkItem = nil
+        guard let lockAfter = holdToLockInterval else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self, self.captureActive, !self.turnLocked else { return }
+            self.lockWorkItem = nil
+            self.turnLocked = true
+            Logger.info("LOCK", "Turn locked after \(String(format: "%g", lockAfter))s hold - release the key; press it again to finish.")
+            if self.config.soundFeedback {
+                let scale: Float =
+                    AudioDucker.shared.isDucked ? Float(1.0 / max(0.15, self.config.duckFraction)) : 1.0
+                SoundManager.playLockSound(volumeScale: scale)
+            }
+            self.hud?.showLocked()
+            self.scheduleLockLimit()
+        }
+        lockWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + lockAfter, execute: item)
+    }
+
+    // Main thread. A locked turn with nobody coming back to finish it is an open mic billing
+    // audio tokens; LOCK_LIMIT finishes it the way the next press would have.
+    private func scheduleLockLimit() {
+        lockLimitWorkItem?.cancel()
+        lockLimitWorkItem = nil
+        guard config.lockLimitSec > 0 else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self, self.turnLocked else { return }
+            self.lockLimitWorkItem = nil
+            Logger.warn("LOCK", "Locked turn reached LOCK_LIMIT (\(String(format: "%g", self.config.lockLimitSec))s) - finishing it now.")
+            self.turnLocked = false
+            self.handleKeyUp(finish: "lock_limit")
+        }
+        lockLimitWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + config.lockLimitSec, execute: item)
     }
 
     /// Runs entirely on sessionQueue: finalizes the capture, arbitrates the WS-vs-REST turn
@@ -499,7 +579,8 @@ final class JustSpeakApp {
                     inputDevice: turnInputDevice,
                     inputTransport: turnInputTransport,
                     peakDb: peakDb,
-                    speechFrames: speechFrames
+                    speechFrames: speechFrames,
+                    finishMode: turnFinishMode
                 ))
             processingLock.lock()
             isProcessing = false
@@ -786,7 +867,8 @@ final class JustSpeakApp {
                     inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
-                    settlePath: turnSettlePath
+                    settlePath: turnSettlePath,
+                    finishMode: turnFinishMode
                 ))
             processingLock.lock()
             isProcessing = false
@@ -830,7 +912,8 @@ final class JustSpeakApp {
                     inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
-                    settlePath: turnSettlePath
+                    settlePath: turnSettlePath,
+                    finishMode: turnFinishMode
                 ))
             processingLock.lock()
             isProcessing = false
@@ -895,7 +978,8 @@ final class JustSpeakApp {
                     inputTransport: turnInputTransport,
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
-                    settlePath: turnSettlePath
+                    settlePath: turnSettlePath,
+                    finishMode: turnFinishMode
                 ))
             processingLock.lock()
             isProcessing = false
@@ -1063,7 +1147,8 @@ final class JustSpeakApp {
                 appName: turnFrontmostName,
                 peakDb: turnPeakDb,
                 speechFrames: turnSpeechFrames,
-                settlePath: turnSettlePath
+                settlePath: turnSettlePath,
+                finishMode: turnFinishMode
             ))
 
         print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")

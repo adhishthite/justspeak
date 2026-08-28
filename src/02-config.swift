@@ -21,8 +21,13 @@ struct Config {
     // Sorted + regex-compiled form of replacementRules, built once at load (the raw rules
     // stay around for display and the analyzer).
     var compiledReplacementRules: [ReplacementEngine.CompiledRule] = []
-    var hotkey: String = "right_option"
+    var hotkey: String = "fn"
     var hotkeyMode: String = "push_to_talk"  // "push_to_talk" or "toggle"
+    // Hold-to-lock: a hold this long (seconds) locks the turn - the release becomes a
+    // non-event and the next press finishes. 0 disables; ignored in toggle mode.
+    var holdToLockSec: Double = 15.0
+    // Seconds a locked turn may run before it finishes on its own (a forgotten open mic).
+    var lockLimitSec: Double = 120.0
     var soundFeedback: Bool = true
     // Soft tick at key release - acknowledges the hold ended while the transcript settles
     // (there can be seconds of silence before the commit earcon on a slow REST fallback).
@@ -245,6 +250,8 @@ struct Config {
                         case "CUSTOM_VOCABULARY_FILE": vocabFile = value
                         case "HOTKEY": config.hotkey = value.lowercased()
                         case "HOTKEY_MODE": config.hotkeyMode = value.lowercased()
+                        case "HOLD_TO_LOCK": if let s = Double(value) { config.holdToLockSec = min(60.0, max(0.0, s)) }
+                        case "LOCK_LIMIT": if let s = Double(value) { config.lockLimitSec = min(600.0, max(0.0, s)) }
                         case "SOUND_FEEDBACK": config.soundFeedback = (value.lowercased() == "true" || value == "1")
                         case "RELEASE_SOUND": config.releaseSound = (value.lowercased() == "true" || value == "1")
                         case "SHOW_HUD": config.showHUD = (value.lowercased() == "true" || value == "1")
@@ -298,6 +305,8 @@ struct Config {
         if let vf = env["CUSTOM_VOCABULARY_FILE"], !vf.isEmpty { vocabFile = vf }
         if let hk = env["HOTKEY"], !hk.isEmpty { config.hotkey = hk.lowercased() }
         if let mode = env["HOTKEY_MODE"], !mode.isEmpty { config.hotkeyMode = mode.lowercased() }
+        if let lock = env["HOLD_TO_LOCK"], let s = Double(lock) { config.holdToLockSec = min(60.0, max(0.0, s)) }
+        if let limit = env["LOCK_LIMIT"], let s = Double(limit) { config.lockLimitSec = min(600.0, max(0.0, s)) }
         if let sound = env["SOUND_FEEDBACK"] { config.soundFeedback = (sound.lowercased() == "true" || sound == "1") }
         if let rel = env["RELEASE_SOUND"] { config.releaseSound = (rel.lowercased() == "true" || rel == "1") }
         if let hud = env["SHOW_HUD"] { config.showHUD = (hud.lowercased() == "true" || hud == "1") }

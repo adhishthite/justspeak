@@ -6,6 +6,7 @@ final class AppleIntelligenceOrbView: NSView {
         case processing
         case success
         case error
+        case locked
     }
 
     var state: OrbState = .listening {
@@ -58,6 +59,9 @@ final class AppleIntelligenceOrbView: NSView {
 
         case .error:
             drawAppleAlert(in: context, center: center, size: maxRadius * 2.0)
+
+        case .locked:
+            drawAppleLock(in: context, center: center)
         }
     }
 
@@ -136,6 +140,32 @@ final class AppleIntelligenceOrbView: NSView {
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.addPath(path)
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    // Padlock in the checkmark's idiom: one stroke weight, one glow, gold for "held".
+    private func drawAppleLock(in context: CGContext, center: CGPoint) {
+        let bodyRect = CGRect(x: center.x - 5.0, y: center.y - 6.0, width: 10.0, height: 7.5)
+        let body = CGPath(roundedRect: bodyRect, cornerWidth: 2.0, cornerHeight: 2.0, transform: nil)
+
+        let r: CGFloat = 3.2
+        let hinge = CGPoint(x: center.x, y: bodyRect.maxY + 1.6)
+        let shackle = CGMutablePath()
+        shackle.move(to: CGPoint(x: center.x - r, y: bodyRect.maxY - 0.5))
+        shackle.addLine(to: CGPoint(x: center.x - r, y: hinge.y))
+        shackle.addArc(center: hinge, radius: r, startAngle: .pi, endAngle: 0, clockwise: true)
+        shackle.addLine(to: CGPoint(x: center.x + r, y: bodyRect.maxY - 0.5))
+
+        context.saveGState()
+        context.setShadow(offset: .zero, blur: 6.0, color: AppleDesign.appleGold.withAlphaComponent(0.85).cgColor)
+        context.setFillColor(AppleDesign.appleGold.cgColor)
+        context.addPath(body)
+        context.fillPath()
+        context.setStrokeColor(AppleDesign.appleGold.cgColor)
+        context.setLineWidth(2.0)
+        context.setLineCap(.round)
+        context.addPath(shackle)
         context.strokePath()
         context.restoreGState()
     }
