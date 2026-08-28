@@ -56,6 +56,17 @@ private enum HUDMetrics {
     }
 }
 
+// AppKit's default constrainFrameRect keeps any window below .mainMenu level (the host is
+// .floating) from overlapping the menu bar: setFrame silently shoves it down by the menu-bar
+// height. The host must span to the screen top (morph starts inside the notch cutout), so
+// the identity override is required - otherwise the pill lands a menu bar below the aura,
+// which stays put because .screenSaver is above the clamp.
+private final class HUDPanel: NSPanel {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+}
+
 final class FloatingHUD: NSObject {
     private let notchPanel: NSPanel
     private let notchGlowView: AppleNotchAuraView
@@ -121,9 +132,9 @@ final class FloatingHUD: NSObject {
         let glowWidth = notchInfo.rect.width + padding * 2
         let glowHeight = notchInfo.rect.height + padding + 44.0
         let glowX = notchInfo.rect.minX - padding
-        let glowY = screenFrame.height - glowHeight
+        let glowY = screenFrame.maxY - glowHeight
 
-        let notchPanel = NSPanel(
+        let notchPanel = HUDPanel(
             contentRect: NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -144,10 +155,10 @@ final class FloatingHUD: NSObject {
 
         // 2. Static host panel for the pill, at maximum footprint, top edge at screen top.
         let host = HUDMetrics.hostSize(notchHeight: notchInfo.rect.height)
-        let hostPanel = NSPanel(
+        let hostPanel = HUDPanel(
             contentRect: NSRect(
                 x: screenFrame.midX - host.width / 2.0,
-                y: screenFrame.height - host.height,
+                y: screenFrame.maxY - host.height,
                 width: host.width, height: host.height),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -261,11 +272,11 @@ final class FloatingHUD: NSObject {
         self.notchInfo = NotchGeometry.detect(screen: screen)
 
         let host = HUDMetrics.hostSize(notchHeight: notchInfo.rect.height)
-        let pillTopScreen = screenFrame.height - notchInfo.rect.height - HUDMetrics.pillGap
+        let pillTopScreen = screenFrame.maxY - notchInfo.rect.height - HUDMetrics.pillGap
         hostPanel.setFrame(
             NSRect(
                 x: screenFrame.midX - host.width / 2.0,
-                y: screenFrame.height - host.height,
+                y: screenFrame.maxY - host.height,
                 width: host.width, height: host.height),
             display: true)
         hostView.frame = NSRect(x: 0, y: 0, width: host.width, height: host.height)
@@ -276,7 +287,7 @@ final class FloatingHUD: NSObject {
             let glowWidth = notchInfo.rect.width + padding * 2
             let glowHeight = notchInfo.rect.height + padding + 44.0
             let glowX = notchInfo.rect.minX - padding
-            let glowY = screenFrame.height - glowHeight
+            let glowY = screenFrame.maxY - glowHeight
             notchPanel.setFrame(NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight), display: true)
             notchGlowView.frame = NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight)
             notchGlowView.notchRect = notchInfo.rect
