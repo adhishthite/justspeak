@@ -22,7 +22,7 @@ Hold [fn 🌐] ──► 🎙️ Audio Capture (16kHz PCM) ──► ⚡ Gemini 
 
 ## ✨ Key Features
 
-- **Hold to Lock**: For long dictations, keep holding — a ring traces the pill's rim and closes after `HOLD_TO_LOCK` seconds (default 12). The pill shows a padlock with *Release the key. Press again to finish.*: let go, keep talking, press the hotkey once more to paste. `LOCK_LIMIT` (default 120s) finishes a locked turn on its own so a forgotten mic never stays open.
+- **Hold to Lock**: For long dictations, keep holding — a ring traces the pill's rim and closes after `HOLD_TO_LOCK` seconds (default 15). The pill shows a padlock with *Release the key. Press again to finish.*: let go, keep talking, press the hotkey once more to paste. `LOCK_LIMIT` (default 120s) finishes a locked turn on its own so a forgotten mic never stays open.
 - **Sub-500ms End-to-End Latency**: Audio chunks are streamed over persistent WebSockets while you speak, so Gemini receives and transcribes speech before you even release the hotkey.
 - **Zero Clipping at Either End**: A 400ms always-on pre-roll ring buffer captures the syllable spoken *before* key-down, and an adaptive post-roll keeps streaming after release while speech energy persists (250ms continuous-quiet window, 1.5s hard cap) — releasing the key mid-syllable never clips the last word.
 - **Apple HIG & Dynamic Island UI**:
@@ -150,7 +150,7 @@ All settings can be configured in `.env` or set as environment variables:
 | `CUSTOM_VOCABULARY_FILE` | `vocabulary.txt` | File containing one word/phrase per line (`#` comments allowed) |
 | `HOTKEY` | `fn` | Trigger key (`fn`, `right_option`, `left_option`, `right_control`, `left_control`, `right_cmd`, `left_cmd`, `f13`–`f20`, or a raw numeric keyCode) |
 | `HOTKEY_MODE` | `push_to_talk` | `push_to_talk` (hold to speak) or `toggle` (press to start, press to stop) |
-| `HOLD_TO_LOCK` | `12` | Seconds of holding after which the turn locks (rim ring closes, padlock shows): release freely, press the hotkey again to finish. `0` disables; ignored in `toggle` mode (0-60) |
+| `HOLD_TO_LOCK` | `15` | Seconds of holding after which the turn locks (rim ring closes, padlock shows): release freely, press the hotkey again to finish. `0` disables; ignored in `toggle` mode (0-60) |
 | `LOCK_LIMIT` | `120` | Seconds a locked turn may run before it finishes on its own (0-600, `0` = no limit) |
 | `SOUND_FEEDBACK` | `true` | Subtle Apple system earcons on start / commit |
 | `RELEASE_SOUND` | `true` | Soft tick at key release acknowledging the hold ended while the transcript settles (needs `SOUND_FEEDBACK`) |
