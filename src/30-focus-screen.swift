@@ -43,20 +43,24 @@ struct FocusScreenResolver {
     // AX reports window bounds in global top-left coordinates (y grows downward from the top
     // of the primary display); NSScreen frames are bottom-left, so flip against the primary
     // screen's height. `screens.first` is the primary (origin 0,0) by AppKit contract.
+    //
+    // One 50ms budget covers all three round-trips: the messaging timeout is per request,
+    // so each call gets whatever is left, and a hung app costs ~50ms total, not 3x.
+    private static let lookupBudget: CFAbsoluteTime = 0.05
+
     private static func focusedWindowFrame(pid: pid_t) -> NSRect? {
+        let deadline = CFAbsoluteTimeGetCurrent() + lookupBudget
         let appElement = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(appElement, 0.05)
         var windowRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowRef) == .success,
+        guard copyAttribute(appElement, kAXFocusedWindowAttribute, deadline: deadline, into: &windowRef),
             let windowAny = windowRef, CFGetTypeID(windowAny) == AXUIElementGetTypeID()
         else { return nil }
         let window = windowAny as! AXUIElement
-        AXUIElementSetMessagingTimeout(window, 0.05)
 
         var posRef: CFTypeRef?
         var sizeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
-            AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+        guard copyAttribute(window, kAXPositionAttribute, deadline: deadline, into: &posRef),
+            copyAttribute(window, kAXSizeAttribute, deadline: deadline, into: &sizeRef),
             let posAny = posRef, let sizeAny = sizeRef,
             CFGetTypeID(posAny) == AXValueGetTypeID(), CFGetTypeID(sizeAny) == AXValueGetTypeID()
         else { return nil }
@@ -70,5 +74,16 @@ struct FocusScreenResolver {
         guard let primary = NSScreen.screens.first else { return nil }
         let flippedY = primary.frame.maxY - origin.y - size.height
         return NSRect(x: origin.x, y: flippedY, width: size.width, height: size.height)
+    }
+
+    // Refuses outright once the budget is spent (a 0 timeout would mean "system default",
+    // not "none"); a few ms of floor keeps a sub-millisecond remainder from being pointless.
+    private static func copyAttribute(
+        _ element: AXUIElement, _ attribute: String, deadline: CFAbsoluteTime, into ref: inout CFTypeRef?
+    ) -> Bool {
+        let remaining = deadline - CFAbsoluteTimeGetCurrent()
+        guard remaining > 0.002 else { return false }
+        AXUIElementSetMessagingTimeout(element, Float(remaining))
+        return AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success
     }
 }
