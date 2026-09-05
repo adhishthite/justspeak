@@ -15,6 +15,7 @@ Microphone recovery now rebuilds the complete capture path and confirms fresh au
 - Detect stale capture at 750 ms, checked every 250 ms while capture is requested.
 - Limit queued hardware buffers to eight. Reject interrupted audio after queue overflow or conversion failure.
 - Reject old-device buffers by generation. Notify the app outside locks.
+- Clear the processing flag before scheduling cleanup for short-click and silent-clip rejections. Deterministic tests force cleanup to run immediately.
 - Cancel pending startup when the user releases the hotkey. Reset toggle state after failure or interruption.
 
 The actual two-process hardware test passed. Both processes received ongoing audio from the default microphone. Forced idle configuration changes recovered; a forced mid-recording configuration change produced one interruption and an invalidated recording; capture became ready again. No microphone audio was saved, printed, transcribed, or transmitted. This does not reproduce the user's unidentified triggering application or every headset mode.
@@ -50,7 +51,7 @@ The final implementation was also checked in six new Live trials with unchanged 
 
 ## Completed checks
 
-- `make check`: 392 Swift regression checks, 10,000 independent Python cases, and strict source lint passed.
+- `make check`: 398 Swift regression checks, 10,000 independent Python cases, and strict source lint passed.
 - `python3 tests/run.py --hud`: 24 HUD checks passed. Its rendered image was inspected.
 - `python3 tests/mic_hardware.py --run`: real two-process microphone sharing and recovery passed, including the final conversion-failure hardening.
 - Swift test formatting, Python syntax, and `git diff --check` passed.

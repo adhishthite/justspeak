@@ -92,6 +92,9 @@ final class JustSpeakApp {
     // Main-thread-only: pending mic release for MIC_IDLE_TIMEOUT. Cancelled on every key-down,
     // re-armed whenever a turn finishes.
     private var micIdleWorkItem: DispatchWorkItem?
+    private var scheduleRejectedTurnUI: (@escaping () -> Void) -> Void = { action in
+        DispatchQueue.main.async(execute: action)
+    }
 
     // Main-thread-only: the delayed duck for the current turn. Ducking waits ~350ms so the
     // begin earcon plays at full volume (an immediate duck swallowed it - "my sounds
@@ -586,13 +589,13 @@ final class JustSpeakApp {
         guard duration >= 0.15 && capturedBytes > 2000 else {
             liveClient?.abandonTurn()
             Logger.warn("INPUT", "Ignored short click (\(String(format: "%.0f", duration * 1000.0))ms). Hold key while speaking.")
-            DispatchQueue.main.async { [weak self] in
-                self?.hud?.hide()
-                self?.scheduleMicIdleRelease()
-            }
             processingLock.lock()
             isProcessing = false
             processingLock.unlock()
+            scheduleRejectedTurnUI { [weak self] in
+                self?.hud?.hide()
+                self?.scheduleMicIdleRelease()
+            }
             return
         }
 
@@ -606,10 +609,6 @@ final class JustSpeakApp {
             Logger.warn("INPUT", "No speech detected in clip (peak \(String(format: "%.1f", peakDb)) dBFS, \(speechFrames) speech frames) - skipping API call.")
             liveClient?.abandonTurn()
             noteNoSpeechTurn()
-            DispatchQueue.main.async { [weak self] in
-                self?.hud?.showError(message: "No speech detected")
-                self?.scheduleMicIdleRelease()
-            }
             history?.record(
                 TranscriptionHistoryStore.TurnRecord(
                     outcome: "empty",
@@ -647,6 +646,10 @@ final class JustSpeakApp {
             processingLock.lock()
             isProcessing = false
             processingLock.unlock()
+            scheduleRejectedTurnUI { [weak self] in
+                self?.hud?.showError(message: "No speech detected")
+                self?.scheduleMicIdleRelease()
+            }
             return
         }
 

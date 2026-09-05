@@ -75,3 +75,45 @@ check(sqlite3_step(fixtureStatement) == SQLITE_ROW && sqlite3_column_int(fixture
 sqlite3_finalize(fixtureStatement)
 sqlite3_close(fixtureDB)
 try? FileManager.default.removeItem(at: historyFixtureURL)
+
+// An immediate dispatcher models main winning the race against the pipeline worker.
+extension AudioCaptureEngine {
+    func fixtureRejectedCapture(silent: Bool) {
+        audioProcessingQueue.sync {
+            lock.lock()
+            isRecording = true
+            turnInterrupted = false
+            recordingStartTime = ProcessInfo.processInfo.systemUptime - (silent ? 1 : 0.01)
+            recordedPCMData = Data(count: silent ? 32000 : 320)
+            statSampleCount = silent ? 16000 : 0
+            turnMaxAbsSample = 0
+            frameDbValues = silent ? [-120] : []
+            lock.unlock()
+        }
+    }
+}
+extension JustSpeakApp {
+    func fixtureRejectedTurn(silent: Bool) {
+        audioCapture.fixtureRejectedCapture(silent: silent)
+        isProcessing = true
+        var callbacks = 0
+        scheduleRejectedTurnUI = { action in
+            callbacks += 1
+            self.processingLock.lock()
+            let busy = self.isProcessing
+            self.processingLock.unlock()
+            check(!busy, "rejected turn clears busy before main cleanup can run")
+            action()
+        }
+        runTurnPipeline(keyUpTime: ProcessInfo.processInfo.systemUptime)
+        check(callbacks == 1 && micIdleWorkItem != nil, "rejected turn arms microphone idle release")
+        check(pendingRestRequest == nil, "rejected turn avoids transcription")
+        micIdleWorkItem?.cancel()
+        micIdleWorkItem = nil
+    }
+}
+var rejectedConfig = appFixtureConfig
+rejectedConfig.historyEnabled = false
+rejectedConfig.micIdleTimeoutSec = 300
+JustSpeakApp(config: rejectedConfig).fixtureRejectedTurn(silent: false)
+JustSpeakApp(config: rejectedConfig).fixtureRejectedTurn(silent: true)
