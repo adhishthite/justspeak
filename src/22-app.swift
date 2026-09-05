@@ -19,6 +19,8 @@ final class JustSpeakApp {
     // key-up, and stopRecording without a matching start would resurrect the PREVIOUS
     // turn's buffer - re-billing the API and re-pasting a stale transcript.
     private var captureActive: Bool = false
+    private var capturePending = false
+    private var captureGeneration: UInt64 = 0
 
     // Main-thread-only hold-to-lock state. turnLocked: the hold outlasted HOLD_TO_LOCK, so
     // the physical release is a non-event and the NEXT key-down finishes the turn.
@@ -84,6 +86,8 @@ final class JustSpeakApp {
     private var pendingRestRequest: CancellableRequest?
     private var restAttemptStart: TimeInterval?
     private var turnEventQueueMs: Double = 0
+    private var turnReleaseTime: TimeInterval = 0
+    private var turnCaptureFinalizeMs: Double = 0
 
     // Main-thread-only: pending mic release for MIC_IDLE_TIMEOUT. Cancelled on every key-down,
     // re-armed whenever a turn finishes.
@@ -98,7 +102,11 @@ final class JustSpeakApp {
     /// Main-thread-only. Schedules the mic to be released after the configured idle window so
     /// the macOS mic indicator turns off between dictation sessions; 0 disables the timeout.
     private func scheduleMicIdleRelease() {
-        guard !captureActive else { return }
+        guard !captureActive, !capturePending else { return }
+        processingLock.lock()
+        let busy = isProcessing
+        processingLock.unlock()
+        guard !busy else { return }
         // Every turn ends here on main - the spot to apply a lid flip that arrived mid-turn.
         TextInjector.discardPreparedClipboard()
         audioCapture.applyPendingReselect()
@@ -211,9 +219,13 @@ final class JustSpeakApp {
         }
 
         // 3. Initialize Audio Capture Engine
-        guard audioCapture.setup() else {
-            Logger.error("MAIN", "Failed to start Audio Capture Engine.")
-            exit(1)
+        audioCapture.onCaptureInterrupted = { [weak self] _ in
+            guard let self = self, self.captureActive else { return }
+            self.turnLocked = false
+            self.handleKeyUp(finish: "input_interrupted")
+        }
+        if !audioCapture.setup() {
+            Logger.warn("MIC", "Microphone unavailable; recovery will retry.")
         }
 
         // The mic idle countdown starts at launch: no dictation for the configured window
@@ -312,6 +324,9 @@ final class JustSpeakApp {
     }
 
     private func handleKeyDown() {
+        defer {
+            if !captureActive && !capturePending { hotkeyManager?.resetToggle() }
+        }
         // A press while locked is the finish gesture, standing in for the release that was
         // ignored. The physical key-up that follows finds captureActive false and is dropped.
         if turnLocked {
@@ -324,9 +339,11 @@ final class JustSpeakApp {
         // Protect re-entrancy / double-tap race
         guard !isProcessing else {
             processingLock.unlock()
+            hud?.showBusy()
             return
         }
         processingLock.unlock()
+        guard !capturePending, !captureActive else { return }
 
         // Refuse to start a turn while secure input is held (password field, Terminal's Secure
         // Keyboard Entry, ...) - synthesized keystrokes and clipboard pastes into it can fail or
@@ -364,40 +381,56 @@ final class JustSpeakApp {
         micIdleWorkItem?.cancel()
         micIdleWorkItem = nil
 
-        // Re-arm the mic if the idle timeout released it. The begin earcon plays only after
-        // the engine is actually capturing, so the sound always means "speak now" - never
-        // before a cold mic is ready.
-        if !audioCapture.isEngineRunning {
-            let wakeStart = ProcessInfo.processInfo.systemUptime
-            if audioCapture.resumeEngine() {
-                Logger.info("MIC", "Mic re-armed after idle (\(String(format: "%.0f", (ProcessInfo.processInfo.systemUptime - wakeStart) * 1000.0))ms spin-up).")
+        capturePending = true
+        captureGeneration &+= 1
+        let generation = captureGeneration
+        if !audioCapture.isEngineRunning { hud?.showStarting() }
+        audioCapture.ensureReady { [weak self] ready in
+            guard let self = self, self.capturePending, self.captureGeneration == generation else { return }
+            self.capturePending = false
+            guard ready else {
+                self.hotkeyManager?.resetToggle()
+                self.hud?.showError(message: "Microphone unavailable. Try again.")
+                if self.config.soundFeedback { SoundManager.playErrorSound() }
+                self.scheduleMicIdleRelease()
+                return
             }
+            self.beginCapture(generation: generation)
         }
+    }
 
-        if config.soundFeedback {
-            SoundManager.playStartSound()
+    private func beginCapture(generation: UInt64) {
+        defer { if !captureActive { hotkeyManager?.resetToggle() } }
+        guard !SecureInputMonitor.isActive, NetworkMonitor.shared.isOnline else {
+            hud?.showError(message: "Dictation unavailable. Check input and connection.")
+            scheduleMicIdleRelease()
+            return
         }
-
-        // The screen lookup (one AX call) rides in this async hop so it runs after
-        // startRecording below has already opened the capture, off the key-down critical path.
-        let followFocus = config.hudFollowFocus
-        let focusPID = turnFrontmostPID
-        let lockAfter = holdToLockInterval
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, let hud = self.hud else { return }
-            if followFocus, let screen = FocusScreenResolver.resolve(frontmostPID: focusPID) {
-                hud.retarget(to: screen)
-            }
-            hud.showListening(lockAfter: lockAfter)
+        // A startup wait must not silently change the intended destination.
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == turnFrontmostPID else {
+            hud?.showError(message: "Focus changed. Press again to dictate.")
+            scheduleMicIdleRelease()
+            return
         }
-
-        // A new capture invalidates any pending post-paste read-back: the upcoming paste
-        // would rewrite the field and the diff would misread it as a typed edit.
         correctionWatcher?.cancelPending()
-
-        captureActive = true
         liveClient?.startNewTurn()
-        audioCapture.startRecording()
+        guard audioCapture.startRecording() else {
+            liveClient?.abandonTurn()
+            hud?.showError(message: "Microphone unavailable. Try again.")
+            scheduleMicIdleRelease()
+            return
+        }
+        captureActive = true
+        turnInputDevice = audioCapture.currentInput?.name
+        turnInputTransport = audioCapture.currentInput?.transport
+        if config.soundFeedback { SoundManager.playStartSound() }
+        hud?.showListening(lockAfter: holdToLockInterval)
+        if config.hudFollowFocus {
+            FocusScreenResolver.resolve(frontmostPID: turnFrontmostPID) { [weak self] screen in
+                guard let self = self, self.captureActive, self.captureGeneration == generation, let screen = screen else { return }
+                self.hud?.retarget(to: screen)
+            }
+        }
         if config.restoreClipboard { TextInjector.prepareClipboard() }
         armHoldToLock()
 
@@ -416,10 +449,20 @@ final class JustSpeakApp {
     }
 
     private func handleKeyUp(finish: String = "release", eventTime: TimeInterval? = nil) {
+        hotkeyManager?.resetToggle()
         // Capture the physical release instant before anything else - this becomes the true
         // start of "Total Key-Up -> Paste" latency measurement.
         let handlerTime = ProcessInfo.processInfo.systemUptime
         let keyUpTime = eventTime.flatMap { $0 > 0 && $0 <= handlerTime ? $0 : nil } ?? handlerTime
+
+        if capturePending {
+            capturePending = false
+            captureGeneration &+= 1
+            audioCapture.cancelPendingReadiness()
+            hud?.hide()
+            scheduleMicIdleRelease()
+            return
+        }
 
         // A release whose press never started a capture (refused by a key-down gate) must
         // not run the pipeline - there is nothing to stop, only stale state to misread.
@@ -507,7 +550,8 @@ final class JustSpeakApp {
     /// lifecycle, and is the only place that mutates currentTurnId / turnSettled / pendingFallbackTimer.
     private func runTurnPipeline(keyUpTime: CFAbsoluteTime) {
         let pipelineStartTime = ProcessInfo.processInfo.systemUptime
-        let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(
+        turnReleaseTime = keyUpTime
+        let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames, interrupted) = audioCapture.stopRecording(
             gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
         // Mic capture for this turn is over and every pipeline exit path passes this point -
         // one restore site instead of one per abandoned-turn/settle branch. The pending-duck
@@ -523,6 +567,18 @@ final class JustSpeakApp {
         turnPeakDb = peakDb
         turnSpeechFrames = speechFrames
         turnSettlePath = nil
+        turnCaptureFinalizeMs = (ProcessInfo.processInfo.systemUptime - pipelineStartTime) * 1000
+        if interrupted {
+            currentTurnId &+= 1
+            turnSettled = false
+            settle(
+                turnId: currentTurnId, route: "microphone",
+                outcome: .failure(
+                    NSError(
+                        domain: "JustSpeak.Microphone", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Microphone interrupted. Nothing pasted. Try again."])))
+            return
+        }
 
         // Discard accidental micro-clicks (< 150ms or < 2KB of real captured audio, ignoring
         // the fixed pre-roll/silence-flush padding that stopRecording always appends).
@@ -585,7 +641,8 @@ final class JustSpeakApp {
                     inputTransport: turnInputTransport,
                     peakDb: peakDb,
                     speechFrames: speechFrames,
-                    finishMode: turnFinishMode
+                    finishMode: turnFinishMode,
+                    eventQueueMs: turnEventQueueMs
                 ))
             processingLock.lock()
             isProcessing = false
@@ -855,6 +912,7 @@ final class JustSpeakApp {
                 inputTokens: inputTokens,
                 outputTokens: outputTokens
             )
+            return
 
         case .empty(let audioDuration):
             noteNoSpeechTurn()
@@ -874,9 +932,9 @@ final class JustSpeakApp {
                     audioSeconds: audioDuration,
                     firstTokenMs: nil,
                     roundtripMs: nil,
-                    captureFinalizeMs: nil,
+                    captureFinalizeMs: turnCaptureFinalizeMs,
                     injectMs: nil,
-                    totalMs: nil,
+                    totalMs: (ProcessInfo.processInfo.systemUptime - turnReleaseTime) * 1000,
                     injected: nil,
                     inputTokens: nil,
                     outputTokens: nil,
@@ -893,16 +951,20 @@ final class JustSpeakApp {
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
                     settlePath: turnSettlePath,
-                    finishMode: turnFinishMode
+                    finishMode: turnFinishMode,
+                    eventQueueMs: turnEventQueueMs
                 ))
             processingLock.lock()
             isProcessing = false
             processingLock.unlock()
 
         case .failure(let error):
-            Logger.error("REST", "Transcription failed: \(error.localizedDescription)")
+            Logger.error(route == "microphone" ? "MIC" : "TRANSCRIBE", "Turn failed: \(error.localizedDescription)")
             if config.soundFeedback { SoundManager.playErrorSound() }
-            let hudMessage = Self.friendlyFailureMessage(error) ?? "Transcription failed — nothing pasted"
+            let hudMessage =
+                (error as NSError).domain == "JustSpeak.Microphone"
+                ? "Microphone interrupted. Try again."
+                : Self.friendlyFailureMessage(error) ?? "Transcription failed — nothing pasted"
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: hudMessage)
             }
@@ -919,9 +981,9 @@ final class JustSpeakApp {
                     audioSeconds: nil,
                     firstTokenMs: nil,
                     roundtripMs: nil,
-                    captureFinalizeMs: nil,
+                    captureFinalizeMs: turnCaptureFinalizeMs,
                     injectMs: nil,
-                    totalMs: nil,
+                    totalMs: (ProcessInfo.processInfo.systemUptime - turnReleaseTime) * 1000,
                     injected: nil,
                     inputTokens: nil,
                     outputTokens: nil,
@@ -938,7 +1000,8 @@ final class JustSpeakApp {
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
                     settlePath: turnSettlePath,
-                    finishMode: turnFinishMode
+                    finishMode: turnFinishMode,
+                    eventQueueMs: turnEventQueueMs
                 ))
             processingLock.lock()
             isProcessing = false
@@ -964,8 +1027,30 @@ final class JustSpeakApp {
         fallbackReason: String? = nil,
         isLiveRoute: Bool = true,
         inputTokens: Int? = nil,
-        outputTokens: Int? = nil
+        outputTokens: Int? = nil,
+        clipboardPrepared: Bool = false
     ) {
+        var canPrepareClipboard = false
+        if config.restoreClipboard, !clipboardPrepared, !SecureInputMonitor.isActive, AXIsProcessTrusted() {
+            DispatchQueue.main.sync {
+                canPrepareClipboard = NSWorkspace.shared.frontmostApplication?.processIdentifier == turnFrontmostPID
+            }
+        }
+        if canPrepareClipboard {
+            TextInjector.awaitPreparedClipboard { [weak self] _ in
+                guard let self = self else { return }
+                self.sessionQueue.async {
+                    self.handleTranscribedText(
+                        rawText, transport: transport,
+                        firstTokenMs: firstTokenMs, roundtripMs: roundtripMs,
+                        audioDuration: audioDuration, totalStartTime: totalStartTime,
+                        captureFinalizeMs: captureFinalizeMs, fallbackReason: fallbackReason,
+                        isLiveRoute: isLiveRoute, inputTokens: inputTokens, outputTokens: outputTokens,
+                        clipboardPrepared: true)
+                }
+            }
+            return
+        }
         let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             Logger.warn("AI", "Received empty transcription from Gemini.")
@@ -1004,11 +1089,13 @@ final class JustSpeakApp {
                     peakDb: turnPeakDb,
                     speechFrames: turnSpeechFrames,
                     settlePath: turnSettlePath,
-                    finishMode: turnFinishMode
+                    finishMode: turnFinishMode,
+                    eventQueueMs: turnEventQueueMs
                 ))
             processingLock.lock()
             isProcessing = false
             processingLock.unlock()
+            DispatchQueue.main.async { [weak self] in self?.scheduleMicIdleRelease() }
             return
         }
 
@@ -1021,11 +1108,14 @@ final class JustSpeakApp {
         // after ~1s on the normal paste path.
         let injected: Bool
         let injectMs: Double
+        var deliveryError: String?
         var copyOnlyReason: String?  // set on downgrade; drives the log message, HUD text and status label
 
         if SecureInputMonitor.isActive {
             let copyStart = ProcessInfo.processInfo.systemUptime
-            _ = TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace)
+            if !TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace) {
+                deliveryError = "Clipboard write failed. Text not copied."
+            }
             injectMs = (ProcessInfo.processInfo.systemUptime - copyStart) * 1000.0
             injected = false
             let holder = SecureInputMonitor.holderName()
@@ -1035,7 +1125,9 @@ final class JustSpeakApp {
             // Accessibility revoked while running: the synthesized Cmd+V would be silently
             // dropped by the system, losing the dictation. Copy instead and say why.
             let copyStart = ProcessInfo.processInfo.systemUptime
-            _ = TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace)
+            if !TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace) {
+                deliveryError = "Clipboard write failed. Text not copied."
+            }
             injectMs = (ProcessInfo.processInfo.systemUptime - copyStart) * 1000.0
             injected = false
             Logger.warn("INJECT", "Accessibility permission revoked - copied, not pasted. Re-enable this terminal under System Settings > Privacy & Security > Accessibility.")
@@ -1046,13 +1138,34 @@ final class JustSpeakApp {
 
             if let priorPid = turnFrontmostPID, let nowPid = frontNow?.processIdentifier, priorPid != nowPid {
                 let copyStart = ProcessInfo.processInfo.systemUptime
-                _ = TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace)
+                if !TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace) {
+                    deliveryError = "Clipboard write failed. Text not copied."
+                }
                 injectMs = (ProcessInfo.processInfo.systemUptime - copyStart) * 1000.0
                 injected = false
                 Logger.warn("INJECT", "Focus moved from \(turnFrontmostName ?? "?") to \(frontNow?.localizedName ?? "?") mid-turn - text copied, not pasted.")
                 copyOnlyReason = "focus changed"
             } else {
-                (injected, injectMs) = TextInjector.inject(text: text, restorePreviousClipboard: config.restoreClipboard, completionSound: config.soundFeedback, appendSpace: config.trailingSpace)
+                let result = TextInjector.inject(
+                    text: text, restorePreviousClipboard: config.restoreClipboard,
+                    completionSound: config.soundFeedback, appendSpace: config.trailingSpace,
+                    shouldDispatch: {
+                        guard !SecureInputMonitor.isActive, AXIsProcessTrusted() else { return false }
+                        var sameTarget = false
+                        DispatchQueue.main.sync {
+                            sameTarget = NSWorkspace.shared.frontmostApplication?.processIdentifier == self.turnFrontmostPID
+                        }
+                        return sameTarget
+                    })
+                injected = result.outcome == .dispatched
+                injectMs = result.latencyMs
+                switch result.outcome {
+                case .dispatched: break
+                case .clipboardUnavailable:
+                    deliveryError = config.historyEnabled ? "Clipboard busy. Text saved in history." : "Clipboard busy. Text not pasted."
+                case .dispatchCancelled: deliveryError = "Destination changed. Text not pasted."
+                case .failed: deliveryError = "Paste failed. Text not pasted."
+                }
                 // Arm the typed-correction read-back only on a real paste into a verified
                 // frontmost app; copy-only downgrades never observe anything.
                 if injected, config.learnCorrections, let pid = frontNow?.processIdentifier ?? turnFrontmostPID {
@@ -1064,7 +1177,7 @@ final class JustSpeakApp {
             }
         }
 
-        if copyOnlyReason != nil, config.soundFeedback {
+        if copyOnlyReason != nil, deliveryError == nil, config.soundFeedback {
             // Text still landed - on the clipboard - so this is a commit, not an error sound.
             SoundManager.playCommitSound()
         }
@@ -1085,23 +1198,29 @@ final class JustSpeakApp {
         let totalElapsedMs = (ProcessInfo.processInfo.systemUptime - totalStartTime) * 1000.0
 
         let injectStatus: String
-        if let reason = copyOnlyReason {
+        if let error = deliveryError {
+            injectStatus = error
+        } else if let reason = copyOnlyReason {
             injectStatus = "\(ANSI.yellow)Copied — \(reason)\(ANSI.reset)"
         } else {
-            injectStatus = injected ? "\(ANSI.green)Pasted via Cmd+V\(ANSI.reset)" : "\(ANSI.yellow)Copied to Clipboard\(ANSI.reset)"
+            injectStatus = injected ? "Paste events dispatched" : (deliveryError ?? "Not delivered")
         }
 
+        let feedbackGeneration = captureGeneration
         DispatchQueue.main.async { [weak self] in
-            if let reason = copyOnlyReason {
+            guard let self = self, self.captureGeneration == feedbackGeneration else { return }
+            if let message = deliveryError {
+                self.hud?.showError(message: message)
+            } else if let reason = copyOnlyReason {
                 let message: String
                 switch reason {
                 case "secure input": message = "Secure input active — copied, press ⌘V after leaving the password field"
                 case "accessibility revoked": message = "Accessibility revoked — copied, press ⌘V"
                 default: message = "Focus changed — copied, press ⌘V"
                 }
-                self?.hud?.showError(message: message)
+                self.hud?.showError(message: message)
             } else {
-                self?.hud?.showSuccess(text: text)
+                self.hud?.showSuccess(text: text)
             }
         }
 
@@ -1145,38 +1264,41 @@ final class JustSpeakApp {
         sessionCostUSD += turnCostUSD
         statsLock.unlock()
 
-        history?.record(
-            TranscriptionHistoryStore.TurnRecord(
-                outcome: "success",
-                text: text,
-                charCount: text.count,
-                wordCount: text.split { $0.isWhitespace }.count,
-                transport: transport,
-                model: isLiveRoute ? config.geminiLiveModel : config.geminiModel,
-                isLiveRoute: isLiveRoute,
-                fallbackReason: fallbackReason,
-                audioSeconds: audioDuration,
-                firstTokenMs: firstTokenMs > 0 ? firstTokenMs : nil,
-                roundtripMs: roundtripMs,
-                captureFinalizeMs: captureFinalizeMs,
-                injectMs: injectMs,
-                totalMs: totalElapsedMs,
-                injected: injected,
-                inputTokens: inputTokens,
-                outputTokens: outputTokens,
-                tokensMetered: usageMetered,
-                costUSD: turnCostUSD,
-                languageCodes: config.languageCodes.joined(separator: ","),
-                smartMode: config.smartTranscription,
-                vadMode: config.vadMode,
-                error: nil,
-                appBundleId: turnFrontmostBundleId,
-                appName: turnFrontmostName,
-                peakDb: turnPeakDb,
-                speechFrames: turnSpeechFrames,
-                settlePath: turnSettlePath,
-                finishMode: turnFinishMode
-            ))
+        var record = TranscriptionHistoryStore.TurnRecord(
+            outcome: deliveryError == nil ? "success" : "delivery_failed",
+            text: text,
+            charCount: text.count,
+            wordCount: text.split { $0.isWhitespace }.count,
+            transport: transport,
+            model: isLiveRoute ? config.geminiLiveModel : config.geminiModel,
+            isLiveRoute: isLiveRoute,
+            fallbackReason: fallbackReason,
+            audioSeconds: audioDuration,
+            firstTokenMs: firstTokenMs > 0 ? firstTokenMs : nil,
+            roundtripMs: roundtripMs,
+            captureFinalizeMs: captureFinalizeMs,
+            injectMs: injectMs,
+            totalMs: totalElapsedMs,
+            injected: injected,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            tokensMetered: usageMetered,
+            costUSD: turnCostUSD,
+            languageCodes: config.languageCodes.joined(separator: ","),
+            smartMode: config.smartTranscription,
+            vadMode: config.vadMode,
+            error: deliveryError,
+            appBundleId: turnFrontmostBundleId,
+            appName: turnFrontmostName,
+            inputDevice: turnInputDevice,
+            inputTransport: turnInputTransport,
+            peakDb: turnPeakDb,
+            speechFrames: turnSpeechFrames,
+            settlePath: turnSettlePath,
+            finishMode: turnFinishMode,
+            eventQueueMs: turnEventQueueMs,
+            deliveryOutcome: injected ? "dispatched" : (deliveryError == nil ? "copied" : "failed")
+        )
 
         Logger.raw("  • \(ANSI.bold)\(ANSI.green)Key-Up → Paste Dispatch:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")
 
@@ -1184,7 +1306,10 @@ final class JustSpeakApp {
         isProcessing = false
         processingLock.unlock()
         let readyMs = (ProcessInfo.processInfo.systemUptime - totalStartTime) * 1000
+        record.readyMs = readyMs
+        history?.record(record)
         Logger.debug("LATENCY", "Key-up to next-turn readiness: \(String(format: "%.1f", readyMs))ms")
+        DispatchQueue.main.async { [weak self] in self?.scheduleMicIdleRelease() }
     }
 
     private func printBanner() {

@@ -1,5 +1,130 @@
 // MARK: - Audio Capture Engine with Pre-roll Ring Buffer & Offloaded Threading
 
+// Main-thread lifecycle; the driver supplies hardware operations and the scheduler is
+// injectable so recovery failures can be tested without opening a microphone.
+final class MicRecoveryController {
+    var rebuild: () -> Bool
+    var stop: () -> Void
+    var running: () -> Bool
+    var interrupted: (String) -> Void
+    var clock: () -> TimeInterval
+    var schedule: (Double, @escaping () -> Void) -> Void
+    private(set) var desiredRunning = false
+    private(set) var ready = false
+    private(set) var generation: UInt64 = 0
+    private var attempt = 0
+    private var startedAt: TimeInterval = 0
+    private var lastBuffer: TimeInterval?
+    private var waiting: [(Bool) -> Void] = []
+    private var configurationPending = false
+
+    init(
+        rebuild: @escaping () -> Bool, stop: @escaping () -> Void,
+        running: @escaping () -> Bool, interrupted: @escaping (String) -> Void,
+        clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        schedule: @escaping (Double, @escaping () -> Void) -> Void = { delay, action in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
+        }
+    ) {
+        self.rebuild = rebuild; self.stop = stop; self.running = running
+        self.interrupted = interrupted; self.clock = clock; self.schedule = schedule
+    }
+
+    var healthy: Bool {
+        ready && running() && lastBuffer.map { clock() - $0 < 0.75 } == true
+    }
+
+    @discardableResult func start() -> Bool {
+        desiredRunning = true
+        attempt = 0
+        return restart()
+    }
+
+    func ensureReady(_ completion: @escaping (Bool) -> Void) {
+        if healthy { completion(true); return }
+        waiting.append(completion)
+        if !configurationPending && (!desiredRunning || attempt == 0 || attempt >= 3) { _ = start() }
+    }
+
+    func cancelPendingReadiness() {
+        complete(false)
+    }
+
+    func suspend() {
+        desiredRunning = false; ready = false; attempt = 0; configurationPending = false
+        generation &+= 1
+        stop()
+        complete(false)
+    }
+
+    func configurationChanged() {
+        interrupted("Microphone configuration changed")
+        guard desiredRunning else { stop(); ready = false; return }
+        // Notifications produced during a rebuild share its existing bounded retry budget.
+        guard !configurationPending, ready || attempt == 0 else { return }
+        if attempt >= 3 {
+            generation &+= 1
+            ready = false
+            stop()
+            complete(false)
+            return
+        }
+        ready = false
+        configurationPending = true
+        let token = generation
+        schedule(0.1) { [weak self] in
+            guard let self, self.desiredRunning, self.generation == token else { return }
+            self.configurationPending = false
+            _ = self.restart()
+        }
+    }
+
+    func receivedBuffer(generation expected: UInt64, at time: TimeInterval) {
+        guard desiredRunning, !configurationPending, generation == expected, running(), clock() - time < 0.75 else { return }
+        lastBuffer = time
+        ready = true
+        if clock() - startedAt >= 1 { attempt = 0 }
+        complete(true)
+    }
+
+    @discardableResult private func restart() -> Bool {
+        configurationPending = false
+        generation &+= 1
+        let token = generation
+        ready = false; lastBuffer = nil; attempt += 1; startedAt = clock()
+        stop()
+        let started = rebuild()
+        schedule(0.25) { [weak self] in self?.check(generation: token) }
+        return started
+    }
+
+    private func check(generation expected: UInt64) {
+        guard desiredRunning, !configurationPending, generation == expected else { return }
+        if healthy {
+            if clock() - startedAt >= 1 { attempt = 0 }
+            schedule(0.25) { [weak self] in self?.check(generation: expected) }
+            return
+        }
+        if running(), !ready, clock() - startedAt < 0.75 {
+            schedule(0.25) { [weak self] in self?.check(generation: expected) }
+            return
+        }
+        interrupted("Microphone stopped delivering audio")
+        if attempt < 3 {
+            _ = restart()
+        } else {
+            ready = false
+            stop()
+            complete(false)
+        }
+    }
+
+    private func complete(_ success: Bool) {
+        let callbacks = waiting; waiting.removeAll()
+        for callback in callbacks { callback(success) }
+    }
+}
+
 final class AudioCaptureEngine {
     private let audioEngine = AVAudioEngine()
     private var audioConverter: AVAudioConverter?
@@ -10,7 +135,29 @@ final class AudioCaptureEngine {
 
     private let lock = NSLock()
     private(set) var isRecording: Bool = false
-    private(set) var isEngineRunning: Bool = false  // main-thread-only (setup/suspend/resume)
+    var isEngineRunning: Bool { recovery.healthy }
+    private var tapInstalled = false
+    private var bufferEpoch: UInt64 = 0
+    private var turnInterrupted = false
+    private var interruptionNotified = false
+    private var queuedBuffers = 0
+    private lazy var healthDelivery = MainQueueDelivery<(UInt64, TimeInterval)> { [weak self] value in
+        self?.recovery.receivedBuffer(generation: value.0, at: value.1)
+    }
+    private lazy var overloadDelivery = MainQueueDelivery<UInt64> { [weak self] epoch in
+        guard let self else { return }
+        self.lock.lock()
+        let current = self.bufferEpoch == epoch && self.turnInterrupted
+        self.lock.unlock()
+        if current { self.interruptCapture("Microphone audio processing could not keep up") }
+    }
+    var onCaptureInterrupted: ((String) -> Void)?
+    private lazy var recovery = MicRecoveryController(
+        rebuild: { [weak self] in self?.rebuildHardware() ?? false },
+        stop: { [weak self] in self?.stopHardware() },
+        running: { [weak self] in self?.audioEngine.isRunning ?? false },
+        interrupted: { [weak self] reason in self?.interruptCapture(reason) }
+    )
     private var recordedPCMData = Data()
     private var chunkCount: Int = 0
     private var recordingStartTime: CFAbsoluteTime = 0
@@ -75,22 +222,6 @@ final class AudioCaptureEngine {
     }
 
     func setup() -> Bool {
-        let inputNode = audioEngine.inputNode
-        applyInputDeviceSelection()
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-
-        Logger.info("MIC", "Input device: \(currentInputLabel)")
-        Logger.info("MIC", "Hardware format: \(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch, \(inputFormat.formatDescription)")
-        Logger.info("MIC", "Target format: 16000 Hz, 1 ch, 16-bit Linear PCM")
-
-        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            Logger.error("MIC", "Failed to construct AVAudioConverter from \(inputFormat) to \(targetFormat)")
-            return false
-        }
-        self.audioConverter = converter
-
-        installTap(on: inputNode, format: inputFormat)
-
         // Device changes (AirPods connect/disconnect, default-input switch) invalidate both
         // the tap's captured format and the converter; AVAudioEngine posts this after
         // reconfiguring itself. Handled on main - isEngineRunning is main-thread-only.
@@ -109,44 +240,65 @@ final class AudioCaptureEngine {
             }
         }
 
-        do {
-            audioEngine.prepare()
-            try audioEngine.start()
-            isEngineRunning = true
-            Logger.success("MIC", "Audio engine pre-warmed & running in background (zero keydown wake-up latency).")
-            return true
-        } catch {
-            Logger.error("MIC", "Could not start AVAudioEngine: \(error.localizedDescription)")
-            return false
-        }
+        return recovery.start()
     }
 
-    // Tap callback: ONLY copies incoming buffer and pushes to serial audio queue (0 blocking operations on render thread)
+    // Bound copied hardware buffers before allocation; callbacks never perform conversion.
     private func installTap(on inputNode: AVAudioInputNode, format: AVAudioFormat) {
+        let epoch = bufferEpoch
+        let generation = recovery.generation
+        let healthDelivery = self.healthDelivery
+        let overloadDelivery = self.overloadDelivery
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] (buffer, when) in
             guard let self = self else { return }
-            let bufferCopy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity)!
-            bufferCopy.frameLength = buffer.frameLength
-            for i in 0..<Int(buffer.format.channelCount) {
-                if let src = buffer.floatChannelData?[i], let dst = bufferCopy.floatChannelData?[i] {
-                    memcpy(dst, src, Int(buffer.frameLength) * MemoryLayout<Float>.size)
+            self.lock.lock()
+            let currentEpoch = self.bufferEpoch == epoch
+            let accepted = currentEpoch && self.queuedBuffers < 8
+            if accepted { self.queuedBuffers += 1 } else if currentEpoch && self.isRecording { self.turnInterrupted = true }
+            self.lock.unlock()
+            guard accepted else {
+                if currentEpoch { overloadDelivery.submit(epoch) }
+                return
+            }
+            var enqueued = false
+            defer {
+                if !enqueued {
+                    self.lock.lock()
+                    self.queuedBuffers -= 1
+                    if self.isRecording { self.turnInterrupted = true }
+                    self.lock.unlock()
+                    overloadDelivery.submit(epoch)
                 }
             }
+            guard let bufferCopy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameCapacity) else { return }
+            bufferCopy.frameLength = buffer.frameLength
+            let source = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+            let destination = UnsafeMutableAudioBufferListPointer(bufferCopy.mutableAudioBufferList)
+            guard source.count == destination.count else { return }
+            for index in source.indices {
+                guard let src = source[index].mData, let dst = destination[index].mData,
+                    source[index].mDataByteSize <= destination[index].mDataByteSize
+                else { return }
+                memcpy(dst, src, Int(source[index].mDataByteSize))
+            }
+            let capturedAt = ProcessInfo.processInfo.systemUptime
 
+            enqueued = true
             self.audioProcessingQueue.async {
-                self.processIncomingBufferOnQueue(bufferCopy)
+                defer { self.lock.lock(); self.queuedBuffers -= 1; self.lock.unlock() }
+                self.lock.lock()
+                let current = self.bufferEpoch == epoch
+                self.lock.unlock()
+                guard current else { return }
+                self.processIncomingBufferOnQueue(bufferCopy, generation: generation, capturedAt: capturedAt, healthDelivery: healthDelivery)
             }
         }
     }
 
-    // Main-thread-only (observer queue is .main). Rebuilds the tap and converter around the
-    // new input device's format, then restarts the engine only if it was meant to be running
-    // (an idle-suspended mic stays suspended; the next key-down re-arms it as usual).
+    // A configuration notification can arrive before the replacement format is usable.
+    // Recovery preserves run intent and retries the complete tap/converter setup.
     private func handleConfigurationChange() {
-        // The engine has already stopped itself; a pinned INPUT_DEVICE must survive the
-        // default-input flip that usually triggers this (if the pinned device vanished, the
-        // HAL has already fallen back).
-        rebuildInput(wasRunning: isEngineRunning, reason: "Input device changed")
+        recovery.configurationChanged()
     }
 
     // INPUT_DEVICE=auto, main-thread-only. No-op unless the lid state now wants a different
@@ -167,9 +319,7 @@ final class AudioCaptureEngine {
             return
         }
         pendingReselect = false
-        let wasRunning = isEngineRunning
-        if wasRunning { audioEngine.stop() }
-        rebuildInput(wasRunning: wasRunning, reason: "Lid \(InputDeviceCatalog.lidClosed() == true ? "closed" : "open")")
+        recovery.configurationChanged()
     }
 
     // Main-thread-only, called after each turn settles.
@@ -178,45 +328,50 @@ final class AudioCaptureEngine {
         reselectForLidState()
     }
 
-    // Engine must already be stopped (or never started). Pins/records the input device,
-    // rebuilds the tap and converter around its format, restarts only if it was running.
-    private func rebuildInput(wasRunning: Bool, reason: String) {
+    private func interruptCapture(_ reason: String) {
+        lock.lock()
+        let notify = isRecording && !interruptionNotified
+        if isRecording { turnInterrupted = true; interruptionNotified = true }
+        lock.unlock()
+        if notify { onCaptureInterrupted?(reason) }
+    }
+
+    private func stopHardware() {
+        audioEngine.stop()
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        audioProcessingQueue.sync {
+            lock.lock()
+            bufferEpoch &+= 1
+            preRollRingBuffer.removeAll(keepingCapacity: true)
+            lock.unlock()
+            audioConverter = nil
+        }
+    }
+
+    private func rebuildHardware() -> Bool {
         let inputNode = audioEngine.inputNode
-        inputNode.removeTap(onBus: 0)
         applyInputDeviceSelection()
         let inputFormat = inputNode.outputFormat(forBus: 0)
-
-        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            Logger.error("MIC", "\(reason) but converter rebuild failed (\(inputFormat)) - dictation disabled until restart.")
-            isEngineRunning = false
-            return
+        guard inputFormat.sampleRate.isFinite, inputFormat.sampleRate > 0,
+            inputFormat.channelCount > 0,
+            let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+        else {
+            Logger.warn("MIC", "Microphone format unavailable; recovery will retry.")
+            return false
         }
-        // audioConverter is read on audioProcessingQueue; hop onto it so the swap can't
-        // tear a conversion in progress. (A stale-format buffer already queued just fails
-        // its convert and is dropped - one buffer, ~64ms, at worst.)
         audioProcessingQueue.sync { self.audioConverter = converter }
-
         installTap(on: inputNode, format: inputFormat)
-
-        lock.lock()
-        let recording = isRecording
-        lock.unlock()
-        if recording {
-            Logger.warn("MIC", "Input device changed mid-dictation - this turn may be truncated.")
-        }
-
-        if wasRunning {
-            audioEngine.prepare()
-            do {
-                try audioEngine.start()
-                isEngineRunning = true
-                Logger.info("MIC", "\(reason) - engine rebuilt on \(currentInputLabel) (\(Int(inputFormat.sampleRate)) Hz, \(inputFormat.channelCount) ch).")
-            } catch {
-                isEngineRunning = false
-                Logger.error("MIC", "\(reason) and engine restart failed: \(error.localizedDescription) - next key-down will retry.")
-            }
-        } else {
-            Logger.info("MIC", "\(reason) while mic idle - tap rebuilt for \(currentInputLabel).")
+        tapInstalled = true
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+            return true
+        } catch {
+            Logger.warn("MIC", "Microphone start failed; recovery will retry.")
+            return false
         }
     }
 
@@ -276,45 +431,34 @@ final class AudioCaptureEngine {
         return activeID
     }
 
-    // Releases the microphone (the macOS status-bar mic indicator turns off) while keeping the
-    // tap installed, so resumeEngine() only pays hardware spin-up. Refuses mid-dictation.
-    // Both suspend and resume are main-thread-only, matching where the idle timer and the
-    // key-down handler run.
     func suspendEngine() {
         lock.lock()
         let recording = isRecording
         lock.unlock()
-        guard isEngineRunning, !recording else { return }
-
-        audioEngine.stop()
-        isEngineRunning = false
-
-        // Minutes-old ambient audio must not be prepended to the next dictation as pre-roll.
-        lock.lock()
-        preRollRingBuffer.removeAll(keepingCapacity: true)
-        lock.unlock()
+        guard !recording else { return }
+        recovery.suspend()
     }
 
-    // Re-acquires the microphone after an idle suspend (~50-200ms hardware spin-up, blocking).
-    func resumeEngine() -> Bool {
-        guard !isEngineRunning else { return true }
-        do {
-            audioEngine.prepare()
-            try audioEngine.start()
-            isEngineRunning = true
-            return true
-        } catch {
-            Logger.error("MIC", "Could not restart AVAudioEngine after idle: \(error.localizedDescription)")
-            return false
+    func ensureReady(completion: @escaping (Bool) -> Void) {
+        recovery.ensureReady(completion)
+    }
+
+    func cancelPendingReadiness() { recovery.cancelPendingReadiness() }
+
+    private func processIncomingBufferOnQueue(_ inputBuffer: AVAudioPCMBuffer, generation: UInt64, capturedAt: TimeInterval, healthDelivery: MainQueueDelivery<(UInt64, TimeInterval)>) {
+        guard let converter = audioConverter, inputBuffer.format == converter.inputFormat,
+            inputBuffer.format.sampleRate.isFinite, inputBuffer.format.sampleRate > 0
+        else {
+            discardFailedBuffer()
+            return
         }
-    }
-
-    private func processIncomingBufferOnQueue(_ inputBuffer: AVAudioPCMBuffer) {
-        guard let converter = audioConverter else { return }
 
         let ratio = 16000.0 / inputBuffer.format.sampleRate
         let outCapacity = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio + 64)
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return }
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else {
+            discardFailedBuffer()
+            return
+        }
 
         var error: NSError?
         var consumed = false
@@ -330,11 +474,17 @@ final class AudioCaptureEngine {
             }
         }
 
-        if status == .haveData, outputBuffer.frameLength > 0, let int16Pointer = outputBuffer.int16ChannelData?[0] {
+        guard status != .error, error == nil else {
+            discardFailedBuffer()
+            return
+        }
+        if outputBuffer.frameLength > 0, let int16Pointer = outputBuffer.int16ChannelData?[0] {
             let byteCount = Int(outputBuffer.frameLength) * 2
             let chunkData = Data(bytes: int16Pointer, count: byteCount)
+            healthDelivery.submit((generation, capturedAt))
 
             lock.lock()
+            if turnInterrupted && isRecording { lock.unlock(); return }
             let currentlyRecording = isRecording
 
             if !currentlyRecording {
@@ -413,6 +563,15 @@ final class AudioCaptureEngine {
         }
     }
 
+    // A single conversion failure loses speech even when the following buffer is healthy.
+    private func discardFailedBuffer() {
+        lock.lock()
+        if isRecording { turnInterrupted = true }
+        let epoch = bufferEpoch
+        lock.unlock()
+        overloadDelivery.submit(epoch)
+    }
+
     private func renderVolumeMeter(db: Double) -> String {
         let normalized = max(0.0, min(1.0, (db + 50.0) / 50.0))
         let totalBlocks = 12
@@ -461,12 +620,16 @@ final class AudioCaptureEngine {
         }
     }
 
-    func startRecording() {
+    @discardableResult func startRecording() -> Bool {
+        guard recovery.healthy else { return false }
         audioProcessingQueue.sync { startRecordingOnQueue() }
+        return true
     }
 
     private func startRecordingOnQueue() {
         lock.lock()
+        turnInterrupted = false
+        interruptionNotified = false
         recordedPCMData.removeAll(keepingCapacity: true)
         pendingChunkBuffer.removeAll(keepingCapacity: true)
         turnMaxAbsSample = 0
@@ -508,7 +671,9 @@ final class AudioCaptureEngine {
         }
     }
 
-    func stopRecording(gracePeriodMs: Int, maxTrailMs: Int, silenceThresholdDb: Double) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?, speechFrames: Int) {
+    func stopRecording(gracePeriodMs: Int, maxTrailMs: Int, silenceThresholdDb: Double) -> (
+        pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?, speechFrames: Int, interrupted: Bool
+    ) {
         // True hold duration is measured at entry, BEFORE the post-roll wait - otherwise the
         // grace period pads every tap past the caller's micro-click duration threshold.
         let stopRequestTime = ProcessInfo.processInfo.systemUptime
@@ -582,7 +747,7 @@ final class AudioCaptureEngine {
     }
 
     private func finishRecording(stopRequestTime: CFAbsoluteTime, silenceThresholdDb: Double) -> (
-        pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?, speechFrames: Int
+        pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?, speechFrames: Int, interrupted: Bool
     ) {
         // The gate and final chunk delivery share the capture queue. A new hardware buffer
         // cannot send later audio ahead of the pre-roll or after the end-of-turn signal.
@@ -591,6 +756,7 @@ final class AudioCaptureEngine {
 
         // 3. Real captured byte count: taken before the silence flush below is appended, and
         // excluding the prepended pre-roll, so callers see genuine key-held speech audio only.
+        let interrupted = turnInterrupted
         let capturedBytes = max(0, recordedPCMData.count - preRollBytesInTurn)
 
         // 4. Collect any trailing pending chunk; fired via onAudioChunk after the lock is released
@@ -623,19 +789,18 @@ final class AudioCaptureEngine {
         lock.unlock()
 
         // 7. Fire chunk callbacks outside the lock. Ordering preserved: trailing real audio first, then silence.
-        if let trailing = trailingChunk {
+        if !interrupted, let trailing = trailingChunk {
             onAudioChunk?(trailing)
         }
-        if !silenceData.isEmpty {
+        if !interrupted, !silenceData.isEmpty {
             onAudioChunk?(silenceData)
         }
 
         Logger.endMeter()
-        return (data, duration, chunks, capturedBytes, peakDb, speechFrames)
+        return (data, duration, chunks, capturedBytes, peakDb, speechFrames, interrupted)
     }
 
     func stopEngine() {
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        recovery.suspend()
     }
 }

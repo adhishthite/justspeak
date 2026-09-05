@@ -55,6 +55,7 @@ final class HotkeyManager {
     private let binding: KeyBinding
     private let mode: String
     private var isKeyDown: Bool = false
+    private var physicalKeyDown = false
     private var lastStateChangeTime: CFAbsoluteTime = 0
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -166,6 +167,9 @@ final class HotkeyManager {
         let now = ProcessInfo.processInfo.systemUptime
 
         if mode == "toggle" {
+            let pressEdge = pressed && !physicalKeyDown
+            physicalKeyDown = pressed
+            guard pressEdge else { return }
             // Both toggle transitions fire on a press edge, so the 80ms debounce applies to both.
             guard (now - lastStateChangeTime) > 0.08 else { return }  // 80ms debounce
             if pressed && !isKeyDown {
@@ -192,6 +196,11 @@ final class HotkeyManager {
                 onKeyUp?()
             }
         }
+    }
+
+    // External completion or refused startup must reset toggle intent, not physical state.
+    func resetToggle() {
+        if mode == "toggle" { isKeyDown = false }
     }
 
     func stop() {

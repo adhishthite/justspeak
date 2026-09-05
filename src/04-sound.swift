@@ -75,7 +75,7 @@ final class SoundManager {
     // from Pop (release) and acknowledgment_sent (commit), so the three moments of a
     // locked turn never sound alike. Fires ducked - see the release note above.
     private static let lockSoundPaths = [
-        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/payment_success.aif",
+        "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/payment_success.aif"
     ]
 
     private static var lockSound: NSSound? = {

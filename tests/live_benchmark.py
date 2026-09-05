@@ -13,6 +13,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--pcm', type=Path, required=True, help='Synthetic 16 kHz mono signed PCM16 LE')
 parser.add_argument('--baseline', default='c82d3a1')
 parser.add_argument('--rounds', type=int, default=2)
+parser.add_argument('--flush-ms', type=int, default=700)
+parser.add_argument('--baseline-flush-ms', type=int, default=700)
+parser.add_argument('--chunk-ms', type=int, default=150)
 parser.add_argument('--output', type=Path, required=True)
 args = parser.parse_args()
 assert os.environ.get('GEMINI_API_KEY'), 'GEMINI_API_KEY must be set in the environment'
@@ -45,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix='justspeak-live-') as tmp:
             print(f'RUN round={index + 1} version={version}', flush=True)
             script = Path(tmp) / 'benchmark.swift'
             script.write_text(logger + versions[version] + '\n' + (root / 'tests/live-fixture.swift').read_text())
-            result = subprocess.run(['/usr/bin/swift', '-module-cache-path', str(Path(tempfile.gettempdir()) / 'justspeak-test-module-cache'), str(script), '150', '700', 'false', str(args.pcm.resolve())], capture_output=True, text=True, timeout=90)
+            result = subprocess.run(['/usr/bin/swift', '-module-cache-path', str(Path(tempfile.gettempdir()) / 'justspeak-test-module-cache'), str(script), str(args.chunk_ms), str(args.baseline_flush_ms if version == 'before' else args.flush_ms), 'false', str(args.pcm.resolve())], capture_output=True, text=True, timeout=90)
             for line in result.stdout.splitlines():
                 if line.startswith('RESULT {'):
                     row = json.loads(line[7:])

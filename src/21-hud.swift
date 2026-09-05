@@ -196,6 +196,17 @@ final class FloatingHUD: NSObject {
     private var widthSpring = SpringChannel(
         value: HUDMetrics.minPillWidth, target: HUDMetrics.minPillWidth, stiffness: 380, dampingRatio: 0.86, epsilon: 0.05)
     private var shownTarget = false
+    private struct FrameState: Equatable {
+        let presence: CGFloat
+        let width: CGFloat
+        let bounds: CGRect
+        let notchHeight: CGFloat
+        let physicalNotch: Bool
+        let style: String
+        let privacy: Bool
+        let reducedMotion: Bool
+    }
+    private var lastFrameState: FrameState?
 
     // Entrance animation; set once at startup from config. "slide" is the shipped default.
     var revealStyle: String = "slide"
@@ -408,6 +419,7 @@ final class FloatingHUD: NSObject {
     }
 
     private func applyScreenLayout() {
+        lastFrameState = nil
         let screen = layoutScreen()
         self.screenFrame = screen.frame
         self.notchInfo = NotchGeometry.detect(screen: screen)
@@ -536,6 +548,12 @@ final class FloatingHUD: NSObject {
         let p = max(0.0, presence.value)
         let w = min(max(widthSpring.value, HUDMetrics.minPillWidth), HUDMetrics.maxPillWidth)
         let hostBounds = hostView.bounds
+        let state = FrameState(
+            presence: p, width: w, bounds: hostBounds,
+            notchHeight: notchInfo.rect.height, physicalNotch: notchInfo.hasPhysicalNotch,
+            style: revealStyle, privacy: privacyMode, reducedMotion: reduceMotion)
+        guard state != lastFrameState else { return }
+        lastFrameState = state
         let pillTop = hostBounds.height - notchInfo.rect.height - HUDMetrics.pillGap
 
         // Each reveal style is a pure mapping from presence to geometry, so the SAME spring
@@ -932,7 +950,24 @@ final class FloatingHUD: NSObject {
         }
     }
 
+    func showStarting() {
+        hideWorkItem?.cancel()
+        if !shownTarget { showListening() }
+        clearLockRing()
+        notchGlowView.state = .processing
+        orbIcon.state = .processing
+        setHeader("Microphone", color: AppleDesign.siriCyan)
+        setTranscript("Getting ready…", color: .white, caret: false)
+        waveformView.reset()
+    }
+
+    func showBusy() {
+        // Keep the current turn's text and animation; acknowledge only the refused press.
+        setHeader("Finishing previous dictation", color: AppleDesign.siriCyan)
+    }
+
     func showProcessing() {
+        if !shownTarget { showListening() }
         hideWorkItem?.cancel()
         // Words still queued behind the lock hint are the freshest transcript there is.
         let deferred = deferredLiveText
@@ -974,6 +1009,7 @@ final class FloatingHUD: NSObject {
     }
 
     func showError(message: String) {
+        if !shownTarget { showListening() }
         hideWorkItem?.cancel()
         clearLockRing()
         notchGlowView.state = .error

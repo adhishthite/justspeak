@@ -78,6 +78,8 @@ extension GeminiLiveClient {
         lock.lock()
         isCommitting = true
         turnCommitTime = ProcessInfo.processInfo.systemUptime
+        commitWritesComplete = true
+        commitWritesCompletedAt = turnCommitTime
         turnCompletion = completion
         lock.unlock()
     }

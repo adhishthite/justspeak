@@ -48,8 +48,8 @@ setup:
 ## install: Alias for make setup
 install: setup
 
-## check: Run system permission diagnostics and API connectivity check
-check: check-permissions test-api
+## check: Run offline regression checks and source lint
+check: check-offline lint
 
 # swift-format ships inside the Apple toolchain (Xcode 16+ / matching CLT) as a
 # `swift format` subcommand - Apple-signed, so Santa-safe. SwiftLint is a third-party
@@ -84,3 +84,13 @@ benchmark:
 	@python3 tests/run.py --benchmark
 
 .PHONY: check-offline benchmark
+
+## check-hud: Verify synthetic HUD states (requires a macOS desktop; no mic or network)
+check-hud:
+	@python3 tests/run.py --hud
+
+## check-mic: Test microphone sharing and recovery without saving or transcribing audio
+check-mic:
+	@python3 tests/mic_hardware.py --run
+
+.PHONY: check-hud check-mic

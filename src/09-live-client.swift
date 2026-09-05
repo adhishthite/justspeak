@@ -17,6 +17,23 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private var reconnectEnabled = true
     private let sendQueue = DispatchQueue(label: "com.justspeak.send", qos: .userInitiated)
     private var turnWrites = DispatchGroup()
+    private struct PendingWrite {
+        let id: UInt64
+        let text: String
+        let admittedAt: Double
+        let writes: DispatchGroup
+    }
+    private var pendingWrites: [PendingWrite] = []
+    private var pendingWriteBytes = 0
+    private var nextWriteID: UInt64 = 0
+    private var writeTransport: (URLSessionWebSocketTask, String, @escaping (Error?) -> Void) -> Void = { task, text, completion in
+        task.send(.string(text), completionHandler: completion)
+    }
+    private var writeInFlight = false
+    private var turnSentAnyMessage = false
+    private var writeDeadline: DispatchWorkItem?
+    private static let maxPendingWriteBytes = 256 * 1024
+    private static let maxPendingWriteAge = 3.0
     var isConnected: Bool { lock.lock(); defer { lock.unlock() }; return connectedState }
     var isReady: Bool { lock.lock(); defer { lock.unlock() }; return readyState }
     var canCommitTurn: Bool {
@@ -73,6 +90,9 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         defer { lock.unlock() }
         return settlePathValue
     }
+    private var commitWritesComplete = false
+    private var commitWritesCompletedAt: Double = 0
+    private var serverCompletionReceived = false
     private var isCommitting: Bool = false
     private var hasFiredTurnCompletion: Bool = false
     private var turnCompletion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?
@@ -167,7 +187,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.webSocketTask = task
         readyState = false
         connectedState = false
-        if turnOpen { turnHasAudioGap = true }
+        if turnOpen && turnSentAnyMessage {
+            turnHasAudioGap = true
+            discardPendingWritesLocked()
+        }
         rotateWhenIdle = false
         lock.unlock()
         old?.cancel(with: .goingAway, reason: nil)
@@ -292,7 +315,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         guard epoch == connectionID else { lock.unlock(); return }
         readyState = false
         connectedState = false
-        if turnOpen { turnHasAudioGap = true }
+        if turnOpen && turnSentAnyMessage {
+            turnHasAudioGap = true
+            discardPendingWritesLocked()
+        }
         let completion = hasFiredTurnCompletion ? nil : turnCompletion
         turnCompletion = nil
         if completion != nil { hasFiredTurnCompletion = true; isCommitting = false }
@@ -339,7 +365,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         var didCompleteSetup = false
         var shouldScheduleReconnect = false
         var liveTextUpdate: (label: String, elapsedMs: Double, fullText: String, textCopy: String)? = nil
-        var turnCompletionFire: (completion: ((Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void)?, text: String, firstTokenMs: Double, totalMs: Double)? = nil
+        var shouldCompleteServerTurn = false
         // Set when a post-commit token arrives while committing: elapsed time since turnCommitTime,
         // used after unlock to (re)schedule the settle check. Finals get the short authoritative
         // grace; interims get the (mode-aware) quiet window.
@@ -464,31 +490,11 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             let isTurnComplete = (serverContent["turnComplete"] as? Bool) ?? (serverContent["turnComplete"] != nil)
             let isGenComplete = (serverContent["generationComplete"] as? Bool) ?? (serverContent["generationComplete"] != nil)
 
-            if (isTurnComplete || isGenComplete) && isCommitting && !turnHasAudioGap && !currentTurnText.isEmpty && !hasFiredTurnCompletion {
-                turnOpen = false
-                shouldScheduleReconnect = rotateWhenIdle
-                completedUsage = usageSnapshot()
-                hasFiredTurnCompletion = true
-                isCommitting = false
-                settlePathValue = "server_turn_complete"
-                settleWorkItem?.cancel()
-                settleWorkItem = nil
-                settleMaxWorkItem?.cancel()
-                settleMaxWorkItem = nil
-
-                let totalLatencyMs = (ProcessInfo.processInfo.systemUptime - turnCommitTime) * 1000.0
-                let text = currentTurnText
-                currentTurnText = ""
-                committedTranscript = ""
-                interimTranscript = ""
-                let firstToken = firstTokenLatencyMs
-                firstTokenLatencyMs = 0
-
-                let completion = self.turnCompletion
-                self.turnCompletion = nil
-
-                turnCompletionFire = (completion: completion, text: text, firstTokenMs: firstToken, totalMs: totalLatencyMs)
+            if (isTurnComplete || isGenComplete) && isCommitting && !turnHasAudioGap && !hasFiredTurnCompletion {
+                serverCompletionReceived = true
             }
+            shouldCompleteServerTurn = serverCompletionReceived && commitWritesComplete
+
         }
 
         lock.unlock()
@@ -499,6 +505,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             connectionFailed(epoch: epoch, error: NSError(domain: "JustSpeak", code: -3, userInfo: [NSLocalizedDescriptionKey: "Live API rejected the request."]))
         }
         if didCompleteSetup {
+            pumpWrites()
             Logger.success("WS", "Gemini Live session established & ready for streaming.")
         }
         if shouldScheduleReconnect {
@@ -515,10 +522,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 "\(ANSI.bold)\(ANSI.cyan)\(update.label)\(ANSI.reset) [\(String(format: "%.0f", update.elapsedMs))ms]: \(ANSI.bold)\(update.fullText.replacingOccurrences(of: "\n", with: " "))\(ANSI.reset)"
             )
         }
-        if let fire = turnCompletionFire {
-            fire.completion?(.success((text: fire.text, firstTokenMs: fire.firstTokenMs, totalMs: fire.totalMs)))
-            Logger.endMeter()
-        }
+        if shouldCompleteServerTurn { completeServerTurnIfReady(turn: messageTurn) }
         // A post-commit token arrived: (re)schedule the quiet-window settle check, never
         // earlier than minPostCommitWait after commit. Scheduling happens off-lock; the
         // pointer swap that replaces the previous pending item is its own short lock scope.
@@ -586,7 +590,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     // truth, not which timer fired.
     private func attemptSettle(turn: UInt64) {
         lock.lock()
-        guard turn == turnID, isCommitting, !hasFiredTurnCompletion else {
+        guard turn == turnID, isCommitting, commitWritesComplete, !hasFiredTurnCompletion else {
             lock.unlock()
             return
         }
@@ -601,8 +605,13 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                     userInfo: [NSLocalizedDescriptionKey: "Live connection missed part of the recording."]))
             return
         }
+        if serverCompletionReceived && !currentTurnText.isEmpty {
+            lock.unlock()
+            completeServerTurnIfReady(turn: turn)
+            return
+        }
         let now = ProcessInfo.processInfo.systemUptime
-        let elapsedCommit = now - turnCommitTime
+        let elapsedCommit = now - commitWritesCompletedAt
         let text = currentTurnText
         let postCommitTokenTime = lastPostCommitTokenTime
         let postCommitFinalTime = lastPostCommitFinalTime
@@ -637,13 +646,14 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         hasFiredTurnCompletion = true
         isCommitting = false
         turnOpen = false
+        discardPendingWritesLocked()
         settlePathValue = timedOut ? "timeout" : firedRule
         settleWorkItem?.cancel()
         settleWorkItem = nil
         settleMaxWorkItem?.cancel()
         settleMaxWorkItem = nil
 
-        let totalLatencyMs = elapsedCommit * 1000.0
+        let totalLatencyMs = (now - turnCommitTime) * 1000.0
         currentTurnText = ""
         committedTranscript = ""
         interimTranscript = ""
@@ -675,13 +685,17 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         lock.lock()
         turnID &+= 1
         turnOpen = true
-        turnHasAudioGap = !readyState
+        discardPendingWritesLocked()
+        turnHasAudioGap = false
+        turnSentAnyMessage = false
         turnWrites = DispatchGroup()
         self.settleWorkItem?.cancel()
         self.settleWorkItem = nil
         self.settleMaxWorkItem?.cancel()
         self.settleMaxWorkItem = nil
         self.isCommitting = false
+        commitWritesComplete = false
+        serverCompletionReceived = false
         self.settlePathValue = nil
         self.currentTurnText = ""
         self.committedTranscript = ""
@@ -720,32 +734,97 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private static let audioChunkJSONPrefix = "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\""
     private static let audioChunkJSONSuffix = "\"}}}"
 
+    // Reservations include the in-flight write. Invalidating a turn releases them once;
+    // late transport callbacks cannot release reservations belonging to the next turn.
+    private func discardPendingWritesLocked() {
+        writeDeadline?.cancel()
+        writeDeadline = nil
+        for write in pendingWrites { write.writes.leave() }
+        pendingWrites.removeAll(keepingCapacity: true)
+        pendingWriteBytes = 0
+        writeInFlight = false
+    }
+
+    private func armWriteDeadlineLocked() {
+        writeDeadline?.cancel()
+        guard let first = pendingWrites.first else { writeDeadline = nil; return }
+        let turn = turnID
+        let id = first.id
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            guard self.turnID == turn, self.pendingWrites.first?.id == id else {
+                self.lock.unlock(); return
+            }
+            self.turnHasAudioGap = true
+            self.discardPendingWritesLocked()
+            let epoch = self.connectionID
+            self.lock.unlock()
+            self.connectionFailed(epoch: epoch, error: Self.writeBacklogError())
+        }
+        writeDeadline = item
+        let remaining = max(0, first.admittedAt + Self.maxPendingWriteAge - ProcessInfo.processInfo.systemUptime)
+        sendQueue.asyncAfter(deadline: .now() + remaining, execute: item)
+    }
+
+    private static func writeBacklogError() -> NSError {
+        NSError(domain: "JustSpeak", code: -4, userInfo: [NSLocalizedDescriptionKey: "Live audio delivery exceeded its queue budget."])
+    }
+
     private func sendTurnMessage(_ text: String) {
         lock.lock()
-        guard readyState, turnOpen, let task = webSocketTask else {
-            if turnOpen { turnHasAudioGap = true }
+        guard turnOpen, !turnHasAudioGap else { lock.unlock(); return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if text.utf8.count > Self.maxPendingWriteBytes - pendingWriteBytes || pendingWrites.first.map({ now - $0.admittedAt >= Self.maxPendingWriteAge }) == true {
+            turnHasAudioGap = true
+            discardPendingWritesLocked()
+            let epoch = connectionID
             lock.unlock()
+            connectionFailed(epoch: epoch, error: Self.writeBacklogError())
             return
         }
-        let epoch = connectionID
-        let turn = turnID
-        let writes = turnWrites
-        writes.enter()
+        nextWriteID &+= 1
+        turnWrites.enter()
+        pendingWrites.append(PendingWrite(id: nextWriteID, text: text, admittedAt: now, writes: turnWrites))
+        pendingWriteBytes += text.utf8.count
+        if pendingWrites.count == 1 { armWriteDeadlineLocked() }
         lock.unlock()
+        pumpWrites()
+    }
+
+    private func pumpWrites() {
         sendQueue.async { [weak self] in
-            guard let self = self else { writes.leave(); return }
+            guard let self = self else { return }
             self.lock.lock()
-            let current = epoch == self.connectionID && turn == self.turnID && self.turnOpen
+            guard self.readyState, self.turnOpen, !self.turnHasAudioGap,
+                !self.writeInFlight, let write = self.pendingWrites.first,
+                let task = self.webSocketTask
+            else { self.lock.unlock(); return }
+            self.writeInFlight = true
+            self.turnSentAnyMessage = true
+            let epoch = self.connectionID
+            let turn = self.turnID
             self.lock.unlock()
-            guard current else { writes.leave(); return }
-            task.send(.string(text)) { [weak self] error in
-                if let self = self, let error = error {
-                    self.lock.lock()
-                    let current = self.turnID == turn && self.connectionID == epoch
+            self.writeTransport(task, write.text) { [weak self] error in
+                guard let self = self else { return }
+                self.lock.lock()
+                guard self.turnID == turn, self.connectionID == epoch,
+                    self.pendingWrites.first?.id == write.id
+                else { self.lock.unlock(); return }
+                if let error = error {
+                    self.turnHasAudioGap = true
+                    self.discardPendingWritesLocked()
                     self.lock.unlock()
-                    if current { self.connectionFailed(epoch: epoch, error: error) }
+                    self.connectionFailed(epoch: epoch, error: error)
+                    return
                 }
-                writes.leave()
+                self.pendingWrites.removeFirst()
+                self.pendingWriteBytes -= write.text.utf8.count
+                self.writeInFlight = false
+                write.writes.leave()
+                self.armWriteDeadlineLocked()
+                self.lock.unlock()
+                self.pumpWrites()
             }
         }
     }
@@ -773,6 +852,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         }
         self.turnCommitTime = ProcessInfo.processInfo.systemUptime
         self.isCommitting = true
+        commitWritesComplete = false
+        serverCompletionReceived = false
         self.lastPostCommitTokenTime = nil
         self.lastPostCommitFinalTime = nil
         self.turnCompletion = completion
@@ -839,29 +920,71 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             sendTurnMessage(jsonString)
         }
 
-        // 4. For dedicated STT Transcribe models: schedule event-driven settlement checks
-        // instead of polling. Two one-shot items cover the four settle rules:
-        //   - settleWorkItem: fires at initialWaitWithoutTokens (rule: pre-commit text, no
-        //     post-commit tokens); handleIncomingMessage reschedules this same slot to the
-        //     quiet-window deadline each time a post-commit token arrives (rule: quiet window
-        //     after post-commit tokens).
-        //   - settleMaxWorkItem: fixed hard ceiling at maxWait, never rescheduled.
-        // Both call attemptSettle(), which re-validates against authoritative locked state
-        // rather than trusting which timer fired.
-        if model.contains("transcribe") {
-            let initialItem = DispatchWorkItem { [weak self] in self?.attemptSettle(turn: expectedTurn) }
-            let maxItem = DispatchWorkItem { [weak self] in self?.attemptSettle(turn: expectedTurn) }
+        lock.lock()
+        let terminalWrites = turnWrites
+        lock.unlock()
+        terminalWrites.notify(queue: sendQueue) { [weak self] in
+            self?.finishCommitWrites(turn: expectedTurn)
+        }
+    }
 
-            lock.lock()
+    private func finishCommitWrites(turn expectedTurn: UInt64) {
+        lock.lock()
+        guard turnID == expectedTurn, isCommitting, !hasFiredTurnCompletion,
+            !turnHasAudioGap, readyState
+        else { lock.unlock(); return }
+        commitWritesComplete = true
+        commitWritesCompletedAt = ProcessInfo.processInfo.systemUptime
+        var initialDelay = Self.settleInitialWaitWithoutTokens
+        if let final = lastPostCommitFinalTime {
+            initialDelay = max(0, Self.settleFinalGrace - (commitWritesCompletedAt - final))
+        } else if let token = lastPostCommitTokenTime {
+            let quiet = usesManualActivity ? Self.settleInterimQuietManual : Self.settleQuietWindow
+            initialDelay = max(Self.settleMinPostCommitWait, quiet - (commitWritesCompletedAt - token))
+        }
+        let initialItem = DispatchWorkItem { [weak self] in self?.attemptSettle(turn: expectedTurn) }
+        let maxItem = DispatchWorkItem { [weak self] in self?.attemptSettle(turn: expectedTurn) }
+        if model.contains("transcribe") {
             settleWorkItem?.cancel()
             settleMaxWorkItem?.cancel()
             settleWorkItem = initialItem
             settleMaxWorkItem = maxItem
-            lock.unlock()
-
-            settleQueue.asyncAfter(deadline: .now() + Self.settleInitialWaitWithoutTokens + Self.settleTimerCushion, execute: initialItem)
+        }
+        lock.unlock()
+        // Preserve finals and server completion received before the send callbacks drained.
+        completeServerTurnIfReady(turn: expectedTurn)
+        if model.contains("transcribe") {
+            attemptSettle(turn: expectedTurn)
+            settleQueue.asyncAfter(deadline: .now() + initialDelay + Self.settleTimerCushion, execute: initialItem)
             settleQueue.asyncAfter(deadline: .now() + Self.settleMaxWait + Self.settleTimerCushion, execute: maxItem)
         }
+    }
+
+    private func completeServerTurnIfReady(turn expectedTurn: UInt64) {
+        lock.lock()
+        guard turnID == expectedTurn, isCommitting, commitWritesComplete, serverCompletionReceived,
+            !turnHasAudioGap, !currentTurnText.isEmpty, !hasFiredTurnCompletion
+        else { lock.unlock(); return }
+        turnOpen = false
+        completedUsage = usageSnapshot()
+        hasFiredTurnCompletion = true
+        isCommitting = false
+        settlePathValue = "server_turn_complete"
+        settleWorkItem?.cancel(); settleWorkItem = nil
+        settleMaxWorkItem?.cancel(); settleMaxWorkItem = nil
+        let elapsed = (ProcessInfo.processInfo.systemUptime - turnCommitTime) * 1000
+        let text = currentTurnText
+        currentTurnText = ""; committedTranscript = ""; interimTranscript = ""
+        let first = firstTokenLatencyMs
+        firstTokenLatencyMs = 0
+        let callback = turnCompletion
+        turnCompletion = nil
+        let rotate = rotateWhenIdle
+        let epoch = connectionID
+        lock.unlock()
+        if rotate { scheduleReconnect(epoch: epoch, onlyWhenIdle: true) }
+        callback?(.success((text: text, firstTokenMs: first, totalMs: elapsed)))
+        Logger.endMeter()
     }
 
     var hasReceivedTokens: Bool {
@@ -894,6 +1017,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         lock.lock()
         let needsRotation = turnOpen
         turnOpen = false
+        discardPendingWritesLocked()
         turnCompletion = nil
         isCommitting = false
         hasFiredTurnCompletion = true
@@ -918,6 +1042,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         connectedState = false
         readyState = false
         if turnOpen { turnHasAudioGap = true }
+        discardPendingWritesLocked()
         let completion = turnCompletion
         turnCompletion = nil
         isCommitting = false

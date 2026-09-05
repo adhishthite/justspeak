@@ -61,17 +61,31 @@ struct Diagnostics {
             return
         }
 
-        engine.startRecording()
+        var ready: Bool?
+        engine.ensureReady { ready = $0 }
+        let readyDeadline = Date().addingTimeInterval(4)
+        while ready == nil && Date() < readyDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        guard ready == true, engine.startRecording() else {
+            engine.stopEngine()
+            Logger.error("TEST", "Microphone did not become ready.")
+            return
+        }
         SoundManager.playStartSound()
 
         for remaining in (1...3).reversed() {
             print("\(ANSI.cyan)Recording... \(remaining)s remaining\(ANSI.reset)")
-            Thread.sleep(forTimeInterval: 1.0)
+            RunLoop.current.run(until: Date().addingTimeInterval(1.0))
         }
 
-        let (pcmData, duration, chunks, _, _, _) = engine.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
+        let (pcmData, duration, chunks, _, _, _, interrupted) = engine.stopRecording(gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
         SoundManager.playCommitSound()
         engine.stopEngine()
+        guard !interrupted else {
+            Logger.error("TEST", "Microphone interrupted; incomplete audio was not sent.")
+            return
+        }
 
         Logger.success("TEST", "Recorded \(String(format: "%.2f", duration))s audio (\(chunks) chunks, \(pcmData.count) bytes).")
 

@@ -1,0 +1,80 @@
+[
+  {
+    "aligned": false,
+    "audio_end_to_settle_ms": 561.559375,
+    "chunk_ms": 150,
+    "client_commit_ms": 560.7355833344627,
+    "flush_ms": 700,
+    "repetition": 1,
+    "send_drain_ms": 0.8237916655373283,
+    "settle_path": "server_turn_complete",
+    "text": "Please send the Kubernetes deployment report to Priya by Friday. Set the retry limit to 27.",
+    "version": "before",
+    "round": 1
+  },
+  {
+    "aligned": false,
+    "audio_end_to_settle_ms": 555.288083,
+    "chunk_ms": 150,
+    "client_commit_ms": 554.4855416665087,
+    "flush_ms": 700,
+    "repetition": 2,
+    "send_drain_ms": 0.8025413334913765,
+    "settle_path": "server_turn_complete",
+    "text": "Please send the Kubernetes deployment report to Priya by Friday. Set the retry limit to 27.",
+    "version": "before",
+    "round": 1
+  },
+  {
+    "aligned": false,
+    "audio_end_to_settle_ms": 579.880458,
+    "chunk_ms": 150,
+    "client_commit_ms": 578.1612083228538,
+    "flush_ms": 700,
+    "repetition": 3,
+    "send_drain_ms": 1.7192496771461947,
+    "settle_path": "server_turn_complete",
+    "text": "Please send the Kubernetes deployment report to Priya by Friday. Set the retry limit to 27.",
+    "version": "before",
+    "round": 1
+  },
+  {
+    "aligned": false,
+    "audio_end_to_settle_ms": 572.537416,
+    "chunk_ms": 150,
+    "client_commit_ms": 571.4676666684682,
+    "flush_ms": 700,
+    "repetition": 1,
+    "send_drain_ms": 1.0697493315318525,
+    "settle_path": "server_turn_complete",
+    "text": "Please send the Kubernetes deployment report to Priya by Friday. Set the retry limit to 27.",
+    "version": "after",
+    "round": 1
+  },
+  {
+    "aligned": false,
+    "audio_end_to_settle_ms": 551.40525,
+    "chunk_ms": 150,
+    "client_commit_ms": 549.5270833343966,
+    "flush_ms": 700,
+    "repetition": 2,
+    "send_drain_ms": 1.8781666656034304,
+    "settle_path": "server_turn_complete",
+    "text": "Please send the Kubernetes deployment report to Priya by Friday. Set the retry limit to 27.",
+    "version": "after",
+    "round": 1
+  },
+  {
+    "aligned": false,
+    "audio_end_to_settle_ms": 564.133417,
+    "chunk_ms": 150,
+    "client_commit_ms": 562.8808333422057,
+    "flush_ms": 700,
+    "repetition": 3,
+    "send_drain_ms": 1.2525836577942755,
+    "settle_path": "server_turn_complete",
+    "text": "Please send the Kubernetes deployment report to Priya by Friday. Set the retry limit to 27.",
+    "version": "after",
+    "round": 1
+  }
+]
