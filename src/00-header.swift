@@ -23,3 +23,5 @@ import IOKit
 // Unbuffer standard output so terminal output flushes immediately in compiled binary
 setbuf(stdout, nil)
 setbuf(stderr, nil)
+
+atexit { Logger.flush() }

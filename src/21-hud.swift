@@ -1,3 +1,28 @@
+// Coalesce producer bursts without building a backlog on the main run loop.
+final class MainQueueDelivery<Value> {
+    private let lock = NSLock()
+    private var latest: Value?
+    private var scheduled = false
+    private let consume: (Value) -> Void
+    init(_ consume: @escaping (Value) -> Void) { self.consume = consume }
+    func submit(_ value: Value) {
+        lock.lock()
+        latest = value
+        let start = !scheduled
+        scheduled = true
+        lock.unlock()
+        guard start else { return }
+        DispatchQueue.main.async {
+            self.lock.lock()
+            let value = self.latest
+            self.latest = nil
+            self.scheduled = false
+            self.lock.unlock()
+            if let value = value { self.consume(value) }
+        }
+    }
+}
+
 // MARK: - Unified Floating Dynamic Island HUD (Spring-Driven Motion)
 
 // One scalar spring channel, stepped per display frame with semi-implicit Euler. Substeps
@@ -171,6 +196,17 @@ final class FloatingHUD: NSObject {
     private var widthSpring = SpringChannel(
         value: HUDMetrics.minPillWidth, target: HUDMetrics.minPillWidth, stiffness: 380, dampingRatio: 0.86, epsilon: 0.05)
     private var shownTarget = false
+    private struct FrameState: Equatable {
+        let presence: CGFloat
+        let width: CGFloat
+        let bounds: CGRect
+        let notchHeight: CGFloat
+        let physicalNotch: Bool
+        let style: String
+        let privacy: Bool
+        let reducedMotion: Bool
+    }
+    private var lastFrameState: FrameState?
 
     // Entrance animation; set once at startup from config. "slide" is the shipped default.
     var revealStyle: String = "slide"
@@ -383,6 +419,7 @@ final class FloatingHUD: NSObject {
     }
 
     private func applyScreenLayout() {
+        lastFrameState = nil
         let screen = layoutScreen()
         self.screenFrame = screen.frame
         self.notchInfo = NotchGeometry.detect(screen: screen)
@@ -511,6 +548,12 @@ final class FloatingHUD: NSObject {
         let p = max(0.0, presence.value)
         let w = min(max(widthSpring.value, HUDMetrics.minPillWidth), HUDMetrics.maxPillWidth)
         let hostBounds = hostView.bounds
+        let state = FrameState(
+            presence: p, width: w, bounds: hostBounds,
+            notchHeight: notchInfo.rect.height, physicalNotch: notchInfo.hasPhysicalNotch,
+            style: revealStyle, privacy: privacyMode, reducedMotion: reduceMotion)
+        guard state != lastFrameState else { return }
+        lastFrameState = state
         let pillTop = hostBounds.height - notchInfo.rect.height - HUDMetrics.pillGap
 
         // Each reveal style is a pure mapping from presence to geometry, so the SAME spring
@@ -870,6 +913,7 @@ final class FloatingHUD: NSObject {
     }
 
     func updateLiveText(_ text: String) {
+        guard notchGlowView.state == .listening || notchGlowView.state == .processing else { return }
         if locked && CACurrentMediaTime() < lockHintUntil {
             deferredLiveText = text
             return
@@ -882,7 +926,7 @@ final class FloatingHUD: NSObject {
             return
         }
 
-        let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        let clean = String(text.suffix(512)).replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         guard !clean.isEmpty else { return }
 
         // While streaming, the newest words matter most: truncate at the head so the tail
@@ -906,7 +950,24 @@ final class FloatingHUD: NSObject {
         }
     }
 
+    func showStarting() {
+        hideWorkItem?.cancel()
+        if !shownTarget { showListening() }
+        clearLockRing()
+        notchGlowView.state = .processing
+        orbIcon.state = .processing
+        setHeader("Microphone", color: AppleDesign.siriCyan)
+        setTranscript("Getting ready…", color: .white, caret: false)
+        waveformView.reset()
+    }
+
+    func showBusy() {
+        // Keep the current turn's text and animation; acknowledge only the refused press.
+        setHeader("Finishing previous dictation", color: AppleDesign.siriCyan)
+    }
+
     func showProcessing() {
+        if !shownTarget { showListening() }
         hideWorkItem?.cancel()
         // Words still queued behind the lock hint are the freshest transcript there is.
         let deferred = deferredLiveText
@@ -948,6 +1009,7 @@ final class FloatingHUD: NSObject {
     }
 
     func showError(message: String) {
+        if !shownTarget { showListening() }
         hideWorkItem?.cancel()
         clearLockRing()
         notchGlowView.state = .error

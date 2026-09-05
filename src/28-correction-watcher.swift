@@ -22,6 +22,7 @@ final class CorrectionWatcher {
     // Main-thread-only. Bumping invalidates any armed read-back (captureActive idiom):
     // a new capture means the field is about to change under the pending read.
     private var generation = 0
+    private let worker = DispatchQueue(label: "com.justspeak.corrections", qos: .utility)
 
     init(config: Config, history: TranscriptionHistoryStore?) {
         self.history = history
@@ -53,28 +54,36 @@ final class CorrectionWatcher {
         guard let front = NSWorkspace.shared.frontmostApplication,
             front.processIdentifier == targetPid
         else { return }
-        guard let field = Self.focusedFieldValue(pid: targetPid) else { return }
-
-        let pairs = Self.extractCorrections(pasted: pastedText, field: field, vocabSet: vocabSet)
-        guard !pairs.isEmpty else { return }
-        for p in pairs {
-            if privacyMode {
-                Logger.info("LEARN", "Observed a typed correction (words hidden - privacy mode).")
-            } else {
-                Logger.info("LEARN", "Observed typed correction: \"\(p.wrong)\" -> \"\(p.right)\" - `make analyze` will pick it up.")
+        worker.async { [weak self] in
+            guard let self = self else { return }
+            // Only the result crosses back to main; the field is never retained or logged.
+            guard let field = Self.focusedFieldValue(pid: targetPid) else { return }
+            let pairs = Self.extractCorrections(pasted: pastedText, field: field, vocabSet: self.vocabSet)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, gen == self.generation, !SecureInputMonitor.isActive,
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPid
+                else { return }
+                for p in pairs {
+                    self.history?.recordCorrection(wrong: p.wrong, right: p.right, appName: appName)
+                }
+                if !pairs.isEmpty { Logger.info("LEARN", "Observed \(pairs.count) typed corrections.") }
             }
-            history?.recordCorrection(wrong: p.wrong, right: p.right, appName: appName)
         }
     }
 
     // Focused element's string value in the target app, or nil when the app exposes none.
     private static func focusedFieldValue(pid: pid_t) -> String? {
         let appElement = AXUIElementCreateApplication(pid)
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.05
+        AXUIElementSetMessagingTimeout(appElement, 0.05)
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
             let focusedAny = focusedRef, CFGetTypeID(focusedAny) == AXUIElementGetTypeID()
         else { return nil }
         let focused = focusedAny as! AXUIElement
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0.002 else { return nil }
+        AXUIElementSetMessagingTimeout(focused, Float(remaining))
         var valueRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(focused, kAXValueAttribute as CFString, &valueRef) == .success,
             let value = valueRef as? String, !value.isEmpty
@@ -90,9 +99,10 @@ final class CorrectionWatcher {
     // band. A missed correction costs nothing (the analyzer can still infer it); a false
     // positive plants a bad rule suggestion.
     static func extractCorrections(pasted: String, field: String, vocabSet: Set<String>) -> [Pair] {
+        guard pasted.utf8.count <= 16000, field.utf8.count <= 500000 else { return [] }
         let pastedTokens = tokenize(pasted)
         let fieldTokens = tokenize(field)
-        guard !pastedTokens.isEmpty, !fieldTokens.isEmpty else { return [] }
+        guard !pastedTokens.isEmpty, !fieldTokens.isEmpty, pastedTokens.count <= 512, fieldTokens.count <= 50000 else { return [] }
 
         let window = bestWindow(pasted: pastedTokens, field: fieldTokens)
         guard !window.isEmpty else { return [] }
@@ -120,9 +130,10 @@ final class CorrectionWatcher {
     }
 
     // Surrounding punctuation only; inner characters ("Next.js", "co-pilot") stay.
+    private static let surroundingPunctuation = CharacterSet(charactersIn: ".,!?;:\"'()[]{}<>«»\u{2018}\u{2019}\u{201C}\u{201D}")
+
     private static func strip(_ token: String) -> String {
-        let punct = CharacterSet(charactersIn: ".,!?;:\"'()[]{}<>«»\u{2018}\u{2019}\u{201C}\u{201D}")
-        return token.trimmingCharacters(in: punct)
+        return token.trimmingCharacters(in: surroundingPunctuation)
     }
 
     // Locate the paste inside a field that may hold unrelated text (an email draft, a doc).
@@ -138,19 +149,40 @@ final class CorrectionWatcher {
             if n <= 4 && field.count == n { return field }
             return []
         }
-        // Always slide an exact-length window: comparing against the whole field dilutes
-        // the overlap score when the paste sits inside a larger draft.
-        var best: [String] = []
-        var bestScore = 0.0
-        for start in 0...(field.count - n) {
-            let window = Array(field[start..<start + n])
-            let score = overlapScore(pasted, window)
-            if score > bestScore {
-                bestScore = score
-                best = window
+        let target = Set(pasted.map { strip($0).lowercased() }.filter { !$0.isEmpty })
+        guard !target.isEmpty else { return [] }
+        let normalized = field.map { strip($0).lowercased() }
+        var counts: [String: Int] = [:]
+        var intersection = 0
+        func add(_ word: String) {
+            guard !word.isEmpty else { return }
+            let count = counts[word, default: 0]
+            if count == 0 && target.contains(word) { intersection += 1 }
+            counts[word] = count + 1
+        }
+        func remove(_ word: String) {
+            guard let count = counts[word] else { return }
+            if count == 1 {
+                counts.removeValue(forKey: word)
+                if target.contains(word) { intersection -= 1 }
+            } else {
+                counts[word] = count - 1
             }
         }
-        return bestScore >= 0.5 ? best : []
+        for word in normalized.prefix(n) { add(word) }
+        var bestStart = 0
+        var bestScore = 0.0
+        for start in 0...(field.count - n) {
+            if start > 0 {
+                remove(normalized[start - 1])
+                add(normalized[start + n - 1])
+            }
+            let union = target.count + counts.count - intersection
+            let score = Double(intersection) / Double(union)
+            if score > bestScore { bestScore = score; bestStart = start }
+            if score == 1 { break }
+        }
+        return bestScore >= 0.5 ? Array(field[bestStart..<bestStart + n]) : []
     }
 
     private static func overlapScore(_ a: [String], _ b: [String]) -> Double {

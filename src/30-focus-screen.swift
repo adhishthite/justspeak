@@ -7,17 +7,22 @@
 /// case the app is hung) pick the screen; the pointer is the fallback for apps that expose no
 /// focused window.
 struct FocusScreenResolver {
-    static func resolve(frontmostPID pid: pid_t?) -> NSScreen? {
-        if let pid = pid, let frame = focusedWindowFrame(pid: pid),
-            let screen = screenContaining(frame)
-        {
-            return screen
+    private static let lookupQueue = DispatchQueue(label: "com.justspeak.focus", qos: .userInitiated)
+
+    // Capture AppKit state on main; Accessibility IPC runs away from the event loop.
+    static func resolve(frontmostPID pid: pid_t?, completion: @escaping (NSScreen?) -> Void) {
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        lookupQueue.async {
+            let frame = pid.flatMap { focusedWindowFrame(pid: $0, primaryTop: primaryTop) }
+            DispatchQueue.main.async {
+                if let frame = frame, let screen = screenContaining(frame) {
+                    completion(screen)
+                } else {
+                    let mouse = NSEvent.mouseLocation
+                    completion(NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main)
+                }
+            }
         }
-        let mouse = NSEvent.mouseLocation
-        if let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) {
-            return screen
-        }
-        return NSScreen.main ?? NSScreen.screens.first
     }
 
     static func displayID(of screen: NSScreen) -> CGDirectDisplayID? {
@@ -48,8 +53,8 @@ struct FocusScreenResolver {
     // so each call gets whatever is left, and a hung app costs ~50ms total, not 3x.
     private static let lookupBudget: CFAbsoluteTime = 0.05
 
-    private static func focusedWindowFrame(pid: pid_t) -> NSRect? {
-        let deadline = CFAbsoluteTimeGetCurrent() + lookupBudget
+    private static func focusedWindowFrame(pid: pid_t, primaryTop: CGFloat) -> NSRect? {
+        let deadline = ProcessInfo.processInfo.systemUptime + lookupBudget
         let appElement = AXUIElementCreateApplication(pid)
         var windowRef: CFTypeRef?
         guard copyAttribute(appElement, kAXFocusedWindowAttribute, deadline: deadline, into: &windowRef),
@@ -71,8 +76,7 @@ struct FocusScreenResolver {
             size.width > 0, size.height > 0
         else { return nil }
 
-        guard let primary = NSScreen.screens.first else { return nil }
-        let flippedY = primary.frame.maxY - origin.y - size.height
+        let flippedY = primaryTop - origin.y - size.height
         return NSRect(x: origin.x, y: flippedY, width: size.width, height: size.height)
     }
 
@@ -81,7 +85,7 @@ struct FocusScreenResolver {
     private static func copyAttribute(
         _ element: AXUIElement, _ attribute: String, deadline: CFAbsoluteTime, into ref: inout CFTypeRef?
     ) -> Bool {
-        let remaining = deadline - CFAbsoluteTimeGetCurrent()
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
         guard remaining > 0.002 else { return false }
         AXUIElementSetMessagingTimeout(element, Float(remaining))
         return AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success

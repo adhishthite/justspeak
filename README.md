@@ -410,6 +410,26 @@ sqlite3 ~/.justspeak/history.db \
 
 ---
 
+## Recovery and performance checks
+
+Microphone startup is confirmed by fresh converted audio, not only by the engine's running flag. If the input changes or stops delivering audio, JustSpeak rebuilds its tap and converter with a bounded retry budget. Interrupted recordings are rejected; incomplete audio is never intentionally sent to transcription as a complete turn. The HUD shows microphone startup and failure states, and toggle mode resets after an interruption.
+
+The Live client retains a bounded, ordered startup queue until setup completes. Pending writes are limited to 256 KiB and three seconds. A failed or expired write invalidates Live delivery and permits the complete recording to use REST fallback.
+
+Clipboard preparation runs during recording. Paste waits at most 150 ms for preparation, without blocking the session queue on a clipboard provider. If a complete snapshot is unavailable, JustSpeak leaves the existing clipboard intact and reports delivery failure. The transcript is recorded when history is enabled. `delivery_outcome` distinguishes dispatched paste events, copied text, and failed delivery; event dispatch does not confirm that the target application displayed the text.
+
+`SILENCE_FLUSH_MS` remains 700 by default. The saved voice benchmark favored 350 ms, but a fresh synthetic comparison did not confirm a consistent speed gain. Use `--flush-ms 350` with the benchmark to test the alternative without changing local configuration.
+
+```sh
+make check       # offline regressions and Swift source lint; no API or microphone
+make check-hud   # synthetic HUD validation; requires a macOS desktop
+make check-mic   # short two-process microphone test; no audio saved or transcribed
+```
+
+The microphone test verifies concurrent capture and forced recovery on the current default input. Test the specific calling/recording app and headset that caused an incident as well. A test with the default microphone cannot establish compatibility with every device and audio mode.
+
+---
+
 ## 🏛️ Disclaimer
 
 This is a personal open-source demonstration project developed by a Googler to showcase real-time voice dictation with Google Gemini Live WebSockets (`gemini-3.5-transcribe-live`). This repository is intended as an architectural reference and demo. It is not an officially supported Google product and is distributed "as is" without warranty.

@@ -47,6 +47,9 @@ final class TranscriptionHistoryStore {
         // How the hold ended: "release" (plain push-to-talk), "lock_press" (hold-to-lock,
         // finished by the next press) or "lock_limit" (locked turn cut by LOCK_LIMIT).
         var finishMode: String? = nil
+        var eventQueueMs: Double? = nil
+        var readyMs: Double? = nil
+        var deliveryOutcome: String? = nil
     }
 
     private let queue = DispatchQueue(label: "com.justspeak.history", qos: .utility)
@@ -146,7 +149,10 @@ final class TranscriptionHistoryStore {
               build_id TEXT,
               input_device TEXT,
               input_transport TEXT,
-              finish_mode TEXT
+              finish_mode TEXT,
+              event_queue_ms REAL,
+              ready_ms REAL,
+              delivery_outcome TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_transcriptions_ts ON transcriptions(ts_epoch);
             CREATE INDEX IF NOT EXISTS idx_transcriptions_session ON transcriptions(session_id);
@@ -187,6 +193,9 @@ final class TranscriptionHistoryStore {
             "ALTER TABLE transcriptions ADD COLUMN input_device TEXT",
             "ALTER TABLE transcriptions ADD COLUMN input_transport TEXT",
             "ALTER TABLE transcriptions ADD COLUMN finish_mode TEXT",
+            "ALTER TABLE transcriptions ADD COLUMN event_queue_ms REAL",
+            "ALTER TABLE transcriptions ADD COLUMN ready_ms REAL",
+            "ALTER TABLE transcriptions ADD COLUMN delivery_outcome TEXT",
         ] {
             sqlite3_exec(opened, migration, nil, nil, nil)
         }
@@ -240,8 +249,8 @@ final class TranscriptionHistoryStore {
                   injected, input_tokens, output_tokens, tokens_metered, cost_usd,
                   language_codes, smart_mode, vad_mode, error, app_bundle_id, app_name,
                   peak_db, speech_frames, settle_path, endpoint_aligned, chunk_ms, silence_flush_ms,
-                  build_id, input_device, input_transport, finish_mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  build_id, input_device, input_transport, finish_mode, event_queue_ms, ready_ms, delivery_outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
             var stmt: OpaquePointer?
@@ -291,6 +300,9 @@ final class TranscriptionHistoryStore {
             self.bindText(stmt, 36, r.inputDevice)
             self.bindText(stmt, 37, r.inputTransport)
             self.bindText(stmt, 38, r.finishMode)
+            self.bindDouble(stmt, 39, r.eventQueueMs)
+            self.bindDouble(stmt, 40, r.readyMs)
+            self.bindText(stmt, 41, r.deliveryOutcome)
 
             if sqlite3_step(stmt) != SQLITE_DONE {
                 self.failed = true

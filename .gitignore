@@ -28,3 +28,6 @@ DerivedData/
 *.log
 scratch/
 tmp/
+
+# Local voice-recording playground and private recordings
+/playground/
