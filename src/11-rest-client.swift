@@ -1,16 +1,81 @@
 // MARK: - Gemini REST Fallback Client (Single-Turn Audio)
 
+final class CancellableRequest {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var task: URLSessionTask?
+    private var retry: DispatchWorkItem?
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+
+    func start(_ task: URLSessionTask) {
+        lock.lock()
+        let stop = cancelled
+        if !stop { self.task = task }
+        lock.unlock()
+        if stop { task.cancel() } else { task.resume() }
+    }
+
+    func schedule(after delay: TimeInterval, _ work: @escaping () -> Void) {
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            let stop = self.cancelled
+            self.retry = nil
+            self.lock.unlock()
+            if !stop { work() }
+        }
+        lock.lock()
+        let stop = cancelled
+        if !stop { retry = item }
+        lock.unlock()
+        if !stop { DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: item) }
+    }
+
+    func completedTask() {
+        lock.lock()
+        task = nil
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let task = self.task
+        let retry = self.retry
+        self.task = nil
+        self.retry = nil
+        lock.unlock()
+        retry?.cancel()
+        task?.cancel()
+    }
+}
+
 struct GeminiRestClient {
+    @discardableResult
     static func transcribe(
+        pcmData: Data, apiKey: String, model: String, languageCodes: [String] = [],
+        customVocabulary: [String] = [], isRetry: Bool = false,
+        completion: @escaping (Result<(text: String, latencyMs: Double, inputTokens: Int?, outputTokens: Int?), Error>) -> Void
+    ) -> CancellableRequest {
+        let request = CancellableRequest()
+        perform(
+            pcmData: pcmData, apiKey: apiKey, model: model, languageCodes: languageCodes,
+            customVocabulary: customVocabulary, isRetry: isRetry, scope: request, completion: completion)
+        return request
+    }
+
+    private static func perform(
         pcmData: Data,
         apiKey: String,
         model: String,
         languageCodes: [String] = [],
         customVocabulary: [String] = [],
         isRetry: Bool = false,
+        scope: CancellableRequest,
         completion: @escaping (Result<(text: String, latencyMs: Double, inputTokens: Int?, outputTokens: Int?), Error>) -> Void
     ) {
-        let startTime = CFAbsoluteTimeGetCurrent()
+        guard !scope.isCancelled else { return }
+        let startTime = ProcessInfo.processInfo.systemUptime
         guard !apiKey.isEmpty else {
             completion(.failure(NSError(domain: "JustSpeak", code: -1, userInfo: [NSLocalizedDescriptionKey: "GEMINI_API_KEY is empty."])))
             return
@@ -74,7 +139,9 @@ struct GeminiRestClient {
         request.httpBody = Data(body.utf8)
 
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+            scope.completedTask()
+            guard !scope.isCancelled else { return }
+            let elapsedMs = (ProcessInfo.processInfo.systemUptime - startTime) * 1000.0
 
             if let error = error {
                 completion(.failure(error))
@@ -98,8 +165,9 @@ struct GeminiRestClient {
                 let delay = Self.retryDelaySeconds(from: data, response: response as? HTTPURLResponse) ?? 2.0
                 if !isRetry, delay <= 8.0 {
                     Logger.warn("REST", "429 rate limited on \(model) - retrying once after \(String(format: "%.1f", delay))s.")
-                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
-                        Self.transcribe(pcmData: pcmData, apiKey: apiKey, model: model, languageCodes: languageCodes, customVocabulary: customVocabulary, isRetry: true, completion: completion)
+                    scope.schedule(after: max(0, delay)) {
+                        Self.perform(
+                            pcmData: pcmData, apiKey: apiKey, model: model, languageCodes: languageCodes, customVocabulary: customVocabulary, isRetry: true, scope: scope, completion: completion)
                     }
                     return
                 }
@@ -190,7 +258,7 @@ struct GeminiRestClient {
             }
         }
 
-        task.resume()
+        scope.start(task)
     }
 
     /// Serializes one small object to a JSON string for splicing into the hand-built envelope.

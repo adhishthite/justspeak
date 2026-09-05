@@ -7,8 +7,22 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private var urlSession: URLSession!
 
     private let lock = NSLock()
-    private(set) var isConnected: Bool = false
-    private(set) var isReady: Bool = false
+    private var connectedState = false
+    private var readyState = false
+    private var connectionID: UInt64 = 0
+    private var turnID: UInt64 = 0
+    private var turnOpen = false
+    private var turnHasAudioGap = false
+    private var rotateWhenIdle = false
+    private var reconnectEnabled = true
+    private let sendQueue = DispatchQueue(label: "com.justspeak.send", qos: .userInitiated)
+    private var turnWrites = DispatchGroup()
+    var isConnected: Bool { lock.lock(); defer { lock.unlock() }; return connectedState }
+    var isReady: Bool { lock.lock(); defer { lock.unlock() }; return readyState }
+    var canCommitTurn: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return readyState && turnOpen && !turnHasAudioGap
+    }
 
     private var currentTurnText: String = ""
     // Multi-segment transcript accumulator. The server's VAD closes a speech segment at every
@@ -33,12 +47,18 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private var lastSeenResponseTokens: Int = 0
     private var turnBaselinePromptTokens: Int = 0
     private var turnBaselineResponseTokens: Int = 0
+    private var completedUsage: (inputTokens: Int, outputTokens: Int)?
 
     /// API-reported usage for the current/most recent turn, or nil if the server reported
     /// nothing new this turn (caller falls back to a duration-based estimate).
     var lastTurnUsage: (inputTokens: Int, outputTokens: Int)? {
         lock.lock()
         defer { lock.unlock() }
+        if hasFiredTurnCompletion { return completedUsage }
+        return usageSnapshot()
+    }
+
+    private func usageSnapshot() -> (inputTokens: Int, outputTokens: Int)? {
         let dp = lastSeenPromptTokens - turnBaselinePromptTokens
         let dr = lastSeenResponseTokens - turnBaselineResponseTokens
         guard dp > 0 || dr > 0 else { return nil }
@@ -83,10 +103,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private static let settleInterimQuietManual: Double = 0.60
     private static let settleInitialWaitWithoutTokens: Double = 0.90
     private static let settleMaxWait: Double = 2.20
-    // Timers are scheduled on DispatchTime but attemptSettle re-validates the rules against
-    // CFAbsoluteTime - two different clocks. A firing that lands marginally early by the
-    // CFAbsoluteTime measurement would return without settling and (being one-shot) leave no
-    // retry, so every deadline gets a small cushion to guarantee the rule holds at fire time.
+    // Settlement and deadlines use monotonic time; keep the existing scheduling allowance.
     private static let settleTimerCushion: Double = 0.01
     private let settleQueue = DispatchQueue(label: "com.justspeak.settle")
     private var settleWorkItem: DispatchWorkItem?  // reschedulable: initial-wait-without-tokens, then quiet-window checks
@@ -119,10 +136,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.urlSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }
 
-    func connect() {
+    func connect(onlyWhenIdle: Bool = false, expectedConnection: UInt64? = nil) {
         guard !apiKey.isEmpty else { return }
-
-        reconnectWorkItem?.cancel()
 
         let wsUrlString = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         guard let url = URL(string: wsUrlString) else {
@@ -135,15 +150,35 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
 
         let task = urlSession.webSocketTask(with: request)
+        lock.lock()
+        if let expected = expectedConnection, expected != connectionID || !reconnectEnabled {
+            lock.unlock(); task.cancel(with: .goingAway, reason: nil); return
+        }
+        if onlyWhenIdle && turnOpen && readyState {
+            rotateWhenIdle = true
+            lock.unlock(); task.cancel(with: .goingAway, reason: nil); return
+        }
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        reconnectEnabled = true
+        connectionID &+= 1
+        let epoch = connectionID
+        let old = webSocketTask
         self.webSocketTask = task
+        readyState = false
+        connectedState = false
+        if turnOpen { turnHasAudioGap = true }
+        rotateWhenIdle = false
+        lock.unlock()
+        old?.cancel(with: .goingAway, reason: nil)
         task.resume()
 
         Logger.info("WS", "Connecting to Gemini Live WebSockets (\(model))...")
-        sendSetupMessage()
-        listenForMessages()
+        sendSetupMessage(task: task, epoch: epoch)
+        listenForMessages(task: task, epoch: epoch)
     }
 
-    private func sendSetupMessage() {
+    private func sendSetupMessage(task: URLSessionWebSocketTask, epoch: UInt64) {
         let setupPayload: [String: Any]
         if model.contains("transcribe") {
             // Dedicated STT Live Streaming Model. Documented setup shape (live-transcribe guide):
@@ -247,41 +282,41 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        webSocketTask?.send(.string(jsonString)) { [weak self] error in
-            if let error = error {
-                Logger.error("WS", "Setup message send failed: \(error.localizedDescription)")
-                self?.isConnected = false
-            } else {
-                Logger.debug("WS", "Setup handshake dispatched to server.")
-            }
+        task.send(.string(jsonString)) { [weak self] error in
+            if let error = error { self?.connectionFailed(epoch: epoch, error: error) }
         }
     }
 
-    private func listenForMessages() {
-        webSocketTask?.receive { [weak self] result in
-            guard let self = self else { return }
+    private func connectionFailed(epoch: UInt64, error: Error) {
+        lock.lock()
+        guard epoch == connectionID else { lock.unlock(); return }
+        readyState = false
+        connectedState = false
+        if turnOpen { turnHasAudioGap = true }
+        let completion = hasFiredTurnCompletion ? nil : turnCompletion
+        turnCompletion = nil
+        if completion != nil { hasFiredTurnCompletion = true; isCommitting = false }
+        lock.unlock()
+        completion?(.failure(error))
+        scheduleReconnect(epoch: epoch)
+    }
 
+    private func listenForMessages(task: URLSessionWebSocketTask, epoch: UInt64) {
+        task.receive { [weak self] result in
+            guard let self = self else { return }
             switch result {
             case .success(let message):
-                self.handleIncomingMessage(message)
-                self.listenForMessages()  // Continue listening
-
-            case .failure(let error):
+                self.handleIncomingMessage(message, epoch: epoch)
                 self.lock.lock()
-                self.isConnected = false
-                self.isReady = false
-                let pendingCompletion = self.hasFiredTurnCompletion ? nil : self.turnCompletion
-                self.turnCompletion = nil
+                let current = self.connectionID == epoch
                 self.lock.unlock()
-
-                Logger.warn("WS", "WebSocket disconnected: \(error.localizedDescription)")
-                pendingCompletion?(.failure(error))
-                self.scheduleReconnect()
+                if current { self.listenForMessages(task: task, epoch: epoch) }
+            case .failure(let error): self.connectionFailed(epoch: epoch, error: error)
             }
         }
     }
 
-    private func handleIncomingMessage(_ message: URLSessionWebSocketTask.Message) {
+    private func handleIncomingMessage(_ message: URLSessionWebSocketTask.Message, epoch: UInt64) {
         var rawData: Data?
         switch message {
         case .string(let str):
@@ -310,8 +345,13 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         // grace; interims get the (mode-aware) quiet window.
         var quietRescheduleElapsedSinceCommit: Double? = nil
         var quietRescheduleIsFinal = false
+        var messageTurn: UInt64 = 0
 
         lock.lock()
+
+        guard epoch == connectionID else { lock.unlock(); return }
+
+        messageTurn = turnID
 
         // 0. Server error handling
         if let errorObj = json["error"] as? [String: Any] {
@@ -326,8 +366,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
 
         // 1. Handshake confirmation
         if json["setupComplete"] != nil {
-            self.isConnected = true
-            self.isReady = true
+            self.connectedState = true
+            self.readyState = true
             self.reconnectAttempts = 0
             didCompleteSetup = true
             // Fresh session: server-side cumulative token counters restart from zero.
@@ -338,10 +378,11 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         }
         // 2. Server goAway notification (Server scheduled disconnect)
         else if json["goAway"] != nil {
-            shouldScheduleReconnect = true
+            rotateWhenIdle = true
+            shouldScheduleReconnect = !turnOpen
         }
         // 3. Server content (transcription streaming)
-        else if let serverContent = json["serverContent"] as? [String: Any] {
+        else if turnOpen, let serverContent = json["serverContent"] as? [String: Any] {
             var updatedText: String? = nil
             var isUserSpeech = false
             var isFinalTranscription = false
@@ -395,7 +436,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             }
 
             if let newText = updatedText {
-                let now = CFAbsoluteTimeGetCurrent()
+                let now = ProcessInfo.processInfo.systemUptime
                 self.lastTokenReceivedTime = now
                 if self.isCommitting {
                     self.lastPostCommitTokenTime = now
@@ -423,7 +464,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             let isTurnComplete = (serverContent["turnComplete"] as? Bool) ?? (serverContent["turnComplete"] != nil)
             let isGenComplete = (serverContent["generationComplete"] as? Bool) ?? (serverContent["generationComplete"] != nil)
 
-            if (isTurnComplete || isGenComplete) && !currentTurnText.isEmpty && !hasFiredTurnCompletion {
+            if (isTurnComplete || isGenComplete) && isCommitting && !turnHasAudioGap && !currentTurnText.isEmpty && !hasFiredTurnCompletion {
+                turnOpen = false
+                shouldScheduleReconnect = rotateWhenIdle
+                completedUsage = usageSnapshot()
                 hasFiredTurnCompletion = true
                 isCommitting = false
                 settlePathValue = "server_turn_complete"
@@ -432,7 +476,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 settleMaxWorkItem?.cancel()
                 settleMaxWorkItem = nil
 
-                let totalLatencyMs = (CFAbsoluteTimeGetCurrent() - turnCommitTime) * 1000.0
+                let totalLatencyMs = (ProcessInfo.processInfo.systemUptime - turnCommitTime) * 1000.0
                 let text = currentTurnText
                 currentTurnText = ""
                 committedTranscript = ""
@@ -451,14 +495,15 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
 
         // Logging & callbacks all run off the lock, in the same relative order as before.
         if let msg = serverErrorMessage {
-            Logger.error("WS", "Server error: \(msg)")
+            _ = msg
+            connectionFailed(epoch: epoch, error: NSError(domain: "JustSpeak", code: -3, userInfo: [NSLocalizedDescriptionKey: "Live API rejected the request."]))
         }
         if didCompleteSetup {
             Logger.success("WS", "Gemini Live session established & ready for streaming.")
         }
         if shouldScheduleReconnect {
             Logger.warn("WS", "Server sent goAway signal. Preemptively scheduling reconnect...")
-            self.scheduleReconnect()
+            self.scheduleReconnect(epoch: epoch, onlyWhenIdle: true)
         }
         // Callbacks fire before any terminal write: stdout is unbuffered and a slow consumer
         // must never delay the HUD update or the turn's completion. The completion is invoked
@@ -478,6 +523,11 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         // earlier than minPostCommitWait after commit. Scheduling happens off-lock; the
         // pointer swap that replaces the previous pending item is its own short lock scope.
         if let elapsedSinceCommit = quietRescheduleElapsedSinceCommit {
+            lock.lock()
+            let expectedTurn = messageTurn
+            let shouldSchedule = turnID == messageTurn && isCommitting && !hasFiredTurnCompletion
+            lock.unlock()
+            guard shouldSchedule else { return }
             let delay: Double
             if quietRescheduleIsFinal {
                 delay = Self.settleFinalGrace + Self.settleTimerCushion
@@ -485,8 +535,9 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 let quiet = usesManualActivity ? Self.settleInterimQuietManual : Self.settleQuietWindow
                 delay = max(quiet, Self.settleMinPostCommitWait - elapsedSinceCommit) + Self.settleTimerCushion
             }
-            let item = DispatchWorkItem { [weak self] in self?.attemptSettle() }
+            let item = DispatchWorkItem { [weak self] in self?.attemptSettle(turn: expectedTurn) }
             lock.lock()
+            guard turnID == expectedTurn, isCommitting, !hasFiredTurnCompletion else { lock.unlock(); return }
             settleWorkItem?.cancel()
             settleWorkItem = item
             lock.unlock()
@@ -533,14 +584,24 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     // holds, performs the once-only settle sequence. Safe to call redundantly from a stale
     // or overlapping timer: state (isCommitting/hasFiredTurnCompletion) is the source of
     // truth, not which timer fired.
-    private func attemptSettle() {
+    private func attemptSettle(turn: UInt64) {
         lock.lock()
-        guard isCommitting, !hasFiredTurnCompletion else {
+        guard turn == turnID, isCommitting, !hasFiredTurnCompletion else {
             lock.unlock()
             return
         }
 
-        let now = CFAbsoluteTimeGetCurrent()
+        if turnHasAudioGap {
+            let epoch = connectionID
+            lock.unlock()
+            connectionFailed(
+                epoch: epoch,
+                error: NSError(
+                    domain: "JustSpeak", code: -4,
+                    userInfo: [NSLocalizedDescriptionKey: "Live connection missed part of the recording."]))
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
         let elapsedCommit = now - turnCommitTime
         let text = currentTurnText
         let postCommitTokenTime = lastPostCommitTokenTime
@@ -572,8 +633,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
+        completedUsage = usageSnapshot()
         hasFiredTurnCompletion = true
         isCommitting = false
+        turnOpen = false
         settlePathValue = timedOut ? "timeout" : firedRule
         settleWorkItem?.cancel()
         settleWorkItem = nil
@@ -590,6 +653,10 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         turnCompletion = nil
         lock.unlock()
 
+        // A heuristic finish has no server boundary. Retire its socket before another turn
+        // can accept delayed words from this one.
+        connect()
+
         // Completion before the terminal write, and directly on settleQueue - the consumer
         // re-dispatches onto sessionQueue itself, so the extra global-queue hop bought nothing.
         if !text.isEmpty {
@@ -602,6 +669,14 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
 
     func startNewTurn() {
         lock.lock()
+        let abandoned = turnOpen
+        lock.unlock()
+        if abandoned { abandonTurn() }
+        lock.lock()
+        turnID &+= 1
+        turnOpen = true
+        turnHasAudioGap = !readyState
+        turnWrites = DispatchGroup()
         self.settleWorkItem?.cancel()
         self.settleWorkItem = nil
         self.settleMaxWorkItem?.cancel()
@@ -618,6 +693,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         self.lastPostCommitTokenTime = nil
         self.lastPostCommitFinalTime = nil
         self.turnCompletion = nil
+        self.completedUsage = nil
         self.turnBaselinePromptTokens = self.lastSeenPromptTokens
         self.turnBaselineResponseTokens = self.lastSeenResponseTokens
         lock.unlock()
@@ -633,7 +709,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             if let startJson = try? JSONSerialization.data(withJSONObject: startPayload),
                 let startStr = String(data: startJson, encoding: .utf8)
             {
-                webSocketTask?.send(.string(startStr)) { _ in }
+                sendTurnMessage(startStr)
             }
         }
     }
@@ -644,22 +720,58 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
     private static let audioChunkJSONPrefix = "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\""
     private static let audioChunkJSONSuffix = "\"}}}"
 
-    func sendAudioChunk(_ pcmChunk: Data) {
-        guard isReady else { return }
-
-        let base64Audio = pcmChunk.base64EncodedString()
-        let jsonString = Self.audioChunkJSONPrefix + base64Audio + Self.audioChunkJSONSuffix
-
-        webSocketTask?.send(.string(jsonString)) { error in
-            if let error = error {
-                Logger.debug("WS", "Chunk send error: \(error.localizedDescription)")
+    private func sendTurnMessage(_ text: String) {
+        lock.lock()
+        guard readyState, turnOpen, let task = webSocketTask else {
+            if turnOpen { turnHasAudioGap = true }
+            lock.unlock()
+            return
+        }
+        let epoch = connectionID
+        let turn = turnID
+        let writes = turnWrites
+        writes.enter()
+        lock.unlock()
+        sendQueue.async { [weak self] in
+            guard let self = self else { writes.leave(); return }
+            self.lock.lock()
+            let current = epoch == self.connectionID && turn == self.turnID && self.turnOpen
+            self.lock.unlock()
+            guard current else { writes.leave(); return }
+            task.send(.string(text)) { [weak self] error in
+                if let self = self, let error = error {
+                    self.lock.lock()
+                    let current = self.turnID == turn && self.connectionID == epoch
+                    self.lock.unlock()
+                    if current { self.connectionFailed(epoch: epoch, error: error) }
+                }
+                writes.leave()
             }
         }
     }
 
+    func sendAudioChunk(_ pcmChunk: Data) {
+        sendTurnMessage(Self.audioChunkJSONPrefix + pcmChunk.base64EncodedString() + Self.audioChunkJSONSuffix)
+    }
+
     func commitTurn(completion: @escaping (Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void) {
         lock.lock()
-        self.turnCommitTime = CFAbsoluteTimeGetCurrent()
+        let writes = turnWrites
+        let expectedTurn = turnID
+        lock.unlock()
+        writes.notify(queue: sendQueue) { [weak self] in
+            self?.beginCommit(turn: expectedTurn, completion: completion)
+        }
+    }
+
+    private func beginCommit(turn expectedTurn: UInt64, completion: @escaping (Result<(text: String, firstTokenMs: Double, totalMs: Double), Error>) -> Void) {
+        lock.lock()
+        guard expectedTurn == turnID, turnOpen, readyState, !turnHasAudioGap else {
+            lock.unlock()
+            completion(.failure(NSError(domain: "JustSpeak", code: -4, userInfo: [NSLocalizedDescriptionKey: "Live connection missed part of the recording."])))
+            return
+        }
+        self.turnCommitTime = ProcessInfo.processInfo.systemUptime
         self.isCommitting = true
         self.lastPostCommitTokenTime = nil
         self.lastPostCommitFinalTime = nil
@@ -686,7 +798,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             if let endAudioJson = try? JSONSerialization.data(withJSONObject: endAudioPayload),
                 let endAudioStr = String(data: endAudioJson, encoding: .utf8)
             {
-                webSocketTask?.send(.string(endAudioStr)) { _ in }
+                sendTurnMessage(endAudioStr)
             }
         }
 
@@ -702,7 +814,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
             if let endJson = try? JSONSerialization.data(withJSONObject: endPayload),
                 let endStr = String(data: endJson, encoding: .utf8)
             {
-                webSocketTask?.send(.string(endStr)) { _ in }
+                sendTurnMessage(endStr)
             }
         }
 
@@ -724,11 +836,7 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
                 return
             }
 
-            webSocketTask?.send(.string(jsonString)) { error in
-                if let error = error {
-                    Logger.debug("WS", "Commit turn send error: \(error.localizedDescription)")
-                }
-            }
+            sendTurnMessage(jsonString)
         }
 
         // 4. For dedicated STT Transcribe models: schedule event-driven settlement checks
@@ -741,8 +849,8 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         // Both call attemptSettle(), which re-validates against authoritative locked state
         // rather than trusting which timer fired.
         if model.contains("transcribe") {
-            let initialItem = DispatchWorkItem { [weak self] in self?.attemptSettle() }
-            let maxItem = DispatchWorkItem { [weak self] in self?.attemptSettle() }
+            let initialItem = DispatchWorkItem { [weak self] in self?.attemptSettle(turn: expectedTurn) }
+            let maxItem = DispatchWorkItem { [weak self] in self?.attemptSettle(turn: expectedTurn) }
 
             lock.lock()
             settleWorkItem?.cancel()
@@ -762,39 +870,59 @@ final class GeminiLiveClient: NSObject, URLSessionWebSocketDelegate {
         return !currentTurnText.isEmpty || firstTokenLatencyMs > 0
     }
 
-    private func scheduleReconnect() {
+    private func scheduleReconnect(epoch: UInt64, onlyWhenIdle: Bool = false) {
         lock.lock()
-        guard reconnectWorkItem == nil else {
-            lock.unlock()
-            return
+        guard epoch == connectionID, reconnectEnabled, reconnectWorkItem == nil else {
+            lock.unlock(); return
         }
         reconnectAttempts += 1
         let delay = min(10.0, pow(2.0, Double(min(reconnectAttempts, 4))))
-        Logger.info("WS", "Scheduling WebSocket reconnection in \(String(format: "%.1f", delay))s (Attempt #\(reconnectAttempts))...")
-
         let item = DispatchWorkItem { [weak self] in
-            self?.lock.lock()
-            self?.reconnectWorkItem = nil
-            self?.lock.unlock()
-            self?.connect()
+            guard let self = self else { return }
+            self.lock.lock()
+            let current = self.connectionID == epoch && self.reconnectEnabled
+            self.reconnectWorkItem = nil
+            self.lock.unlock()
+            if current { self.connect(onlyWhenIdle: onlyWhenIdle, expectedConnection: epoch) }
         }
-        self.reconnectWorkItem = item
+        reconnectWorkItem = item
         lock.unlock()
+        settleQueue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
 
-        DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: item)
+    func abandonTurn() {
+        lock.lock()
+        let needsRotation = turnOpen
+        turnOpen = false
+        turnCompletion = nil
+        isCommitting = false
+        hasFiredTurnCompletion = true
+        settleWorkItem?.cancel()
+        settleMaxWorkItem?.cancel()
+        lock.unlock()
+        if needsRotation { connect() }
     }
 
     func disconnect() {
         lock.lock()
+        connectionID &+= 1
+        reconnectEnabled = false
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
         settleWorkItem?.cancel()
         settleWorkItem = nil
         settleMaxWorkItem?.cancel()
         settleMaxWorkItem = nil
+        let task = webSocketTask
+        webSocketTask = nil
+        connectedState = false
+        readyState = false
+        if turnOpen { turnHasAudioGap = true }
+        let completion = turnCompletion
+        turnCompletion = nil
+        isCommitting = false
         lock.unlock()
-
-        reconnectWorkItem?.cancel()
-        webSocketTask?.cancel(with: .normalClosure, reason: nil)
-        isConnected = false
-        isReady = false
+        task?.cancel(with: .normalClosure, reason: nil)
+        completion?(.failure(NSError(domain: "JustSpeak", code: -4, userInfo: [NSLocalizedDescriptionKey: "Live connection closed."])))
     }
 }

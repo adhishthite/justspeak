@@ -354,7 +354,7 @@ final class AudioCaptureEngine {
 
             // 10Hz meter throttle decision must happen under the lock since it mutates
             // lastMeterUpdateTime; only snapshot the meter's inputs when actually needed.
-            let now = CFAbsoluteTimeGetCurrent()
+            let now = ProcessInfo.processInfo.systemUptime
             var shouldUpdateMeter = false
             var elapsed: Double = 0
             var kbStreamed: Double = 0
@@ -398,7 +398,7 @@ final class AudioCaptureEngine {
 
             lock.lock()
             lastLevelDb = db
-            lastLevelTime = CFAbsoluteTimeGetCurrent()
+            lastLevelTime = ProcessInfo.processInfo.systemUptime
             lock.unlock()
 
             // HUD level first, terminal meter last - the print is the only call here that can
@@ -462,6 +462,10 @@ final class AudioCaptureEngine {
     }
 
     func startRecording() {
+        audioProcessingQueue.sync { startRecordingOnQueue() }
+    }
+
+    private func startRecordingOnQueue() {
         lock.lock()
         recordedPCMData.removeAll(keepingCapacity: true)
         pendingChunkBuffer.removeAll(keepingCapacity: true)
@@ -486,7 +490,7 @@ final class AudioCaptureEngine {
         }
 
         chunkCount = 0
-        recordingStartTime = CFAbsoluteTimeGetCurrent()
+        recordingStartTime = ProcessInfo.processInfo.systemUptime
         lastMeterUpdateTime = 0
         isRecording = true
         lock.unlock()
@@ -507,7 +511,7 @@ final class AudioCaptureEngine {
     func stopRecording(gracePeriodMs: Int, maxTrailMs: Int, silenceThresholdDb: Double) -> (pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?, speechFrames: Int) {
         // True hold duration is measured at entry, BEFORE the post-roll wait - otherwise the
         // grace period pads every tap past the caller's micro-click duration threshold.
-        let stopRequestTime = CFAbsoluteTimeGetCurrent()
+        let stopRequestTime = ProcessInfo.processInfo.systemUptime
 
         // 1. Trailing capture: keep streaming while speech energy persists. gracePeriodMs is the
         // required continuous-quiet window; maxTrailMs the hard cap. maxTrailMs <= gracePeriodMs
@@ -538,7 +542,7 @@ final class AudioCaptureEngine {
             lock.unlock()
             var quietStart: CFAbsoluteTime? = quietFrames > 0 ? stopRequestTime - Double(quietFrames) * 0.02 : nil
             while true {
-                let now = CFAbsoluteTimeGetCurrent()
+                let now = ProcessInfo.processInfo.systemUptime
                 lock.lock()
                 let levelDb = lastLevelDb
                 let levelTime = lastLevelTime
@@ -564,7 +568,7 @@ final class AudioCaptureEngine {
                 usleep(25_000)
             }
 
-            let totalWaitMs = (CFAbsoluteTimeGetCurrent() - stopRequestTime) * 1000.0
+            let totalWaitMs = (ProcessInfo.processInfo.systemUptime - stopRequestTime) * 1000.0
             if totalWaitMs > Double(gracePeriodMs) + 1.0 {
                 Logger.debug("AUDIO", "Trailing speech captured: +\(Int(totalWaitMs - Double(gracePeriodMs)))ms past post-roll")
             } else if totalWaitMs < Double(gracePeriodMs) - 1.0 {
@@ -572,9 +576,16 @@ final class AudioCaptureEngine {
             }
         }
 
-        // 2. Synchronously drain all in-flight audio processing tasks on the serial queue
-        audioProcessingQueue.sync {}
+        return audioProcessingQueue.sync {
+            finishRecording(stopRequestTime: stopRequestTime, silenceThresholdDb: silenceThresholdDb)
+        }
+    }
 
+    private func finishRecording(stopRequestTime: CFAbsoluteTime, silenceThresholdDb: Double) -> (
+        pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?, speechFrames: Int
+    ) {
+        // The gate and final chunk delivery share the capture queue. A new hardware buffer
+        // cannot send later audio ahead of the pre-roll or after the end-of-turn signal.
         lock.lock()
         isRecording = false
 

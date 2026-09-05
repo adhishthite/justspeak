@@ -1,0 +1,14 @@
+[
+  {"id":"en_email","language":"English","voice":"Kore","style":"Natural Indian English, normal dictation speed","text":"Please send the revised architecture report to Priya by Friday. Set the retry limit to twenty seven."},
+  {"id":"en_terminal","language":"English","voice":"Puck","style":"Natural Indian English, brisk but clear","text":"In Codex, inspect the retry logic in the Gemini client. Run the tests, but do not commit or push."},
+  {"id":"en_calendar","language":"English","voice":"Kore","style":"Natural Indian English with a brief pause between sentences","text":"Schedule the architecture review for Thursday at four thirty p.m. Invite Neha and Arjun."},
+  {"id":"en_tasks","language":"English","voice":"Puck","style":"Natural Indian English, normal dictation speed","text":"Remind me tomorrow at nine to review the pull request and update the project plan."},
+  {"id":"en_messages","language":"English","voice":"Kore","style":"Conversational Indian English, brisk but clear","text":"I am running ten minutes late. Please start without me."},
+  {"id":"en_brd","language":"English","voice":"Puck","style":"Natural Indian English with a brief pause between sentences","text":"The service must process requests idempotently. The ninety fifth percentile latency must remain below two hundred milliseconds."},
+  {"id":"mr_email","language":"Marathi","voice":"Kore","style":"Natural Marathi, normal dictation speed","text":"प्रियाला सुधारित अहवाल उद्या सकाळी पाठवा. बैठकीची वेळ दहा वाजता ठरवा."},
+  {"id":"mr_calendar","language":"Marathi","voice":"Puck","style":"Natural Marathi with a brief pause between sentences","text":"गुरुवारी दुपारी साडेचार वाजता बैठक ठेवा. नेहा आणि अर्जुन यांना बोलवा."},
+  {"id":"mr_messages","language":"Marathi","voice":"Kore","style":"Conversational Marathi, brisk but clear","text":"मी दहा मिनिटे उशिरा पोहोचेन. तुम्ही माझी वाट न पाहता सुरुवात करा."},
+  {"id":"mix_terminal","language":"Mixed","voice":"Puck","style":"Natural Marathi with English technical terms, normal dictation speed","text":"Codex मध्ये Gemini client चे retry logic तपासा. Tests चालवा, पण commit किंवा push करू नका."},
+  {"id":"mix_brd","language":"Mixed","voice":"Kore","style":"Natural Marathi with English technical terms and a brief pause between sentences","text":"या service साठी p ninety five latency दोनशे milliseconds पेक्षा कमी हवी. Duplicate requests मुळे दुहेरी processing होता कामा नये."},
+  {"id":"mix_calendar","language":"Mixed","voice":"Puck","style":"Natural Marathi with English technical terms, brisk but clear","text":"उद्या सकाळी नऊ वाजता architecture review ठेवा. Gmail मधून Priya ला invite पाठवा."}
+]

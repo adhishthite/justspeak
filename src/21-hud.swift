@@ -1,3 +1,28 @@
+// Coalesce producer bursts without building a backlog on the main run loop.
+final class MainQueueDelivery<Value> {
+    private let lock = NSLock()
+    private var latest: Value?
+    private var scheduled = false
+    private let consume: (Value) -> Void
+    init(_ consume: @escaping (Value) -> Void) { self.consume = consume }
+    func submit(_ value: Value) {
+        lock.lock()
+        latest = value
+        let start = !scheduled
+        scheduled = true
+        lock.unlock()
+        guard start else { return }
+        DispatchQueue.main.async {
+            self.lock.lock()
+            let value = self.latest
+            self.latest = nil
+            self.scheduled = false
+            self.lock.unlock()
+            if let value = value { self.consume(value) }
+        }
+    }
+}
+
 // MARK: - Unified Floating Dynamic Island HUD (Spring-Driven Motion)
 
 // One scalar spring channel, stepped per display frame with semi-implicit Euler. Substeps
@@ -870,6 +895,7 @@ final class FloatingHUD: NSObject {
     }
 
     func updateLiveText(_ text: String) {
+        guard notchGlowView.state == .listening || notchGlowView.state == .processing else { return }
         if locked && CACurrentMediaTime() < lockHintUntil {
             deferredLiveText = text
             return
@@ -882,7 +908,7 @@ final class FloatingHUD: NSObject {
             return
         }
 
-        let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        let clean = String(text.suffix(512)).replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         guard !clean.isEmpty else { return }
 
         // While streaming, the newest words matter most: truncate at the head so the tail

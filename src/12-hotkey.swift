@@ -59,6 +59,8 @@ final class HotkeyManager {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
+    private(set) var lastEventUptime: TimeInterval?
+
     var onKeyDown: (() -> Void)?
     var onKeyUp: (() -> Void)?
 
@@ -109,6 +111,7 @@ final class HotkeyManager {
     }
 
     private func handleCGEvent(type: CGEventType, event: CGEvent) {
+        lastEventUptime = Double(event.timestamp) / 1_000_000_000
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
 
@@ -160,7 +163,7 @@ final class HotkeyManager {
     }
 
     private func updateKeyState(pressed: Bool) {
-        let now = CFAbsoluteTimeGetCurrent()
+        let now = ProcessInfo.processInfo.systemUptime
 
         if mode == "toggle" {
             // Both toggle transitions fire on a press edge, so the 80ms debounce applies to both.

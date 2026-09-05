@@ -80,6 +80,10 @@ final class JustSpeakApp {
     private var currentTurnId: UInt64 = 0
     private var turnSettled: Bool = false
     private var pendingFallbackTimer: DispatchWorkItem?
+    private var pendingTurnDeadline: DispatchWorkItem?
+    private var pendingRestRequest: CancellableRequest?
+    private var restAttemptStart: TimeInterval?
+    private var turnEventQueueMs: Double = 0
 
     // Main-thread-only: pending mic release for MIC_IDLE_TIMEOUT. Cancelled on every key-down,
     // re-armed whenever a turn finishes.
@@ -94,7 +98,9 @@ final class JustSpeakApp {
     /// Main-thread-only. Schedules the mic to be released after the configured idle window so
     /// the macOS mic indicator turns off between dictation sessions; 0 disables the timeout.
     private func scheduleMicIdleRelease() {
+        guard !captureActive else { return }
         // Every turn ends here on main - the spot to apply a lid flip that arrived mid-turn.
+        TextInjector.discardPreparedClipboard()
         audioCapture.applyPendingReselect()
         micIdleWorkItem?.cancel()
         micIdleWorkItem = nil
@@ -148,7 +154,7 @@ final class JustSpeakApp {
         printBanner()
 
         // Handle SIGINT (Ctrl+C) and SIGTERM cleanly. C signal handlers must not call
-        // async-signal-unsafe functions like print(), so ignore the raw signal and do the
+        // async-signal-unsafe functions like Logger.raw(), so ignore the raw signal and do the
         // actual work in a GCD dispatch source on the main queue instead.
         signal(SIGINT, SIG_IGN)
         signal(SIGTERM, SIG_IGN)
@@ -159,7 +165,7 @@ final class JustSpeakApp {
             AudioDucker.shared.restore()
             self?.printSessionUsageSummary()
             self?.history?.close()
-            print("\n\(ANSI.bold)Exiting JustSpeak. Goodbye!\(ANSI.reset)")
+            Logger.raw("\n\(ANSI.bold)Exiting JustSpeak. Goodbye!\(ANSI.reset)")
             exit(0)
         }
         sigint.resume()
@@ -220,19 +226,13 @@ final class JustSpeakApp {
         }
 
         // Wire audio level (dB) to Floating HUD
-        audioCapture.onAudioLevel = { [weak self] db in
-            DispatchQueue.main.async {
-                self?.hud?.updateAudioLevel(db: db)
-            }
-        }
+        let levelDelivery = MainQueueDelivery<Double> { [weak self] db in self?.hud?.updateAudioLevel(db: db) }
+        audioCapture.onAudioLevel = { db in levelDelivery.submit(db) }
 
         // 4. Pre-warm Gemini Live WebSocket & wire streaming text to HUD
         if config.enableLiveWebSocket {
-            liveClient?.onLiveTextUpdate = { [weak self] text in
-                DispatchQueue.main.async {
-                    self?.hud?.updateLiveText(text)
-                }
-            }
+            let textDelivery = MainQueueDelivery<String> { [weak self] text in self?.hud?.updateLiveText(text) }
+            liveClient?.onLiveTextUpdate = { text in textDelivery.submit(text) }
             liveClient?.connect()
         }
 
@@ -240,13 +240,13 @@ final class JustSpeakApp {
         // the REST fallback is ever needed, it isn't paying cold-connection cost on the critical
         // path. Uses URLSession.shared, the same pool GeminiRestClient makes its calls from.
         if !config.geminiApiKey.isEmpty {
-            let prewarmStart = CFAbsoluteTimeGetCurrent()
+            let prewarmStart = ProcessInfo.processInfo.systemUptime
             if let prewarmUrl = URL(string: "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1") {
                 var prewarmRequest = URLRequest(url: prewarmUrl)
                 prewarmRequest.timeoutInterval = 10.0
                 prewarmRequest.setValue(config.geminiApiKey, forHTTPHeaderField: "x-goog-api-key")
                 URLSession.shared.dataTask(with: prewarmRequest) { _, response, _ in
-                    let elapsedMs = (CFAbsoluteTimeGetCurrent() - prewarmStart) * 1000.0
+                    let elapsedMs = (ProcessInfo.processInfo.systemUptime - prewarmStart) * 1000.0
                     let status = (response as? HTTPURLResponse)?.statusCode ?? -1
                     Logger.debug("REST", "Connection pre-warmed (\(String(format: "%.0f", elapsedMs))ms, HTTP \(status))")
                 }.resume()
@@ -261,8 +261,8 @@ final class JustSpeakApp {
             self?.handleKeyDown()
         }
 
-        hotkey.onKeyUp = { [weak self] in
-            self?.handleKeyUp()
+        hotkey.onKeyUp = { [weak self, weak hotkey] in
+            self?.handleKeyUp(eventTime: hotkey?.lastEventUptime)
         }
 
         // Sleep/wake hygiene: release the mic before sleep (suspendEngine refuses mid-dictation),
@@ -296,7 +296,7 @@ final class JustSpeakApp {
         if let lockAfter = holdToLockInterval {
             Logger.info("LOCK", "Hold-to-lock: keep holding \(String(format: "%g", lockAfter))s and the turn locks - release freely, press the key again to finish.")
         }
-        print("\(ANSI.gray)Press Ctrl+C to quit at any time.\(ANSI.reset)\n")
+        Logger.raw("\(ANSI.gray)Press Ctrl+C to quit at any time.\(ANSI.reset)\n")
 
         // Run AppKit RunLoop with Accessory activation policy (no Dock icon, full window support)
         let app = NSApplication.shared
@@ -368,9 +368,9 @@ final class JustSpeakApp {
         // the engine is actually capturing, so the sound always means "speak now" - never
         // before a cold mic is ready.
         if !audioCapture.isEngineRunning {
-            let wakeStart = CFAbsoluteTimeGetCurrent()
+            let wakeStart = ProcessInfo.processInfo.systemUptime
             if audioCapture.resumeEngine() {
-                Logger.info("MIC", "Mic re-armed after idle (\(String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - wakeStart) * 1000.0))ms spin-up).")
+                Logger.info("MIC", "Mic re-armed after idle (\(String(format: "%.0f", (ProcessInfo.processInfo.systemUptime - wakeStart) * 1000.0))ms spin-up).")
             }
         }
 
@@ -398,6 +398,7 @@ final class JustSpeakApp {
         captureActive = true
         liveClient?.startNewTurn()
         audioCapture.startRecording()
+        if config.restoreClipboard { TextInjector.prepareClipboard() }
         armHoldToLock()
 
         // Duck AFTER the begin earcon has played, not with it - Talkify's ordering. The
@@ -414,10 +415,11 @@ final class JustSpeakApp {
         }
     }
 
-    private func handleKeyUp(finish: String = "release") {
+    private func handleKeyUp(finish: String = "release", eventTime: TimeInterval? = nil) {
         // Capture the physical release instant before anything else - this becomes the true
         // start of "Total Key-Up -> Paste" latency measurement.
-        let keyUpTime = CFAbsoluteTimeGetCurrent()
+        let handlerTime = ProcessInfo.processInfo.systemUptime
+        let keyUpTime = eventTime.flatMap { $0 > 0 && $0 <= handlerTime ? $0 : nil } ?? handlerTime
 
         // A release whose press never started a capture (refused by a key-down gate) must
         // not run the pipeline - there is nothing to stop, only stale state to misread.
@@ -426,6 +428,7 @@ final class JustSpeakApp {
         if turnLocked { return }
         captureActive = false
         turnFinishMode = finish
+        turnEventQueueMs = (handlerTime - keyUpTime) * 1000
         lockWorkItem?.cancel()
         lockWorkItem = nil
         lockLimitWorkItem?.cancel()
@@ -503,7 +506,7 @@ final class JustSpeakApp {
     /// Runs entirely on sessionQueue: finalizes the capture, arbitrates the WS-vs-REST turn
     /// lifecycle, and is the only place that mutates currentTurnId / turnSettled / pendingFallbackTimer.
     private func runTurnPipeline(keyUpTime: CFAbsoluteTime) {
-        let pipelineStartTime = CFAbsoluteTimeGetCurrent()
+        let pipelineStartTime = ProcessInfo.processInfo.systemUptime
         let (pcmData, duration, chunks, capturedBytes, peakDb, speechFrames) = audioCapture.stopRecording(
             gracePeriodMs: config.postRollMs, maxTrailMs: config.postRollMaxMs, silenceThresholdDb: config.trailSilenceDb)
         // Mic capture for this turn is over and every pipeline exit path passes this point -
@@ -525,6 +528,7 @@ final class JustSpeakApp {
         // the fixed pre-roll/silence-flush padding that stopRecording always appends).
         // isProcessing was set at key-up, so every abandoned-turn exit clears it.
         guard duration >= 0.15 && capturedBytes > 2000 else {
+            liveClient?.abandonTurn()
             Logger.warn("INPUT", "Ignored short click (\(String(format: "%.0f", duration * 1000.0))ms). Hold key while speaking.")
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.hide()
@@ -544,6 +548,7 @@ final class JustSpeakApp {
         // cleared, the WS turn never committed). nil peak = no real audio = "not silent".
         if let peakDb = peakDb, peakDb < silentClipPeakDb || speechFrames <= silentClipMaxSpeechFrames {
             Logger.warn("INPUT", "No speech detected in clip (peak \(String(format: "%.1f", peakDb)) dBFS, \(speechFrames) speech frames) - skipping API call.")
+            liveClient?.abandonTurn()
             noteNoSpeechTurn()
             DispatchQueue.main.async { [weak self] in
                 self?.hud?.showError(message: "No speech detected")
@@ -593,16 +598,28 @@ final class JustSpeakApp {
         currentTurnId += 1
         let turnId = currentTurnId
         turnSettled = false
+        restAttemptStart = nil
+        let budget = max(10.0, min(30.0, config.restFallbackTimeout + 10.0))
+        let deadline = DispatchWorkItem { [weak self] in
+            self?.settle(
+                turnId: turnId, route: "deadline",
+                outcome: .failure(
+                    NSError(
+                        domain: NSURLErrorDomain, code: NSURLErrorTimedOut,
+                        userInfo: [NSLocalizedDescriptionKey: "Dictation deadline exceeded; nothing pasted."])))
+        }
+        pendingTurnDeadline = deadline
+        sessionQueue.asyncAfter(deadline: .now() + max(0, budget - (ProcessInfo.processInfo.systemUptime - keyUpTime)), execute: deadline)
 
         Logger.info("AUDIO", "Captured \(String(format: "%.2fs", duration)) audio (\(chunks) chunks, \(String(format: "%.1f", Double(pcmData.count)/1024.0)) KB). Committing turn...")
 
-        let commitDispatchTime = CFAbsoluteTimeGetCurrent()
+        let commitDispatchTime = ProcessInfo.processInfo.systemUptime
         let captureFinalizeMs = (commitDispatchTime - pipelineStartTime) * 1000.0
 
         // Strategy: Try Live WebSocket first; if not ready or on error, fallback seamlessly to REST
-        if config.enableLiveWebSocket, let liveClient = self.liveClient, liveClient.isReady {
+        if config.enableLiveWebSocket, let liveClient = self.liveClient, liveClient.canCommitTurn {
             let commitStartTime = commitDispatchTime
-            let dynamicTimeout = max(config.restFallbackTimeout, min(8.0, duration * 0.4 + 3.0))
+            let dynamicTimeout = max(0.1, config.restFallbackTimeout)
 
             let fallbackTimer = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
@@ -618,9 +635,10 @@ final class JustSpeakApp {
             liveClient.commitTurn { [weak self] result in
                 guard let self = self else { return }
                 self.sessionQueue.async {
+                    guard self.currentTurnId == turnId, !self.turnSettled else { return }
                     switch result {
                     case .success(let payload):
-                        let roundtripMs = (CFAbsoluteTimeGetCurrent() - commitStartTime) * 1000.0
+                        let roundtripMs = (ProcessInfo.processInfo.systemUptime - commitStartTime) * 1000.0
                         let usage = self.liveClient?.lastTurnUsage
                         self.turnSettlePath = self.liveClient?.lastSettlePath
                         self.settle(
@@ -670,7 +688,7 @@ final class JustSpeakApp {
             }
         } else {
             // Direct REST
-            let reason = !config.enableLiveWebSocket ? "Live WebSockets Disabled in Config" : "Live WebSocket Initial Handshake Pending"
+            let reason = !config.enableLiveWebSocket ? "Live WebSockets Disabled in Config" : "Live connection not ready or recording incomplete"
             executeRestFallback(turnId: turnId, pcmData: pcmData, duration: duration, keyUpTime: keyUpTime, captureFinalizeMs: captureFinalizeMs, reason: reason)
         }
     }
@@ -703,7 +721,7 @@ final class JustSpeakApp {
         let cost = sessionCostUSD
         statsLock.unlock()
         guard turns > 0 else { return }
-        print("\n\(ANSI.bold)📈 Session Usage:\(ANSI.reset) \(turns) dictation\(turns == 1 ? "" : "s") | \(inTok) in / \(outTok) out tokens | ≈ $\(String(format: "%.4f", cost))")
+        Logger.raw("\n\(ANSI.bold)📈 Session Usage:\(ANSI.reset) \(turns) dictation\(turns == 1 ? "" : "s") | \(inTok) in / \(outTok) out tokens | ≈ $\(String(format: "%.4f", cost))")
     }
 
     /// Launches the REST fallback for turnId. Does NOT settle the turn by itself - WS and REST
@@ -712,8 +730,10 @@ final class JustSpeakApp {
     /// isRetry marks the one allowed re-send after an empty transcript (model nondeterminism,
     /// not silence - the silent-clip gate already filtered room tone before any call was made).
     private func executeRestFallback(turnId: UInt64, pcmData: Data, duration: Double, keyUpTime: CFAbsoluteTime, captureFinalizeMs: Double, reason: String, isRetry: Bool = false) {
-        let restStartTime = CFAbsoluteTimeGetCurrent()
-        GeminiRestClient.transcribe(
+        guard currentTurnId == turnId, !turnSettled else { return }
+        if restAttemptStart == nil { restAttemptStart = ProcessInfo.processInfo.systemUptime }
+        let restStartTime = restAttemptStart!
+        pendingRestRequest = GeminiRestClient.transcribe(
             pcmData: pcmData,
             apiKey: config.geminiApiKey,
             model: config.geminiModel,
@@ -733,7 +753,7 @@ final class JustSpeakApp {
                         self.executeRestFallback(turnId: turnId, pcmData: pcmData, duration: duration, keyUpTime: keyUpTime, captureFinalizeMs: captureFinalizeMs, reason: reason, isRetry: true)
                         return
                     }
-                    let roundtripMs = (CFAbsoluteTimeGetCurrent() - restStartTime) * 1000.0
+                    let roundtripMs = (ProcessInfo.processInfo.systemUptime - restStartTime) * 1000.0
                     self.settle(
                         turnId: turnId, route: "REST",
                         outcome: .success(
@@ -810,6 +830,11 @@ final class JustSpeakApp {
             return
         }
         turnSettled = true
+        pendingTurnDeadline?.cancel()
+        pendingTurnDeadline = nil
+        pendingRestRequest?.cancel()
+        pendingRestRequest = nil
+        if route != "WS" { liveClient?.abandonTurn() }
         pendingFallbackTimer?.cancel()
         pendingFallbackTimer = nil
 
@@ -990,18 +1015,6 @@ final class JustSpeakApp {
         // Deterministic wrong->right enforcement (client-side guarantee on top of boost bias).
         let text = ReplacementEngine.apply(trimmed, compiled: config.compiledReplacementRules)
 
-        // Privacy mode keeps dictated words off the terminal too - a shared screen with a
-        // visible terminal leaks exactly like the pill would. Say "transcribed", not "pasted":
-        // delivery isn't known yet (secure input / lost accessibility / focus change all
-        // downgrade to copy-only below) - the Injection Latency line reports the real outcome.
-        if config.privacyMode {
-            print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed ───\(ANSI.reset) \(ANSI.gray)privacy mode: \(text.count) chars transcribed, not shown\(ANSI.reset)")
-        } else {
-            print("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
-            print("\(ANSI.bold)\(text)\(ANSI.reset)")
-            print("\(ANSI.bold)\(ANSI.magenta)─────────────────────────────────────────────────────────────\(ANSI.reset)")
-        }
-
         // Active Window Injection: paste, unless secure input is held or the frontmost app
         // changed mid-turn - both downgrade to clipboard-only delivery instead of synthesizing
         // a paste into the wrong (or a password) field. Auto-restores the previous clipboard
@@ -1011,9 +1024,9 @@ final class JustSpeakApp {
         var copyOnlyReason: String?  // set on downgrade; drives the log message, HUD text and status label
 
         if SecureInputMonitor.isActive {
-            let copyStart = CFAbsoluteTimeGetCurrent()
+            let copyStart = ProcessInfo.processInfo.systemUptime
             _ = TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace)
-            injectMs = (CFAbsoluteTimeGetCurrent() - copyStart) * 1000.0
+            injectMs = (ProcessInfo.processInfo.systemUptime - copyStart) * 1000.0
             injected = false
             let holder = SecureInputMonitor.holderName()
             Logger.warn("INJECT", "Secure input is held by \(holder ?? "another app") - copied, not pasted.")
@@ -1021,9 +1034,9 @@ final class JustSpeakApp {
         } else if !AXIsProcessTrusted() {
             // Accessibility revoked while running: the synthesized Cmd+V would be silently
             // dropped by the system, losing the dictation. Copy instead and say why.
-            let copyStart = CFAbsoluteTimeGetCurrent()
+            let copyStart = ProcessInfo.processInfo.systemUptime
             _ = TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace)
-            injectMs = (CFAbsoluteTimeGetCurrent() - copyStart) * 1000.0
+            injectMs = (ProcessInfo.processInfo.systemUptime - copyStart) * 1000.0
             injected = false
             Logger.warn("INJECT", "Accessibility permission revoked - copied, not pasted. Re-enable this terminal under System Settings > Privacy & Security > Accessibility.")
             copyOnlyReason = "accessibility revoked"
@@ -1032,9 +1045,9 @@ final class JustSpeakApp {
             DispatchQueue.main.sync { frontNow = NSWorkspace.shared.frontmostApplication }
 
             if let priorPid = turnFrontmostPID, let nowPid = frontNow?.processIdentifier, priorPid != nowPid {
-                let copyStart = CFAbsoluteTimeGetCurrent()
+                let copyStart = ProcessInfo.processInfo.systemUptime
                 _ = TextInjector.copyOnly(text: text, appendSpace: config.trailingSpace)
-                injectMs = (CFAbsoluteTimeGetCurrent() - copyStart) * 1000.0
+                injectMs = (ProcessInfo.processInfo.systemUptime - copyStart) * 1000.0
                 injected = false
                 Logger.warn("INJECT", "Focus moved from \(turnFrontmostName ?? "?") to \(frontNow?.localizedName ?? "?") mid-turn - text copied, not pasted.")
                 copyOnlyReason = "focus changed"
@@ -1056,7 +1069,20 @@ final class JustSpeakApp {
             SoundManager.playCommitSound()
         }
 
-        let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartTime) * 1000.0
+        // Privacy mode keeps dictated words off the terminal too - a shared screen with a
+        // visible terminal leaks exactly like the pill would. Say "transcribed", not "pasted":
+        // delivery isn't known yet (secure input / lost accessibility / focus change all
+        // downgrade to copy-only below) - the Injection Latency line reports the real outcome.
+        if config.privacyMode {
+            Logger.raw("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed ───\(ANSI.reset) \(ANSI.gray)privacy mode: \(text.count) chars transcribed, not shown\(ANSI.reset)")
+        } else {
+            Logger.raw("\n\(ANSI.bold)\(ANSI.magenta)─── Transcribed & Polished Text ─────────────────────────────\(ANSI.reset)")
+            Logger.raw("\(ANSI.bold)\(text)\(ANSI.reset)")
+            Logger.raw("\(ANSI.bold)\(ANSI.magenta)─────────────────────────────────────────────────────────────\(ANSI.reset)")
+        }
+
+
+        let totalElapsedMs = (ProcessInfo.processInfo.systemUptime - totalStartTime) * 1000.0
 
         let injectStatus: String
         if let reason = copyOnlyReason {
@@ -1079,22 +1105,23 @@ final class JustSpeakApp {
             }
         }
 
-        print("\n\(ANSI.bold)📊 Latency Diagnostic Breakdown:\(ANSI.reset)")
-        print("  • Primary Route:       \(ANSI.cyan)\(transport)\(ANSI.reset)")
+        Logger.raw("\n\(ANSI.bold)📊 Latency Diagnostic Breakdown:\(ANSI.reset)")
+        Logger.raw("  • Primary Route:       \(ANSI.cyan)\(transport)\(ANSI.reset)")
         if let reason = fallbackReason {
-            print("  • Fallback Used:       \(ANSI.bold)\(ANSI.yellow)YES ⚠️ [REST Fallback Route Invoked]\(ANSI.reset)")
-            print("  • Fallback Reason:     \(ANSI.yellow)\(reason)\(ANSI.reset)")
-            print("  • Fallback Model:      \(ANSI.bold)\(config.geminiModel)\(ANSI.reset)")
+            Logger.raw("  • Fallback Used:       \(ANSI.bold)\(ANSI.yellow)YES ⚠️ [REST Fallback Route Invoked]\(ANSI.reset)")
+            Logger.raw("  • Fallback Reason:     \(ANSI.yellow)\(reason)\(ANSI.reset)")
+            Logger.raw("  • Fallback Model:      \(ANSI.bold)\(config.geminiModel)\(ANSI.reset)")
         } else {
-            print("  • Fallback Used:       \(ANSI.green)NO (Direct Live Stream Complete)\(ANSI.reset)")
+            Logger.raw("  • Fallback Used:       \(ANSI.green)NO (Direct Live Stream Complete)\(ANSI.reset)")
         }
-        print("  • Audio Duration:      \(String(format: "%.2f", audioDuration))s")
-        print("  • Capture Finalize:    \(String(format: "%.1f", captureFinalizeMs)) ms (post-roll + drain)")
+        Logger.raw("  • Audio Duration:      \(String(format: "%.2f", audioDuration))s")
+        Logger.raw("  • Capture Finalize:    \(String(format: "%.1f", captureFinalizeMs)) ms (post-roll + drain)")
         if firstTokenMs > 0 {
-            print("  • First Token TTFT:    \(ANSI.bold)\(String(format: "%.1f", firstTokenMs)) ms\(ANSI.reset)")
+            Logger.raw("  • First Token TTFT:    \(ANSI.bold)\(String(format: "%.1f", firstTokenMs)) ms\(ANSI.reset)")
         }
-        print("  • API Roundtrip (RTT): \(ANSI.bold)\(String(format: "%.1f", roundtripMs)) ms\(ANSI.reset)")
-        print("  • Injection Latency:   \(String(format: "%.1f", injectMs)) ms (\(injectStatus))")
+        Logger.raw("  • Event Queue Delay:   \(String(format: "%.1f", turnEventQueueMs)) ms")
+        Logger.raw("  • API Roundtrip (RTT): \(ANSI.bold)\(String(format: "%.1f", roundtripMs)) ms\(ANSI.reset)")
+        Logger.raw("  • Injection Latency:   \(String(format: "%.1f", injectMs)) ms (\(injectStatus))")
 
         // Token usage & cost. API-metered when the server reported usageMetadata; otherwise a
         // deterministic estimate from the documented rates (25 audio tokens/sec + ~1s of
@@ -1107,7 +1134,7 @@ final class JustSpeakApp {
         let turnCostUSD =
             Double(effectiveInputTokens) / 1_000_000.0 * inputPrice
             + Double(effectiveOutputTokens) / 1_000_000.0 * outputPrice
-        print(
+        Logger.raw(
             "  • Tokens & Cost:       \(effectiveInputTokens) in / \(effectiveOutputTokens) out ≈ \(ANSI.bold)$\(String(format: "%.5f", turnCostUSD))\(ANSI.reset) \(ANSI.gray)(\(usageMetered ? "API metered" : "estimated"))\(ANSI.reset)"
         )
 
@@ -1151,18 +1178,20 @@ final class JustSpeakApp {
                 finishMode: turnFinishMode
             ))
 
-        print("  • \(ANSI.bold)\(ANSI.green)Total Key-Up → Paste:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")
+        Logger.raw("  • \(ANSI.bold)\(ANSI.green)Key-Up → Paste Dispatch:\(ANSI.reset) \(ANSI.bold)\(ANSI.green)\(String(format: "%.1f", totalElapsedMs)) ms ⚡\(ANSI.reset)\n")
 
         processingLock.lock()
         isProcessing = false
         processingLock.unlock()
+        let readyMs = (ProcessInfo.processInfo.systemUptime - totalStartTime) * 1000
+        Logger.debug("LATENCY", "Key-up to next-turn readiness: \(String(format: "%.1f", readyMs))ms")
     }
 
     private func printBanner() {
         let langDisplay =
             config.languageCodes.isEmpty
             ? "\(ANSI.green)Auto (All 80+ Languages)\(ANSI.reset)" : "\(ANSI.green)\(config.languageCodes.joined(separator: ", "))\(ANSI.reset) \(ANSI.gray)(Prioritized)\(ANSI.reset)"
-        print(
+        Logger.raw(
             """
             \(ANSI.bold)\(ANSI.cyan)
                  _           _   ____                   _    

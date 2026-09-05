@@ -1,0 +1,4 @@
+BENCH correction field_words=1000 paste_words=50 before_ms=96.88620833185269 after_ms=2.1276249972288497 speedup=45.53725795572212
+BENCH correction field_words=5000 paste_words=50 before_ms=504.38479166768957 after_ms=9.574249997967854 speedup=52.68138932811926
+BENCH correction field_words=20000 paste_words=50 before_ms=2031.8285833345726 after_ms=38.49916666513309 speedup=52.77591073613304
+BENCH logging controlled_sink=50ms writes=10 synchronous_producer_ms=540.5563749955036 queued_producer_ms=0.10645833390299231
